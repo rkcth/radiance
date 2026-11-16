@@ -245,7 +245,7 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t ep, int64_t pd,
 }
 
 int64_t frames_bytes_of(const RadVideoGenDecl& d) {
-    return (d.frames_per_chunk + d.frames_tail) * d.max_area * 3;
+    return (d.frames_per_chunk + std::max<int64_t>(0, d.frames_tail)) * d.max_area * 3;
 }
 
 /* The samples a channel of a soundtrack under `frames` frames: its latents rounded up, which
@@ -732,6 +732,8 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     for (int i = 0; i < 8; ++i) {
         if (i >= 4 && d.audio_channels == 0 && !std::isnan(r->guidance[i]))
             return no("this model has no soundtrack guidance");
+        if (d.guidance == RAD_VIDEO_GUIDANCE_CFG && i % 4 != 0 && !std::isnan(r->guidance[i]))
+            return no("this model supports only classifier-free guidance");
         named = named || !std::isnan(r->guidance[i]);
         j->guidance[i] = (float)(std::isnan(r->guidance[i]) ? d.guidance_default[i] : r->guidance[i]);
         if (!(j->guidance[i] >= 0.0f) || !std::isfinite(j->guidance[i]))
@@ -1242,8 +1244,8 @@ const RadBatch* VideoDriver::build_chunk(Job& j, int step) {
     stage_seed(j);   /* a decoder that denoises draws from the request's seed */
     if (upload() < 0) return nullptr;
     base_batches(j, j.geom, j.dec_rows, step);
-    const bool last = j.chunk == j.n_chunks - 1;
-    const int32_t n = (int32_t)(decl_.frames_per_chunk + (last ? decl_.frames_tail : 0));
+    const bool boundary = decl_.frames_tail < 0 ? j.chunk == 0 : j.chunk == j.n_chunks - 1;
+    const int32_t n = (int32_t)(decl_.frames_per_chunk + (boundary ? decl_.frames_tail : 0));
     for (size_t r = 0; r < out_.size(); ++r) {
         out_[r].gen = RAD_GEN_PASS_VDECODE;
         vout_[r].n_frames_out = n;

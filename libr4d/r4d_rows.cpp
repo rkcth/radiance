@@ -2980,6 +2980,7 @@ static const RadOperandSpec oFlowRM[] = {
 static const RadOperandSpec oFlowUniPC[] = {
     { "v", RAD_OPD_IN, 0 }, { "coefficients", RAD_OPD_IN, 0 },
     { "history", RAD_OPD_INOUT, 0 }, { "x", RAD_OPD_INOUT, 0 },
+    { "negative", RAD_OPD_IN, 1 }, { "guidance", RAD_OPD_IN, 1 },
 };
 static const RadParamSpec pPatchUnfold[] = { P_INT("M"), P_INT("C"), P_INT("pt"), P_INT("ph"),
                                              P_INT("pw"), P_STR("mul"), P_STR("add"),

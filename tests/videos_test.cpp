@@ -241,6 +241,24 @@ TEST(the_generator_gets_the_size_the_chunks_and_the_steps) {
 
 /* `shift`/`audio_shift` thread to the request and echo back; omitted, the request carries 0 (the
  * driver keeps the model's trained shift) and the echo adds neither field. */
+TEST(a_short_first_chunk_is_counted_in_the_video_api_duration) {
+    Videos v;
+    auto& d = v.gen.inf;
+    d.fps_num = 16;
+    d.frames_per_chunk = 4;
+    d.frames_tail = -3;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+
+    for (const auto& [seconds, chunks] : std::vector<std::pair<double, int>>{
+             {0.0625, 1}, {0.20, 2}, {0.33, 3}}) {
+        const auto r = v.create(Videos::body({{"seconds", seconds}, {"size", "256x256"}}));
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().chunks, chunks);
+    }
+    CHECK_EQ(v.refused(Videos::body({{"seconds", 0.6}})), std::string("seconds"));
+}
+
 TEST(the_shift_threads_to_the_request_and_echoes) {
     Videos v;
     HttpResponse r = v.create(Videos::body({ { "shift", 6 }, { "audio_shift", 2 } }));
@@ -1198,6 +1216,11 @@ TEST(a_video_only_model_refuses_soundtrack_options_and_finishes_an_mp4) {
 TEST(a_unipc_model_reports_its_sampler_and_refuses_other_samplers) {
     Videos v;
     v.gen.inf.unipc_only = true;
+    v.gen.inf.guidance = true;
+    v.gen.inf.guidance_cfg_only = true;
+    CHECK_EQ(v.refused(Videos::body({{"stg_scale", 1}})), std::string("stg_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"modality_scale", 2}})), std::string("modality_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"guidance_rescale", .2}})), std::string("guidance_rescale"));
     v.gen.inf.step_evals = true;
     CHECK_EQ(v.refused(Videos::body({ { "sampler", "euler" } })), std::string("sampler"));
     CHECK_EQ(v.refused(Videos::body({ { "sampler", "res_multistep" } })), std::string("sampler"));

@@ -561,6 +561,16 @@ int ref_flow_unipc_step(const RadArgs* a, RadStream) {
         rows > (INT64_MAX - n) / x->stride[0] ||
         rows > (INT64_MAX - n) / v->stride[0] ||
         rows > (INT64_MAX - 3 * n) / history->stride[0]) return RAD_E_SHAPE;
+    const RadTensor *negative = t_in(a, 4), *guidance = t_in(a, 5);
+    if (bool(negative) != bool(guidance)) return RAD_E_INVAL;
+    if (negative) {
+        if (negative->dtype != v->dtype || guidance->dtype != RAD_F32) return RAD_E_DTYPE;
+        if (negative->rank != 2 || negative->shape[0] < rows || negative->shape[1] != n ||
+            guidance->rank != 1 || guidance->shape[0] != 1) return RAD_E_SHAPE;
+        if (negative->stride[1] != 1 || negative->stride[0] < n) return RAD_E_STRIDE;
+        if (rows > (INT64_MAX - n) / negative->stride[0]) return RAD_E_SHAPE;
+    }
+    const float scale = guidance ? ldt(guidance, 0) : 1.0f;
     const float* values = static_cast<const float*>(coeff->data);
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
@@ -571,7 +581,12 @@ int ref_flow_unipc_step(const RadArgs* a, RadStream) {
             float last_sample = ldt(history, h);
             float last_clean = ldt(history, h + n);
             float older_clean = ldt(history, h + 2 * n);
-            const float next = rad_unipc::advance(values, ldt(x, xb + c), ldt(v, vb + c),
+            float velocity = ldt(v, vb + c);
+            if (negative) {
+                const float unconditioned = ldt(negative, r * negative->stride[0] + c);
+                velocity = unconditioned + scale * (velocity - unconditioned);
+            }
+            const float next = rad_unipc::advance(values, ldt(x, xb + c), velocity,
                                                   last_sample, last_clean, older_clean);
             stt(x, xb + c, next);
             stt(history, h, last_sample);

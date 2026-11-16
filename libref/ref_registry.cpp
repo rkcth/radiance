@@ -908,7 +908,7 @@ static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD(
 static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
                                           OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
 static const RadOperandSpec oFlowUniPC[] = { OPD("v"), OPD("coefficients"),
-                                             INOUT("history"), INOUT("x") };
+                                             INOUT("history"), INOUT("x"), OPD_O("negative"), OPD_O("guidance") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
                                           P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
                                           P_STR("dtype") };

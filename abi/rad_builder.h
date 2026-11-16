@@ -1309,8 +1309,9 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  * Geometry. A video of n chunks has `frames_per_chunk n + frames_tail` frames at
  * `fps_num / fps_den` a second and `latents_per_chunk n + latents_tail` latent frames, each of
  * (height / latent_scale) x (width / latent_scale) latents of `latent_channels`; the denoiser
- * reads them in `patch` x `patch` patches. Chunk c of n is `frames_per_chunk` frames, the last
- * `frames_per_chunk + frames_tail`. A side is a multiple of `size_multiple` pixels, at least
+ * reads them in `patch` x `patch` patches. A positive `frames_tail` adds frames to the last
+ * chunk. A negative `frames_tail` trims the first chunk, which must still emit at least one
+ * frame. Every other chunk has `frames_per_chunk` frames. A side is a multiple of `size_multiple` pixels, at least
  * `min_side`, the area at most `max_area`, and the long side over the short at most `max_aspect`.
  * The soundtrack has round(frames / fps * audio_rate) latents a channel, each
  * `sample_rate / audio_rate` samples.
@@ -1365,6 +1366,7 @@ enum { RAD_GEN_PASS_VCOND = 8, RAD_GEN_PASS_VSTEP = 9, RAD_GEN_PASS_ADECODE = 10
        RAD_GEN_PASS_VENCODE = 13, RAD_GEN_PASS_AENCODE = 14 };
 
 enum { RAD_VIDEO_SCHEDULE_UNIPC = 2 };
+enum { RAD_VIDEO_GUIDANCE_FULL = 1, RAD_VIDEO_GUIDANCE_CFG = 2 };
 
 typedef struct RadVideoGenDecl {
     const char* name;             /* "minimax-h3" -- the served model id and messages */
@@ -1439,11 +1441,12 @@ typedef struct RadVideoGenDecl {
     /* The text rows of every VSTEP pass, whatever the prompt's length (0: the prompt's tokens):
      * a model whose text encoder writes a fixed number of rows. */
     int64_t       step_text_rows;
-    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is 1: the defaults a request
+    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is nonzero: the defaults a request
      * that names none gets, the video's scale, spatio-temporal scale, modality scale and rescale,
      * then the soundtrack's four. A request whose video or soundtrack scale is not 1 is guided
      * against a negative prompt: its own, else `default_negative` (null: ""). The VCOND pass then
-     * carries both prompts, the positive first (two cu_seqlens entries). */
+     * carries both prompts, the positive first (two cu_seqlens entries).
+     * RAD_VIDEO_GUIDANCE_CFG accepts only the video and soundtrack CFG scales and negative prompt. */
     int32_t       guidance;
     double        guidance_default[8];
     const char*   default_negative;

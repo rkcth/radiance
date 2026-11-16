@@ -36,7 +36,8 @@ struct Umt5Encoder {
         if (!state || !norm || !scaled || !qkv || !attended || !residual || !gate_up ||
             !activated || !gated || !encoded) return RAD_E_INVAL;
 
-        token_weight = mapped(b, names.f("umt5.token.weight"), {"text_encoder.shared.weight"},
+        // The Diffusers loader flattens text_encoder into the checkpoint's root namespace.
+        token_weight = mapped(b, names.f("umt5.token.weight"), {"shared.weight"},
                               {vocab, width}, grp_model());
         if (!token_weight) return RAD_E_INVAL;
         embed = rw(b, RAD_OP(b, "embed_lookup",
@@ -49,7 +50,7 @@ struct Umt5Encoder {
         for (int i = 0; i < layer_count; ++i) {
             Layer& l = layers[i];
             const auto group = grp_layer(i);
-            const char* source = names.ckpt("text_encoder.encoder.block.%d", i);
+            const char* source = names.ckpt("encoder.block.%d", i);
             const char* attn = names.ckpt("%s.layer.0.SelfAttention", source);
             const char* ffn = names.ckpt("%s.layer.1.DenseReluDense", source);
             auto weight = [&](const char* suffix, std::initializer_list<const char*> sources,
@@ -90,7 +91,7 @@ struct Umt5Encoder {
                 !l.multiply || !l.project_down || !l.after_ffn) return RAD_E_NOKERNEL;
         }
         final_weight = mapped(b, names.f("umt5.final_norm.weight"),
-                              {"text_encoder.encoder.final_layer_norm.weight"}, {width},
+                              {"encoder.final_layer_norm.weight"}, {width},
                               grp_layer(layer_count));
         if (!final_weight) return RAD_E_INVAL;
         final_norm = declare_norm(b, final_weight, encoded);

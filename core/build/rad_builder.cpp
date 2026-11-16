@@ -1741,7 +1741,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
                          "length (%lld)", nm, (long long)d->max_text);
         return RAD_E_INVAL;
     }
-    if (d->fps_num <= 0 || d->fps_den <= 0 || d->frames_per_chunk <= 0 || d->frames_tail < 0 ||
+    if (d->fps_num <= 0 || d->fps_den <= 0 || d->frames_per_chunk <= 0 ||
+        d->frames_tail <= -d->frames_per_chunk ||
         d->latents_per_chunk <= 0 || d->latents_tail < 0 || d->dec_latents < d->latents_per_chunk ||
         d->min_chunks <= 0 || d->max_chunks < d->min_chunks || d->default_chunks < d->min_chunks ||
         d->default_chunks > d->max_chunks ||
@@ -1842,7 +1843,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
     if (d->step_text_rows < 0 || d->step_text_rows > d->max_text * 64 || d->image_crf < 0 ||
         d->image_crf > 51 || (d->image_cond != 0 && d->image_cond != 1) ||
-        (d->guidance != 0 && d->guidance != 1)) {
+        (d->guidance != 0 && d->guidance != RAD_VIDEO_GUIDANCE_FULL &&
+         d->guidance != RAD_VIDEO_GUIDANCE_CFG)) {
         err(RAD_E_INVAL, "declare_video_generator '%s': step_text_rows %lld, image_cond %d, "
                          "image_crf %d (0..51) or guidance %d is out of range", nm,
             (long long)d->step_text_rows, (int)d->image_cond, (int)d->image_crf, (int)d->guidance);
@@ -1904,9 +1906,9 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
         return true;
     };
-    /* frames_out holds the last chunk, the largest, at the largest area; audio_out the longest
-     * soundtrack. */
-    const int64_t chunk_px = (d->frames_per_chunk + d->frames_tail) * d->max_area * 3;
+    /* frames_out holds the largest chunk at the largest area; audio_out the longest soundtrack. */
+    const int64_t chunk_frames = d->frames_per_chunk + std::max<int64_t>(0, d->frames_tail);
+    const int64_t chunk_px = chunk_frames * d->max_area * 3;
     if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out")) return RAD_E_INVAL;
     if (has_audio) {
         const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;

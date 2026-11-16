@@ -3095,6 +3095,8 @@ int ref_flow_unipc_step_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     o.t_fill(RAD_F32, { rad_unipc::COUNT }, RAD_FILL_SIGMOID, 0);
     o.t(RAD_F32, { M, 3 * n });
     o.t(RAD_F32, { M, n });
+    o.skip();  // Classifier-free guidance is covered by a separate correctness test.
+    o.skip();
     return o.finish("flow_unipc_step", operand, out);
 }
 int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

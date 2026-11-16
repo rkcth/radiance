@@ -402,6 +402,51 @@ TEST(a_video_only_request_finishes_without_an_audio_pass) {
     CHECK_EQ(frames, 5);
 }
 
+TEST(a_causal_video_decoder_can_trim_only_the_first_chunk) {
+    VideoFixture f;
+    f.build();
+    auto& d = f.prog.video_gen;
+    d.sample_rate = d.audio_rate = d.audio_channels = d.audio_latent_channels = 0;
+    d.audio_out = RAD_NULL_HANDLE;
+    d.shift_audio = 0;
+    d.frames_per_chunk = 4;
+    d.frames_tail = -3;
+    d.latents_tail = 0;
+    d.dec_latents = 1;
+    REQUIRE_EQ(f.start(), RAD_OK);
+
+    for (const int chunks : {1, 3}) {
+        auto r = f.req(chunks);
+        auto ticket = r->ticket;
+        std::string why;
+        REQUIRE_EQ(f.drv.submit(std::move(r), &why), RAD_OK);
+        const int frames = 4 * chunks - 3;
+        CHECK_EQ(ticket->frames, frames);
+        for (int i = 0; i < 12; ++i) {
+            const RadBatch* b = f.drv.next(i);
+            if (!b) break;
+            if (b->gen == RAD_GEN_PASS_VDECODE) {
+                const auto& v = *b->vgen_b;
+                CHECK_EQ(v.n_frames_out, v.chunk == 0 ? 1 : 4);
+                CHECK_EQ(v.geom_d[RAD_VGEOM_CHUNK_LAT0], v.chunk);
+                CHECK_EQ(f.drv.readbacks().front().bytes, v.n_frames_out * 64 * 32 * 3);
+            }
+            f.answer(i);
+            CHECK_OK(f.drv.done());
+        }
+        CHECK_EQ(ticket->status(), RAD_OK);
+        gen::VideoEvent e;
+        bool timeout = false;
+        int n = 0;
+        while (ticket->next(&e, 0, &timeout)) {
+            if (e.kind != gen::VideoEvent::FRAMES) continue;
+            CHECK_EQ(e.first, n);
+            n += e.n;
+        }
+        CHECK_EQ(n, frames);
+    }
+}
+
 TEST(unipc_stages_wan_timesteps_and_coefficients_for_each_video_step) {
     VideoFixture f;
     f.build();

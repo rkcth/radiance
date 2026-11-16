@@ -410,7 +410,7 @@ TEST(a_video_only_declaration_requires_consistent_soundtrack_fields) {
         RadBufDecl frames{};
         frames.dtype = RAD_U8;
         frames.rank = 1;
-        frames.shape[0] = (decl.frames_per_chunk + decl.frames_tail) * decl.max_area * 3;
+        frames.shape[0] = (decl.frames_per_chunk + std::max<int64_t>(0, decl.frames_tail)) * decl.max_area * 3;
         frames.kind = RAD_BUF_PERSIST;
         frames.domain = RAD_DOMAIN_DEVICE;
         decl.frames_out = builder.decl_buffer("frames", &frames);
@@ -430,6 +430,13 @@ TEST(a_video_only_declaration_requires_consistent_soundtrack_fields) {
 
     d.sched_kind = RAD_VIDEO_SCHEDULE_UNIPC;
     CHECK_EQ(declare(d), RAD_OK);
+    RadVideoGenDecl first_trim = d;
+    first_trim.frames_tail = -3;
+    first_trim.latents_tail = 0;
+    first_trim.dec_latents = 1;
+    CHECK_EQ(declare(first_trim), RAD_OK);
+    first_trim.frames_tail = -first_trim.frames_per_chunk;
+    CHECK_EQ(declare(first_trim), RAD_E_INVAL);
     RadVideoGenDecl unsupported = d;
     unsupported.max_steps = 1001;
     CHECK_EQ(declare(unsupported), RAD_E_INVAL);

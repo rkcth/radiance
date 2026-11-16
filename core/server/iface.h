@@ -806,6 +806,7 @@ struct VideoGenInfo {
     /* Guidance (RadVideoGenDecl::guidance): the terms a request may name, their defaults and the
      * negative prompt a guided request gets when it names none. */
     bool    guidance = false;
+    bool    guidance_cfg_only = false;
     double  guidance_default[8] = {};
     std::string default_negative;
     /* Image to video: a first frame is taken, after an H.264 round trip at image_crf when > 0. */

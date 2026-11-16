@@ -4372,6 +4372,7 @@ int Engine::with_server_dependencies(
         in.step_evals = vd.sched_kind != 0;
         in.unipc_only = vd.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC;
         in.guidance = vd.guidance != 0;
+        in.guidance_cfg_only = vd.guidance == RAD_VIDEO_GUIDANCE_CFG;
         for (int i = 0; i < 8; ++i) in.guidance_default[i] = vd.guidance_default[i];
         in.default_negative = pg.vgen_str.default_negative;
         in.image_cond = vd.image_cond != 0;

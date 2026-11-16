@@ -163,6 +163,34 @@ decoder with relative RMSE of 0.577%, 0.760%, and 0.552%. The RGB
 packer widened the decoded patches to FP32 and matched reference
 unpatching and normalization byte for byte on the same device patches.
 
+## Standalone serving
+
+The `wan` plugin runs the pinned TI2V-5B Diffusers checkpoint through
+`POST /v1/videos`. Convert it with
+`data/recipes/wan-2.2-ti2v-5b-bf16.recipe`. The tested conversion contains
+1,007 weight entries and 21.16 GiB of weights. Its SHA-256 was
+`df6a1f27c6b61f8c628d1347da19c1d60274eb5f2cdec3147be25c4a9af17716`.
+The four temporal downsample tensors omitted from the package are bypassed
+when the encoder handles the first frame.
+
+The one-card smoke test used a single request lane, 256 × 256, 9 frames,
+24 fps, seed 170160, four UniPC evaluations, and CFG 5. Both text-to-video
+and image-to-video returned silent H.264 MP4 files. Independent decoding
+verified all nine frames in each. The image-to-video first frame was
+35.12 dB PSNR against the provided image after VAE and MP4 encoding.
+The server reported about 0.5 seconds per request, including 0.3 seconds
+of denoising and 0.2 seconds of decoding. This was a short smoke workload.
+One-second samples reached 26.54 GiB of VRAM and 168.05 GiB of available
+system RAM on a host with 184.31 GiB visible. Weight placement and
+kernel relayout finished 6.7 seconds after the checkpoint read began.
+
+The video HTTP suite passed the causal chunk, UniPC and video-only MP4
+cases. Its existing H.264 round-trip image fixture still failed at the
+PNG pixel-budget check described above. Wan's image conditioning uses
+the input image without an H.264 round trip.
+
+## Reference and qualification checklist
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,

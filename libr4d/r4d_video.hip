@@ -253,15 +253,20 @@ __global__ __launch_bounds__(kT) void flow_rm_kernel(
 template <typename TV>
 __global__ __launch_bounds__(kT) void flow_unipc_kernel(
     const TV* __restrict__ v, const float* __restrict__ coeff, float* __restrict__ history,
-    float* __restrict__ x, int64_t n, int64_t v_ld, int64_t h_ld, int64_t x_ld, int64_t total) {
+    float* __restrict__ x, const TV* __restrict__ negative, const float* __restrict__ guidance,
+    int64_t n, int64_t v_ld, int64_t h_ld, int64_t x_ld, int64_t negative_ld, int64_t total) {
     const int64_t id = static_cast<int64_t>(blockIdx.x) * kT + threadIdx.x;
     if (id >= total) return;
     const int64_t row = id / n;
     const int64_t col = id % n;
     float& sample = x[row * x_ld + col];
     float* hist = history + row * h_ld + col;
-    sample = rad_unipc::advance(coeff, sample, ldv(v, row * v_ld + col),
-                                hist[0], hist[n], hist[2 * n]);
+    float velocity = ldv(v, row * v_ld + col);
+    if (negative) {
+        const float unconditioned = ldv(negative, row * negative_ld + col);
+        velocity = unconditioned + guidance[0] * (velocity - unconditioned);
+    }
+    sample = rad_unipc::advance(coeff, sample, velocity, hist[0], hist[n], hist[2 * n]);
 }
 
 // ---------------------------------------------------------------------------- patch_unfold
@@ -1147,11 +1152,23 @@ extern "C" int r4d_rad_flow_unipc_step(const RadArgs* a, RadStream s) {
         rx > (INT64_MAX - n) / xl || rx > (INT64_MAX - n) / vl ||
         rx > (INT64_MAX - 3 * n) / hl)
         return R4D_NO(RAD_E_SHAPE);
+    const RadTensor *negative = r4d_opt(a, 4), *guidance = r4d_opt(a, 5);
+    if (bool(negative) != bool(guidance)) return R4D_NO(RAD_E_INVAL);
+    int64_t negative_ld = 0;
+    if (negative) {
+        if (negative->dtype != v->dtype || !is_f32(guidance)) return R4D_NO(RAD_E_DTYPE);
+        if (negative->rank != 2 || negative->shape[0] < rx || negative->shape[1] != n ||
+            guidance->rank != 1 || guidance->shape[0] != 1) return R4D_NO(RAD_E_SHAPE);
+        negative_ld = negative->stride[0];
+        if (negative->stride[1] != 1 || negative_ld < n) return R4D_NO(RAD_E_STRIDE);
+        if (rx > (INT64_MAX - n) / negative_ld) return R4D_NO(RAD_E_SHAPE);
+    }
     const int64_t total = rx * n;
 #define R4D_UNIPC(TV) \
     hipLaunchKernelGGL(flow_unipc_kernel<TV>, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s, \
                        (const TV*)v->data, (const float*)coeff->data, (float*)history->data, \
-                       (float*)x->data, n, vl, hl, xl, total)
+                       (float*)x->data, negative ? (const TV*)negative->data : nullptr, \
+                       guidance ? (const float*)guidance->data : nullptr, n, vl, hl, xl, negative_ld, total)
     if (is_f32(v)) R4D_UNIPC(float);
     else           R4D_UNIPC(uint16_t);
 #undef R4D_UNIPC

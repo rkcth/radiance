@@ -724,6 +724,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         if (!info.guidance)
             return error_response(err_unsupported(kGuide[i], "this model takes no guidance"),
                                   req.peer);
+        if (info.guidance_cfg_only && i % 4 != 0)
+            return error_response(err_unsupported(kGuide[i], "this model supports only classifier-free guidance"),
+                                  req.peer);
         double v = 0;
         const bool rescale = i % 4 == 3;
         if (!number(body[kGuide[i]], &v) || !(v >= 0.0) || v > (rescale ? 1.0 : 100.0))
