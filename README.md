@@ -1,4 +1,77 @@
-# radiance
+# Radiance with Secondary Models
+
+## Keep Your Local Assistant Running While You Make Images
+
+This Radiance 2.1 preview fork lets you run Qwen Flash Next for chat or coding
+and use the same AMD GPUs to create and edit images. The fork builds on
+[StillDeadcode’s Radiance](https://codeberg.org/StillDeadcode/radiance).
+
+Generate a first draft with Qwen Image, then send it to Krea for an edit
+guided by a reference photo. Pick the image model and any local LoRA
+adapters for each request, including how strongly to apply them. You can
+switch image models without restarting the server or unloading Qwen
+Flash Next.
+
+When the image tools are idle, Qwen Flash Next can borrow some of their
+GPU memory.
+Radiance can keep recently used image models in system RAM so they’re
+quicker to bring back too, we call it Hot Swapping.
+
+### Now with 2 new model packages
+
+| Model package verified on two Radeon AI PRO R9700s | Checkpoint | Download |
+| --- | --- | --- |
+| Qwen Image 2.1 (uncensored), IQ8R | `qwen-image-2.1-uc-iq8r.rad` | [Hugging Face model card](https://huggingface.co/rkcth/Radiance-IQ8R-from-Qwen-Image-2.1-Uncensored) |
+| Krea 2 Raw Edit IQ8R, with Turbo and Registered Outpaint adapters | `krea-2-raw-edit-iq8r.rad` | [Hugging Face model card](https://huggingface.co/rkcth/Krea-2-Raw-Radiance-Edit-IQ8R) |
+
+Accept each model's terms on Hugging Face to download the package.
+Verify its checkpoint and adapter hashes using the model card instructions.
+
+### Tested hardware
+
+The shared-serving preview was tested with two Radeon AI PRO R9700s
+with 32 GB of VRAM each and about 184 GiB of system RAM visible to Linux.
+Use that setup as a reference. A 128 GB system still needs validation for
+this release. RAM needs depend on your text model, context length, and how
+many image models you keep in RAM. The example sets aside 40 GiB for text
+model experts and targets 8 GiB of free system RAM. The image runtime and
+any cached weights need additional room.
+
+### Important new settings
+
+Start with the [two-card profile](deploy/compose/swift-shared.radiance.yaml).
+Add `image-model` under the text model’s entry in `models` to enable
+shared serving. The example already includes the settings for both image
+packages.
+
+| Set this in the text model entry | What it does |
+| --- | --- |
+| `image-model` | Selects the image checkpoint to load at startup. |
+| `image-model-reserve` | Lists additional image checkpoints you want to switch to by name. Radiance measures their GPU memory needs at startup. |
+| `lora-dir`, `max-loras`, `max-lora-rank` | Enable local LoRAs and give their combinations room to fit. Use `max-lora-rank: 128` for the Krea Turbo plus Identity Edit stack. |
+| `image-gen-max-refs` | Set to `2` to allow two reference images for Krea edits. |
+| `image-model-cache-mib` | Sets how much system RAM to use for keeping image models ready between switches. Increase it if you have room for more than the active model. |
+| `unloaded-image-expert-pool-mib` | Lets the text model reuse freed VRAM after an explicit image-model unload, up to the per-GPU cap you set. |
+
+Build the executable and plugins together for ABI 41. Set your checkpoint
+paths and memory limits, then run `radiance --config FILE --check`.
+Use `GET /v1/models` to list the IDs you can send in a request.
+See the [shared-serving guide](docs/GUIDE.md#serving-text-and-images-together)
+for queue controls and memory tuning.
+
+The Qwen IQ8R conversion starts from the selected
+[uncensored checkpoint](https://huggingface.co/0xSojalSec/Qwen-Image-2.1-Uncensored-HF).
+Krea generation, one- and two-reference editing, and registered outfill
+were tested.
+The optional Identity Edit V2 adapter is available from its
+[publisher](https://huggingface.co/conradlocke/krea2-identity-edit/blob/f33b26291c640e8ec50b0da420bfee3c9a660daa/krea2_identity_edit_v2_r64.safetensors).
+
+The verified shared profile uses a text primary and serves one generator
+job at a time. Switches and image work can pause text streaming. Other
+models in the upstream catalog have their own upstream support and were
+outside this release's shared-serving GPU validation.
+
+## About upstream Radiance
 
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and
 music generation. Its HTTP API speaks OpenAI's chat, completions, Responses, images, audio and video
@@ -15,38 +88,6 @@ Qwen3-ASR, the 0.8B-3B models) at interactive speed on a desktop CPU, the 27B an
 slowly than a card.
 
 To support the development of radiance: [Patreon](https://patreon.com/StillDeadCode).
-
-## Shared serving preview for Radiance 2.1
-
-This fork of [StillDeadcode's Radiance](https://codeberg.org/StillDeadcode/radiance)
-serves Swift Flash Next and registered image generators on one listener.
-The image queue selects a model and local LoRA strengths per request.
-Radiance can retain image weights in host RAM between switches and lend
-idle generator VRAM to the text model's MoE experts.
-
-Start with the [two-card profile](deploy/compose/swift-shared.radiance.yaml)
-and the [shared-serving guide](docs/GUIDE.md#serving-text-and-images-together).
-Build the executable and plugins together for ABI 41. Set your checkpoint
-paths and memory limits, then run `radiance --config FILE --check`.
-Use `GET /v1/models` to list the served model IDs.
-
-| Model package verified on two Radeon AI PRO R9700s | Checkpoint | Download status |
-| --- | --- | --- |
-| Qwen Image 2.1 (uncensored), IQ8R | `qwen-image-2.1-uc-iq8r.rad` | Gated upload pending under `rkcth/Radiance-IQ8R-from-Qwen-Image-2.1-Uncensored` |
-| Krea 2 Raw, IQ8R, with Turbo and Registered Outpaint adapters | `krea-2-raw-edit-iq8r.rad` | Gated upload pending under `rkcth/Krea-2-Raw-Radiance-Edit-IQ8R` |
-
-The Qwen IQ8R conversion starts from the selected
-[uncensored checkpoint](https://huggingface.co/0xSojalSec/Qwen-Image-2.1-Uncensored-HF).
-Krea generation, one- and two-reference editing, and registered outfill
-were tested. For two references, reserve two in `image-gen-max-refs`.
-For a stacked Krea adapter request, configure `max-lora-rank: 128`.
-The optional Identity Edit V2 adapter is available from its
-[publisher](https://huggingface.co/conradlocke/krea2-identity-edit/blob/f33b26291c640e8ec50b0da420bfee3c9a660daa/krea2_identity_edit_v2_r64.safetensors).
-
-The verified shared profile uses a text primary and serves one generator
-job at a time. Switches and image work can pause text streaming. Other
-models in the upstream catalog have their own upstream support and were
-outside this release's shared-serving GPU validation.
 
 ## Models
 
@@ -68,9 +109,11 @@ outside this release's shared-serving GPU validation.
 | Gemma 4 12B bf16: MTP, vision, audio | `gemma4-12b-bf16.rad` (25 GiB) | [download](https://huggingface.co/keptn/gemma4-12b-bf16) | — |
 | Gemma 4 12B int8 (i8a8): MTP, vision, audio | `gemma4-12b-i8g.rad` (14 GiB) | [download](https://huggingface.co/keptn/gemma4-12b-i8g) | — |
 | Qwen-Image 2.1 IQ8R: text to image and image edits | `qwen-image-2.1-iq8r.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r) | `tp1.yaml`, `tp2.yaml` |
+| Qwen Image 2.1 Uncensored IQ8R, fork package: text to image and reference edits | `qwen-image-2.1-uc-iq8r.rad` (16.1 GiB) | [download](https://huggingface.co/rkcth/Radiance-IQ8R-from-Qwen-Image-2.1-Uncensored) | [shared example](deploy/compose/swift-shared.radiance.yaml) |
 | Qwen-Image 2.1 Turbo IQ8R: the same in 8 steps | `qwen-image-2.1-turbo-iq8r.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-iq8r) | — |
 | Krea 2 Turbo IQ8R: text to image, one card | `krea-2-turbo-iq8r.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-iq8r) | — |
 | Krea 2 Raw IQ8R: the same, undistilled | `krea-2-raw-iq8r.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-raw-radiance-iq8r) | — |
+| Krea 2 Raw Edit IQ8R, fork package: generation, one- and two-reference edits, and outpainting | `krea-2-raw-edit-iq8r.rad` (17.2 GiB) | [download](https://huggingface.co/rkcth/Krea-2-Raw-Radiance-Edit-IQ8R) | [shared example](deploy/compose/swift-shared.radiance.yaml) |
 | FLUX.3 [klein] IQ8R: text to image and edits from up to ten pictures, one card | `flux-3-klein-iq8r.rad` (9.4 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-iq8r) | — |
 | FLUX.3 [klein] base IQ8R | `flux-3-klein-base-iq8r.rad` (9.3 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-base-iq8r) | — |
 | LTX-2.5 distilled IQ8R: video with its stereo soundtrack from text or a first frame, one card | `ltx-2.5-distilled-iq8r.rad` (37 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-iq8r) | — |
