@@ -989,6 +989,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     j->from_image = !r->image.empty();
     j->decoder = decoder;
     const double upscale = r->upscale;
+    auto model_lease = deps_.front ? deps_.front->hold_active_job(this) : nullptr;
     {
         std::string w;
         const int s = deps_.videos->submit(std::move(r), &w);
@@ -1020,9 +1021,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     sweep_videos_locked(unix_now());
     videos_.push_back(j);
     if (deps_.background) deps_.background->fetch_add(1);
-    j->worker = std::thread([this, j] {
+    j->worker = std::thread([this, j, model_lease = std::move(model_lease)]() mutable {
         video_work(j);
         if (deps_.background) deps_.background->fetch_sub(1);
+        model_lease.reset();
     });
     return HttpResponse::json_body(200, json_dump(video_json(*j)));
 }
