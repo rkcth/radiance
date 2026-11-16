@@ -2051,6 +2051,8 @@ guidance and sampler in f32.
 | `wan_mod_norm` | `M`(range) `n` `group` `eps`:f64/opt `round_norm`/opt `dtype` | F32 `x`, F32 `time`, F32 `table`w, I32 `split`? → `y` |
 | `wan_gated_add` | `M`(range) `n` `gate` `dtype` | F32 `x`:inout, BF16 `update`, F32 `time`?, F32 `table`w?, I32 `split`? |
 | `wan_unpatch` | `M`(range) `n` `dtype` | `patches`, I32 latent `geom` → F32 `velocity` |
+| `wan_vae_history` | `M`(range) `temporal` `reset` `dtype` | BF16 `x`, BF16 `history`:inout → BF16 `y` |
+| `wan_vae_expand` | `M`(range) `cin` `cout` `st` `s` `drop` `temporal` `dtype` | BF16 `x`, I32 `geom` → BF16 `y` |
 | `s2d3d` | `M`(range) `C` `st` `sh` `sw` `tpre`/opt `group`/opt `mode` `add`/opt `dtype` | `x`, `geom`, `y`:inout |
 | `pix_patch` | `M`(range) `p` `C` `order`/opt `dtype` | `x` → `y` |
 | `stft_logmel` | `M`(range) `hop` `nfft` `n_mel` `ch` `dtype` | `x`, `basis`w, `mel`w → `y` |
@@ -2088,6 +2090,13 @@ guidance and sampler in f32.
   `round_norm` is used in the first block, whose inputs originated as BF16 patch embeddings.
   `wan_gated_add` accumulates into F32. Gates 2 and 5 select the self-attention and feed-forward
   coefficients. Gate -1 adds the cross-attention update directly.
+- `wan_vae_history` stores two frames per decoder layer and request lane. For spatial
+  convolution it prepends those frames to the current volume. For a temporal convolution it
+  forms three adjacent samples per channel in each output row. `reset=1` supplies zero
+  history and then saves the current chunk's tail. The spatial geometry is fixed until reset.
+- `wan_vae_expand` converts time-convolution output columns `[dt, C]` into consecutive
+  frames when `temporal=1`. With `temporal=0` it repeats channels and expands the shortcut's
+  `[C, dt, dy, dx]` layout. `drop` removes leading output frames on the first chunk.
 - `head_gate`: `x = rd(x rd(2 rd(sigmoid(g))))` for each head's `head_dim` values, `g`
   `[M, >= n_head]` the head's logit (the gated attention's `to_gate_logits`), each operand at its
   own row pitch.

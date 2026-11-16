@@ -128,6 +128,20 @@ second case uses the image-to-video time split with the test latent.
 The complete video path still needs VAE encoding and decoding, guidance,
 and latent updates in the serving architecture.
 
+The VAE temporal operators now carry two causal frames per layer and
+request lane. A temporal upsampler bypasses its convolution on the first
+chunk. Its first convolution starts with zero history, and later chunks
+reuse the cached tail. The shortcut uses the reference's channel
+repetition and drops one expanded temporal plane on the first chunk.
+
+With the pinned BF16-cast VAE weights on an R9700, the decoder input
+convolution matched 184,294 of 184,320 output values exactly
+(`2.82e-5` relative RMSE). The temporal convolution and shuffle matched
+322,500 of 322,560 values (`3.75e-5` relative RMSE). The shortcut matched
+the reference exactly with and without the first-chunk crop. The probe
+used the registered 3D convolution weight relayout and ran ten chunks
+through two interleaved lanes, including a new sequence in a reused lane.
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,

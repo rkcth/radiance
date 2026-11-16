@@ -14,6 +14,7 @@
 #include "ref_ops.h"
 #include "rad_philox.h"
 #include "rad_wan_dit.h"
+#include "rad_wan_vae.h"
 
 #include <algorithm>
 #include <vector>
@@ -276,6 +277,55 @@ int ref_wan_gated_add(const RadArgs* a, RadStream) {
                 value *= static_cast<const float*>(table->data)[off] + mod[off];
             }
             state[r * x->stride[0] + c] += value;
+        }
+    return RAD_OK;
+}
+
+int ref_wan_vae_history(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *history = &a->t[1], *out = &a->t[2];
+    const int64_t mode = p_int(a, "temporal", 0), reset = p_int(a, "reset", 0);
+    if ((mode != 0 && mode != 1) || (reset != 0 && reset != 1)) return RAD_E_INVAL;
+    int64_t plane, frames;
+    RAD_REF_TRY(rad_wan_vae::check_history(x, history, out, mode != 0, plane, frames));
+    const int64_t channels = x->shape[1];
+    const auto* src = static_cast<const uint16_t*>(x->data);
+    auto* cache = static_cast<uint16_t*>(history->data);
+    auto* dest = static_cast<uint16_t*>(out->data);
+    REF_PAR_FOR(plane * channels)
+    for (int64_t i = 0; i < plane * channels; ++i) {
+        const int64_t pixel = i / channels, c = i % channels;
+        if (mode)
+            rad_wan_vae::history_cell<true>(src, cache, dest, pixel, c, plane, frames,
+                                            x->stride[0], history->stride[0], out->stride[0], reset != 0);
+        else
+            rad_wan_vae::history_cell<false>(src, cache, dest, pixel, c, plane, frames,
+                                             x->stride[0], history->stride[0], out->stride[0], reset != 0);
+    }
+    return RAD_OK;
+}
+
+int ref_wan_vae_expand(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *geom = &a->t[1], *out = &a->t[2];
+    const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
+    const int64_t st = p_int(a, "st", 1), s = p_int(a, "s", 1), drop = p_int(a, "drop", 0);
+    const int64_t mode = p_int(a, "temporal", 0);
+    if (mode != 0 && mode != 1) return RAD_E_INVAL;
+    RAD_REF_TRY(rad_wan_dit::check_grid(geom));
+    RAD_REF_TRY(rad_wan_vae::check_expand(x, out, cin, cout, st, s, drop, mode != 0));
+    const auto* dims = static_cast<const int32_t*>(geom->data);
+    const int64_t rows = out->shape[0];
+    if (!rad_wan_vae::check_expand_grid(dims, x->shape[0], rows, st, s, drop))
+        return RAD_E_SHAPE;
+    const auto* input = static_cast<const uint16_t*>(x->data);
+    auto* output = static_cast<uint16_t*>(out->data);
+    REF_PAR_FOR(rows * cout)
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < cout; ++c) {
+            const int64_t at = rad_wan_vae::expand_offset(r, c, dims[1], dims[2], cin, cout,
+                                                          st, s, drop, mode != 0, x->stride[0]);
+            output[r * out->stride[0] + c] = input[at];
         }
     return RAD_OK;
 }

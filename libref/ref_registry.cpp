@@ -1005,6 +1005,15 @@ static const RadOperandSpec oWanGate[] = {
     INOUT("x"), OPD("update"), OPD_O("time"), WGT_O("table"), OPD_O("split"),
 };
 static const RadOperandSpec oWanUnpatch[] = { OPD("patches"), OPD("geom"), OUT("velocity") };
+static const RadParamSpec pWanVaeHistory[] = {
+    P_INT("M"), P_INT("temporal"), P_INT("reset"), P_STR("dtype"),
+};
+static const RadParamSpec pWanVaeExpand[] = {
+    P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("st"), P_INT("s"), P_INT("drop"),
+    P_INT("temporal"), P_STR("dtype"),
+};
+static const RadOperandSpec oWanVaeHistory[] = { OPD("x"), INOUT("history"), OUT("y") };
+static const RadOperandSpec oWanVaeExpand[] = { OPD("x"), OPD("geom"), OUT("y") };
 /* ---- video sparse attention (ref_vsa.cpp). `segs` cuts the rows into dense segments and the
  * video grid, last; `geom` is the request's RadVideoGeom on the device (RAD_VGEOM_*). The two ops
  * share their parameters: attn_vsa recomputes k from `sparsity`. `v` of vsa_select is read for
@@ -2069,6 +2078,8 @@ static const RadOpSchema kSchemas[] = {
 { "wan_mod_norm", ARR(pWanModNorm), ARR(oWanModNorm), "Wan's timestep-modulated layer normalization." },
 { "wan_gated_add", ARR(pWanGate), ARR(oWanGate), "Wan's FP32 residual update with an optional gate." },
 { "wan_unpatch", ARR(pMnD), ARR(oWanUnpatch), "Expand Wan head patches into F32 NDHWC velocity rows." },
+{ "wan_vae_history", ARR(pWanVaeHistory), ARR(oWanVaeHistory), "Wan VAE causal history and temporal taps." },
+{ "wan_vae_expand", ARR(pWanVaeExpand), ARR(oWanVaeExpand), "Wan VAE temporal shuffle and shortcut upsample." },
 { "vsa_select", ARR(pVsa), ARR(oVsaSelect),
   "video sparse attention's tile selection. Tiles: each dense segment of `segs` in chunks of "
   "tile_t tile_h tile_w rows (P prefix tiles), then tile_t x tile_h x tile_w boxes over the "
@@ -2850,6 +2861,8 @@ SIMPLE("ref_wan_mod_norm", "wan_mod_norm", "norm", "Wan's timestep-modulated lay
 SIMPLE("ref_wan_gated_add", "wan_gated_add", "elem", "Wan's FP32 residual update",
        "f32 state and bf16 update", ref_wan_gated_add),
 SIMPLE("ref_wan_unpatch", "wan_unpatch", "elem", "Wan patch velocity to voxel velocity", "bf16/f32", ref_wan_unpatch),
+SIMPLE("ref_wan_vae_history", "wan_vae_history", "elem", "Wan VAE causal history", "bf16", ref_wan_vae_history),
+SIMPLE("ref_wan_vae_expand", "wan_vae_expand", "elem", "Wan VAE temporal shuffle and shortcut", "bf16", ref_wan_vae_expand),
 SIMPLE("ref_vsa_select", "vsa_select", "attn",
        "video sparse attention's top-k tiles by pooled score, and the coarse branch",
        "float q, k, v and coarse; i32 segs, geom and sel", ref_vsa_select),

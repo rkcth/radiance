@@ -3616,6 +3616,34 @@ int ref_wan_unpatch_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("wan_unpatch", operand, out);
 }
 
+int ref_wan_vae_history_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0);
+    const bool temporal = gi(p, n_p, "temporal", 0) != 0;
+    if (rows < 1 || rows > INT32_MAX) return RAD_E_SHAPE;
+    constexpr int64_t channels = 8;
+    const int64_t cached = rows % 2 == 0 ? 4 : 2;
+    Opd o;
+    o.t(RAD_BF16, {rows, channels});
+    o.t(RAD_BF16, {cached, channels});
+    o.t(RAD_BF16, {temporal ? rows : rows + cached, temporal ? 3 * channels : channels});
+    return o.finish("wan_vae_history", operand, out);
+}
+
+int ref_wan_vae_expand_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bound = gi(p, n_p, "M", 0);
+    if (bound < 1 || bound > (1ll << 30)) return RAD_E_SHAPE;
+    const int64_t side = cube_side(bound);
+    const int64_t cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    const int64_t st = gi(p, n_p, "st", 1), s = gi(p, n_p, "s", 1), drop = gi(p, n_p, "drop", 0);
+    if (cin < 1 || cin > 4096 || cout < 1 || cout > 4096 || st < 1 || st > 2 ||
+        s < 1 || s > 2 || drop < 0 || drop >= st) return RAD_E_SHAPE;
+    Opd o;
+    o.t(RAD_BF16, {side * side * side, cin});
+    o.t_idx({3}, 0, side, 0);
+    o.t(RAD_BF16, {(side * st - drop) * side * side * s * s, cout});
+    return o.finish("wan_vae_expand", operand, out);
+}
+
 int ref_conv3d_ndhwc_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
     const int64_t k = gi(p, n_p, "k", 0), kt = gi(p, n_p, "kt", 0), c = cube_side(M);

@@ -19,6 +19,7 @@
 #include "r4d_q8.h"
 #include "rad_unipc_math.h"
 #include "rad_wan_dit.h"
+#include "rad_wan_vae.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -748,6 +749,30 @@ __global__ __launch_bounds__(kT) void wan_unpatch(
     }
 }
 
+template<bool Temporal>
+__global__ __launch_bounds__(kT) void wan_vae_history(
+    const uint16_t* x, uint16_t* cache, uint16_t* out, int64_t plane, int64_t frames, int64_t n,
+    int64_t x_ld, int64_t h_ld, int64_t y_ld, bool reset) {
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < plane * n;
+         i += (int64_t)gridDim.x * kT)
+        rad_wan_vae::history_cell<Temporal>(x, cache, out, i / n, i % n, plane, frames,
+                                            x_ld, h_ld, y_ld, reset);
+}
+
+__global__ __launch_bounds__(kT) void wan_vae_expand(
+    const uint16_t* x, const int32_t* geom, uint16_t* y, int64_t rows, int64_t expanded,
+    int cin, int cout, int st, int s, int drop, bool temporal, int64_t x_ld, int64_t y_ld) {
+    if (!rad_wan_vae::check_expand_grid(geom, rows, expanded, st, s, drop)) return;
+    const int64_t height = geom[1], width = geom[2], total = expanded * cout;
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / cout, c = i % cout;
+        const int64_t at = rad_wan_vae::expand_offset(row, c, height, width, cin, cout,
+                                                      st, s, drop, temporal, x_ld);
+        y[row * y_ld + c] = x[at];
+    }
+}
+
 unsigned wan_blocks(int64_t total) {
     const int64_t blocks = (total + kT - 1) / kT;
     return static_cast<unsigned>(blocks > 65535 ? 65535 : blocks);
@@ -858,6 +883,50 @@ extern "C" int r4d_rad_wan_gated_add(const RadArgs* a, RadStream s) {
                        table ? static_cast<const float*>(table->data) : nullptr,
                        split ? static_cast<const int32_t*>(split->data) : nullptr, (int)rows, (int)n,
                        (int)gate, x->stride[0], update->stride[0], time ? time->stride[0] : 0);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_vae_history(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *history = r4d_opt(a, 1), *out = r4d_opt(a, 2);
+    if (!x || !history || !out) return R4D_NO(RAD_E_INVAL);
+    const int64_t mode = r4d_geti_or(a, "temporal", 0), reset = r4d_geti_or(a, "reset", 0);
+    if ((mode != 0 && mode != 1) || (reset != 0 && reset != 1)) return R4D_NO(RAD_E_INVAL);
+    int64_t plane, frames;
+    const int rc = rad_wan_vae::check_history(x, history, out, mode != 0, plane, frames);
+    if (rc < 0) return R4D_NO(rc);
+    const int64_t n = x->shape[1];
+    const auto* src = static_cast<const uint16_t*>(x->data);
+    auto* cache = static_cast<uint16_t*>(history->data);
+    auto* dest = static_cast<uint16_t*>(out->data);
+    const dim3 grid(wan_blocks(plane * n));
+    if (mode)
+        hipLaunchKernelGGL(wan_vae_history<true>, grid, dim3(kT), 0, (hipStream_t)s,
+                           src, cache, dest, plane, frames, n,
+                           x->stride[0], history->stride[0], out->stride[0], reset != 0);
+    else
+        hipLaunchKernelGGL(wan_vae_history<false>, grid, dim3(kT), 0, (hipStream_t)s,
+                           src, cache, dest, plane, frames, n,
+                           x->stride[0], history->stride[0], out->stride[0], reset != 0);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_vae_expand(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *out = r4d_opt(a, 2);
+    if (!x || !geom || !out) return R4D_NO(RAD_E_INVAL);
+    const int64_t cin = r4d_geti_or(a, "cin", 0), cout = r4d_geti_or(a, "cout", 0);
+    const int64_t st = r4d_geti_or(a, "st", 1), spatial = r4d_geti_or(a, "s", 1),
+                  drop = r4d_geti_or(a, "drop", 0), mode = r4d_geti_or(a, "temporal", 0);
+    if (mode != 0 && mode != 1) return R4D_NO(RAD_E_INVAL);
+    int rc = rad_wan_dit::check_grid(geom);
+    if (rc < 0) return R4D_NO(rc);
+    rc = rad_wan_vae::check_expand(x, out, cin, cout, st, spatial, drop, mode != 0);
+    if (rc < 0) return R4D_NO(rc);
+    const int64_t rows = x->shape[0], expanded = out->shape[0];
+    hipLaunchKernelGGL(wan_vae_expand, dim3(wan_blocks(expanded * cout)), dim3(kT), 0,
+                       (hipStream_t)s, static_cast<const uint16_t*>(x->data),
+                       static_cast<const int32_t*>(geom->data), static_cast<uint16_t*>(out->data),
+                       rows, expanded, (int)cin, (int)cout, (int)st, (int)spatial, (int)drop,
+                       mode != 0, x->stride[0], out->stride[0]);
     return st_of(hipGetLastError());
 }
 

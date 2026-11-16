@@ -3,6 +3,7 @@
 #include "../arch/wan/wan_denoiser.h"
 #include "../arch/wan/wan_dit_io.h"
 #include "../arch/wan/wan_time.h"
+#include "../arch/wan/wan_vae_time.h"
 
 TEST(wan_umt5_declares_each_checkpoint_tensor_and_runs_packed_conditioning) {
     RadBuilder builder{};
@@ -309,6 +310,71 @@ TEST(wan_denoiser_records_all_blocks_with_fp32_residual_and_velocity) {
         CHECK_EQ(run.issues.back().opd.back().rows, 48);
         CHECK_LINT(builder, &run);
     }
+}
+
+TEST(wan_vae_time_cache_bypasses_first_chunk_and_isolates_lanes) {
+    using namespace rad::arch;
+    RadBuilder b{};
+    Names names("wan");
+    const rad_buf in = decl_b(&b, "in", RAD_BF16, {16, 8}, RAD_BUF_PERSIST);
+    const rad_buf out = decl_b(&b, "out", RAD_BF16, {32, 8}, RAD_BUF_PERSIST);
+    const int32_t dims[] = {1, 2, 2};
+    const wan::VaeVolume volume{1, 2, 2, praw(dims, RAD_I32, 3)};
+    const wan::VaeChunkCapacity limit{8, 2, 2};
+    const wan::VaeChunkCapacity wide{9000, 2, 2};
+    CHECK(!wide.fits({1, 1, 9000, volume.geometry}, 0));
+    CHECK(!limit.fits({1, 2, 2, RAD_NONE}, 0));
+    wan::VaeTemporalUp up;
+    REQUIRE_EQ(up.declare(&b, names, "vae.up", "vae.decoder.up.time_conv",
+                         limit, 8, in, out, 0, grp_layer(0)), RAD_OK);
+    const auto* weight = find_w(b, "wan.vae.up.weight");
+    REQUIRE(weight);
+    CHECK_EQ(weight->d.rank, 5u);
+    CHECK_EQ(weight->d.shape[0], 16);
+    CHECK_EQ(weight->d.shape[1], 8);
+    CHECK_EQ(weight->d.shape[2], 3);
+    CHECK_EQ(weight->d.shape[3], 1);
+    for (int chunk : {0, 1, 2}) {
+        RadCtx run{};
+        run.b = &b;
+        up.step(&run, volume, 1, chunk, RAD_B(in), RAD_B(out));
+        REQUIRE(run.step_fail.empty());
+        if (chunk == 0) {
+            REQUIRE_EQ(run.issues.size(), 1u);
+            CHECK(b.ops.at(run.issues[0].op - 1).op == "cast");
+            CHECK_EQ(run.issues[0].opd.back().rows, 4);
+        } else {
+            REQUIRE_EQ(run.issues.size(), 3u);
+            const auto& issue = run.issues.front();
+            const auto& op = b.ops.at(issue.op - 1);
+            CHECK(op.op == "wan_vae_history");
+            CHECK_EQ(pint(&op, "reset"), chunk == 1);
+            CHECK_EQ(issue.opd.at(1).offset, 2 * 8 * 8);
+            CHECK_EQ(issue.opd.at(1).rows, 8);
+            CHECK_EQ(run.issues.back().opd.back().rows, 8);
+        }
+        CHECK_LINT(b, &run);
+    }
+}
+
+TEST(wan_vae_causal_convolution_excludes_history_outputs) {
+    using namespace rad::arch;
+    RadBuilder b{};
+    Names names("wan");
+    const auto in = decl_b(&b, "in", RAD_BF16, {16, 8}, RAD_BUF_PERSIST);
+    const auto out = decl_b(&b, "out", RAD_BF16, {16, 8}, RAD_BUF_PERSIST);
+    wan::VaeCausalConv conv;
+    REQUIRE_EQ(conv.declare(&b, names, "vae.conv", "vae.decoder.conv_in", {8, 2, 2},
+                           8, 8, in, out, 0, grp_layer(0)), RAD_OK);
+    int32_t dims[] = {2, 2, 2};
+    RadCtx run{};
+    run.b = &b;
+    conv.step(&run, {2, 2, 2, praw(dims, RAD_I32, 3)}, 0, false, RAD_B(in), RAD_B(out));
+    REQUIRE_EQ(run.issues.size(), 4u);
+    CHECK_EQ(run.issues[2].n, 16);
+    CHECK_EQ(run.issues[3].opd.at(0).offset, 2 * 4 * 8);
+    CHECK_EQ(run.issues[3].opd.back().rows, 8);
+    CHECK_LINT(b, &run);
 }
 
 RAD_TEST_MAIN()
