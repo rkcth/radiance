@@ -233,7 +233,7 @@ private:
     HttpResponse metrics(const HttpRequest& q);
     void         install_routes(const Router& model_router);
     /* Leases on every Open entry, for the fleet-wide routes. */
-    std::vector<std::pair<Entry*, std::shared_ptr<void>>> hold_open();
+    std::vector<std::pair<Entry*, std::shared_ptr<void>>> hold_open(bool include_draining_jobs = false);
 
     TransportOptions      topts_;
     int64_t               keepalive_ms_ = 0;
