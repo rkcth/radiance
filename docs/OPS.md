@@ -2047,7 +2047,9 @@ guidance and sampler in f32.
 | `pixel_norm` | `M`(range) `n` `eps`:f64 `form` `act`/opt `ileave`/opt `dtype` `mult`:f64/opt | `x` → `y` |
 | `d2s3d` | `M`(range) `C` `st` `sh` `sw` `drop`/opt `dtype` | `x`, `geom` → `y` |
 | `wan_rope_table` | `M`(range) `dtype` | I32 latent `geom` → F32 `table` |
-| `wan_rope` | `M`(range) `heads` `dtype` | BF16 `q`:inout, BF16 `k`:inout, F32 `table` |
+| `wan_rope` | `M`(range) `heads` `dtype` | `q`:inout, `k`:inout, F32 `table` |
+| `wan_mod_norm` | `M`(range) `n` `group` `eps`:f64/opt `round_norm`/opt `dtype` | F32 `x`, F32 `time`, F32 `table`w, I32 `split`? → `y` |
+| `wan_gated_add` | `M`(range) `n` `gate` `dtype` | F32 `x`:inout, BF16 `update`, F32 `time`?, F32 `table`w?, I32 `split`? |
 | `wan_unpatch` | `M`(range) `n` `dtype` | `patches`, I32 latent `geom` → F32 `velocity` |
 | `s2d3d` | `M`(range) `C` `st` `sh` `sw` `tpre`/opt `group`/opt `mode` `add`/opt `dtype` | `x`, `geom`, `y`:inout |
 | `pix_patch` | `M`(range) `p` `C` `order`/opt `dtype` | `x` → `y` |
@@ -2075,9 +2077,17 @@ guidance and sampler in f32.
   of interleaved cosines and sines for each 1 × 2 × 2 patch. The 128-wide head rotates adjacent
   pairs, with 22 pairs on time and 21 each on height and width. Each axis starts its own
   frequency ladder at 1. Angles and trigonometry use FP64, and the table stores FP32.
-  `wan_rope` reuses that table across heads and rotates the BF16 queries and keys in place.
+  `wan_rope` reuses that table across heads and rotates BF16 or F32 queries and keys in place.
   `wan_unpatch` expands `[dy, dx, channel]` head columns to F32 voxel rows, with
   x varying fastest, then y, then time. Its `dtype` is the source patch dtype.
+- `wan_mod_norm` applies layer normalization and then `norm(x) * (1 + scale) + shift`.
+  Groups 0 and 3 read the first or second modulation triplet. Group -1 uses the same time
+  embedding for both head coefficients. Each coefficient adds its learned table row.
+  An optional scalar `split` marks the first row after the conditioned frame. Rows below it
+  read the timestep-zero coefficients. Without it, every row uses the sole time row.
+  `round_norm` is used in the first block, whose inputs originated as BF16 patch embeddings.
+  `wan_gated_add` accumulates into F32. Gates 2 and 5 select the self-attention and feed-forward
+  coefficients. Gate -1 adds the cross-attention update directly.
 - `head_gate`: `x = rd(x rd(2 rd(sigmoid(g))))` for each head's `head_dim` values, `g`
   `[M, >= n_head]` the head's logit (the gated attention's `to_gate_logits`), each operand at its
   own row pitch.

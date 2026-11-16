@@ -190,8 +190,9 @@ int ref_wan_rope(const RadArgs* a, RadStream) {
     const RadTensor *q = &a->t[0], *k = &a->t[1], *table = &a->t[2];
     const int64_t rows = q->shape[0], heads = p_int(a, "heads", 0);
     if (heads < 1 || heads > 128) return RAD_E_SHAPE;
-    RAD_REF_TRY(check_matrix(q, RAD_BF16, rows, heads * head_width));
-    RAD_REF_TRY(check_matrix(k, RAD_BF16, rows, heads * head_width));
+    if (q->dtype != RAD_F32 && q->dtype != RAD_BF16) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(q, q->dtype, rows, heads * head_width));
+    RAD_REF_TRY(check_matrix(k, q->dtype, rows, heads * head_width));
     RAD_REF_TRY(check_matrix(table, RAD_F32, rows, head_width));
     REF_PAR_FOR(rows * heads * head_width)
     for (int64_t row = 0; row < rows; ++row) {
@@ -205,6 +206,77 @@ int ref_wan_rope(const RadArgs* a, RadStream) {
                     stt(x, off + 1, im * cs[i] + re * cs[i + 1]);
                 }
     }
+    return RAD_OK;
+}
+
+int ref_wan_mod_norm(const RadArgs* a, RadStream) {
+    if (!have(a, 3) || !t_in(a, 4)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *x = &a->t[0], *time = &a->t[1], *table = &a->t[2];
+    const RadTensor *split = t_in(a, 3), *y = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), rows = x->shape[0];
+    const int64_t group = p_int(a, "group", 0);
+    const bool head = group == -1, round = p_int(a, "round_norm", 0) != 0;
+    const float eps = p_f32(a, "eps", 1e-6f);
+    if (n < 1 || n > 4096 || (group != -1 && group != 0 && group != 3) ||
+        !(eps > 0) || !std::isfinite(eps)) return RAD_E_SHAPE;
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(x, RAD_F32, rows, n));
+    RAD_REF_TRY(check_matrix(y, y->dtype, rows, n));
+    RAD_REF_TRY(check_modulation(time, table, split, n, head));
+    const int64_t first = split ? ldi(split, 0) : rows;
+    if (first < 0 || first > rows) return RAD_E_SHAPE;
+    const int64_t shift_row = head ? 0 : group;
+    const int64_t scale_row = head ? 0 : group + 1;
+    const auto* weights = static_cast<const float*>(table->data) + shift_row * n;
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        const auto* row = static_cast<const float*>(x->data) + r * x->stride[0];
+        const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+        float mean = 0.0f, variance = 0.0f;
+        for (int64_t c = 0; c < n; ++c) mean += row[c];
+        mean /= static_cast<float>(n);
+        for (int64_t c = 0; c < n; ++c) {
+            const float centered = row[c] - mean;
+            variance += centered * centered;
+        }
+        const float inverse = 1.0f / std::sqrt(variance / static_cast<float>(n) + eps);
+        for (int64_t c = 0; c < n; ++c) {
+            const float norm = (row[c] - mean) * inverse;
+            const float scale = weights[n + c] + mod[scale_row * n + c];
+            const float shift = weights[c] + mod[shift_row * n + c];
+            stt(y, r * y->stride[0] + c, (round ? round_dt(RAD_BF16, norm) : norm) * (1.0f + scale) + shift);
+        }
+    }
+    return RAD_OK;
+}
+
+int ref_wan_gated_add(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *x = &a->t[0], *update = &a->t[1];
+    const RadTensor *time = t_in(a, 2), *table = t_in(a, 3), *split = t_in(a, 4);
+    const int64_t n = p_int(a, "n", 0), rows = x->shape[0], gate = p_int(a, "gate", -1);
+    const bool gated = gate != -1;
+    if (n < 1 || n > 4096 || (gated && gate != 2 && gate != 5)) return RAD_E_SHAPE;
+    if (gated ? (!time || !table) : (time || table || split)) return RAD_E_INVAL;
+    RAD_REF_TRY(check_matrix(x, RAD_F32, rows, n));
+    RAD_REF_TRY(check_matrix(update, RAD_BF16, rows, n));
+    if (gated) RAD_REF_TRY(check_modulation(time, table, split, n, false));
+    const int64_t first = split ? ldi(split, 0) : rows;
+    if (first < 0 || first > rows) return RAD_E_SHAPE;
+    auto* state = static_cast<float*>(x->data);
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < n; ++c) {
+            float value = ldt(update, r * update->stride[0] + c);
+            if (gated) {
+                const int64_t off = gate * n + c;
+                const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+                value *= static_cast<const float*>(table->data)[off] + mod[off];
+            }
+            state[r * x->stride[0] + c] += value;
+        }
     return RAD_OK;
 }
 

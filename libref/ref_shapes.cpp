@@ -3559,11 +3559,46 @@ int ref_wan_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     const int64_t rows = gi(p, n_p, "M", 0), heads = gi(p, n_p, "heads", 0);
     if (rows < 1 || rows > INT32_MAX || heads < 1 || heads > 128) return RAD_E_SHAPE;
     const int64_t width = heads * rad_wan_dit::head_width;
+    const uint32_t dtype = act_dt(p, n_p);
+    if (dtype != RAD_BF16 && dtype != RAD_F32) return RAD_E_DTYPE;
     Opd o;
-    o.t(RAD_BF16, {rows, width});
-    o.t(RAD_BF16, {rows, width});
+    o.t(dtype, {rows, width});
+    o.t(dtype, {rows, width});
     o.t(RAD_F32, {rows, rad_wan_dit::head_width});
     return o.finish("wan_rope", operand, out);
+}
+
+int ref_wan_mod_norm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    const bool head = gi(p, n_p, "group", 0) == -1;
+    if (rows < 1 || rows > INT32_MAX || width < 1 || width > 4096) return RAD_E_SHAPE;
+    const uint32_t dtype = act_dt(p, n_p);
+    if (dtype != RAD_BF16 && dtype != RAD_F32) return RAD_E_DTYPE;
+    Opd o;
+    o.t(RAD_F32, {rows, width});
+    o.t(RAD_F32, {1, head ? width : 6 * width});
+    o.t(RAD_F32, {1, head ? 2 : 6, width});
+    o.skip();
+    o.t(dtype, {rows, width});
+    return o.finish("wan_mod_norm", operand, out);
+}
+
+int ref_wan_gated_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    if (rows < 1 || rows > INT32_MAX || width < 1 || width > 4096) return RAD_E_SHAPE;
+    const bool gated = gi(p, n_p, "gate", -1) != -1;
+    Opd o;
+    o.t(RAD_F32, {rows, width});
+    o.t(RAD_BF16, {rows, width});
+    if (gated) {
+        o.t(RAD_F32, {1, 6 * width});
+        o.t(RAD_F32, {1, 6, width});
+    } else {
+        o.skip();
+        o.skip();
+    }
+    o.skip();
+    return o.finish("wan_gated_add", operand, out);
 }
 
 int ref_wan_unpatch_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

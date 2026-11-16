@@ -45,10 +45,12 @@ and rejects alternate samplers. The Wan graph still needs to bind these
 operands and supply its predicted velocity.
 
 The verified Diffusers files store the text encoder in BF16 and the
-transformer and VAE in FP32. The conversion recipe retains the transformer's
-timestep projections in FP32 and casts the remaining transformer and VAE
-weights to BF16. `rad-convert` requires the Wan architecture's declaration
-before emitting a runnable container.
+transformer and VAE in FP32. The conversion recipe keeps the timestep
+projections, normalization gains, modulation tables, and velocity head
+in FP32. It casts the denoiser's other projections and the VAE weights
+to BF16. The recipe matches declared weight names. The denoiser probe
+checked each declared dtype against these rules. `rad-convert` still
+requires the Wan architecture's declaration to emit a runnable container.
 
 Wan's UMT5 relative-position attention now runs in libref and on gfx1201.
 A seeded BF16 comparison with pinned Wan's PyTorch expression used 64 heads
@@ -100,8 +102,31 @@ instead keeps FP64 through the rotation and narrows to FP32 and then BF16
 at its attention boundary. A dense 24-head comparison used four grids,
 including coordinate 1023 on each axis. The R9700 matched 18,947,937 of
 18,948,096 BF16 outputs exactly, with maximum absolute error `0.0078125`.
-The next DiT step is to wire these paths into the self-attention,
-cross-attention, and residual blocks.
+
+The denoiser graph now issues all 30 self-attention, cross-attention,
+and feed-forward blocks and the F32 velocity head. Residual and
+modulation arithmetic stays in F32. Q and K normalization rounds to
+BF16 before applying the F32 gain. Self-attention keeps the resulting
+queries and keys in F32 through rotary and narrows them for attention.
+With the real first-layer gains and dense inputs, that FP32 rotary path
+matched 18,947,923 of 18,948,096 reference values after BF16 narrowing.
+The maximum absolute difference was `0.03125`.
+
+A device probe staged 821 source tensors on one R9700 and compared a
+12-patch denoising pass at timestep 999 with the pinned Wan block and
+head implementation. The PyTorch oracle used CPU scaled dot-product
+attention with BF16 inputs and the reference's output dtype. Both ran
+on the same latent and projected prompts.
+
+| Conditioning | Velocity relative RMSE | Velocity cosine similarity |
+| --- | ---: | ---: |
+| Text only | 0.75% | 0.999973 |
+| First temporal patch plane at timestep zero | 1.89% | 0.999823 |
+
+This compares the denoiser before sampler updates or VAE decoding. The
+second case uses the image-to-video time split with the test latent.
+The complete video path still needs VAE encoding and decoding, guidance,
+and latent updates in the serving architecture.
 
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata

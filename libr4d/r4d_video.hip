@@ -659,14 +659,16 @@ __global__ void wan_rope_table(const int32_t* dims, float* table, int64_t rows, 
     dst[1] = static_cast<float>(sin(angle));
 }
 
-__device__ __forceinline__ void wan_turn(uint16_t* x, float co, float si) {
-    const float re = bf2f(x[0]), im = bf2f(x[1]);
-    x[0] = f32_to_bf16(re * co - im * si);
-    x[1] = f32_to_bf16(im * co + re * si);
+template<typename T>
+__device__ __forceinline__ void wan_turn(T* x, float co, float si) {
+    const float re = ldv(x, 0), im = ldv(x, 1);
+    stv(x, 0, re * co - im * si);
+    stv(x, 1, im * co + re * si);
 }
 
+template<typename T>
 __global__ __launch_bounds__(kT) void wan_rope(
-    uint16_t* q, uint16_t* k, const float* table, int64_t total, int row_width,
+    T* q, T* k, const float* table, int64_t total, int row_width,
     int64_t q_ld, int64_t k_ld, int64_t table_ld) {
     for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
          i += (int64_t)gridDim.x * kT) {
@@ -675,6 +677,59 @@ __global__ __launch_bounds__(kT) void wan_rope(
         const float* cs = table + row * table_ld + col % rad_wan_dit::head_width;
         wan_turn(q + row * q_ld + col, cs[0], cs[1]);
         wan_turn(k + row * k_ld + col, cs[0], cs[1]);
+    }
+}
+
+template<typename Out>
+__global__ __launch_bounds__(kT) void wan_mod_norm(
+    const float* x, const float* time, const float* table, const int32_t* split,
+    Out* y, int rows, int n, int group, bool round, float eps, int64_t xp, int64_t tp, int64_t yp) {
+    __shared__ float sums[kT / 32];
+    const int row = blockIdx.x;
+    const int first = split ? *split : rows;
+    if (first < 0 || first > rows) return;
+    x += row * xp;
+    y += row * yp;
+    time += row >= first ? tp : 0;
+    const bool head = group == -1;
+    const float* shift_time = time + (head ? 0 : group * n);
+    const float* scale_time = time + (head ? 0 : (group + 1) * n);
+    const float* shift_weight = table + (head ? 0 : group * n);
+    const float* scale_weight = shift_weight + n;
+    float mean = 0.0f;
+    for (int c = threadIdx.x; c < n; c += kT) mean += x[c];
+    mean = block_sum(mean, sums) / n;
+    // Finish consuming the first set of LDS partials before reusing it.
+    __syncthreads();
+    float variance = 0.0f;
+    for (int c = threadIdx.x; c < n; c += kT) {
+        const float centered = x[c] - mean;
+        variance += centered * centered;
+    }
+    const float inverse = rsqrtf(block_sum(variance, sums) / n + eps);
+    for (int c = threadIdx.x; c < n; c += kT) {
+        const float norm = (x[c] - mean) * inverse;
+        const float scale = scale_weight[c] + scale_time[c];
+        const float shift = shift_weight[c] + shift_time[c];
+        stv(y, c, (round ? bfr(norm) : norm) * (1.0f + scale) + shift);
+    }
+}
+
+__global__ __launch_bounds__(kT) void wan_gated_add(
+    float* x, const uint16_t* update, const float* time, const float* table, const int32_t* split,
+    int rows, int n, int gate, int64_t xp, int64_t up, int64_t tp) {
+    const int first = split ? *split : rows;
+    if (first < 0 || first > rows) return;
+    const int64_t total = (int64_t)rows * n;
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / n, c = i % n;
+        float v = bf2f(update[row * up + c]);
+        if (gate != -1) {
+            const int64_t off = gate * n + c;
+            v *= table[off] + time[(row >= first ? tp : 0) + off];
+        }
+        x[row * xp + c] += v;
     }
 }
 
@@ -725,17 +780,84 @@ extern "C" int r4d_rad_wan_rope(const RadArgs* a, RadStream s) {
     const int64_t rows = q->shape[0], heads = r4d_geti_or(a, "heads", 0);
     if (heads < 1 || heads > 128 || rows > INT32_MAX) return R4D_NO(RAD_E_SHAPE);
     const int width = static_cast<int>(heads * head_width);
-    int rc = check_matrix(q, RAD_BF16, rows, width);
+    if (q->dtype != RAD_F32 && q->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    int rc = check_matrix(q, q->dtype, rows, width);
     if (rc != RAD_OK) return R4D_NO(rc);
-    rc = check_matrix(k, RAD_BF16, rows, width);
+    rc = check_matrix(k, q->dtype, rows, width);
     if (rc != RAD_OK) return R4D_NO(rc);
     rc = check_matrix(table, RAD_F32, rows, head_width);
     if (rc != RAD_OK) return R4D_NO(rc);
     const int64_t total = rows * (width / 2);
-    hipLaunchKernelGGL(wan_rope, dim3(wan_blocks(total)), dim3(kT), 0, (hipStream_t)s,
-                       static_cast<uint16_t*>(q->data), static_cast<uint16_t*>(k->data),
-                       static_cast<const float*>(table->data), total, width, q->stride[0], k->stride[0],
-                       table->stride[0]);
+    const auto* cs = static_cast<const float*>(table->data);
+    const dim3 grid(wan_blocks(total));
+    if (q->dtype == RAD_F32)
+        hipLaunchKernelGGL(wan_rope<float>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<float*>(q->data), static_cast<float*>(k->data),
+                           cs, total, width, q->stride[0], k->stride[0], table->stride[0]);
+    else
+        hipLaunchKernelGGL(wan_rope<uint16_t>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<uint16_t*>(q->data), static_cast<uint16_t*>(k->data),
+                           cs, total, width, q->stride[0], k->stride[0], table->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_mod_norm(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *x = r4d_opt(a, 0), *time = r4d_opt(a, 1), *table = r4d_opt(a, 2),
+                    *split = r4d_opt(a, 3), *y = r4d_opt(a, 4);
+    if (!x || !time || !table || !y) return R4D_NO(RAD_E_INVAL);
+    const int64_t n = r4d_geti_or(a, "n", 0), rows = x->shape[0], group = r4d_geti_or(a, "group", 0);
+    const bool head = group == -1, round = r4d_geti_or(a, "round_norm", 0) != 0;
+    const float eps = r4d_getf(a, "eps", 1e-6);
+    if (n < 1 || n > 4096 || rows > INT32_MAX || (group != -1 && group != 0 && group != 3) ||
+        !(eps > 0) || !std::isfinite(eps)) return R4D_NO(RAD_E_SHAPE);
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    int rc = check_matrix(x, RAD_F32, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    rc = check_matrix(y, y->dtype, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    rc = check_modulation(time, table, split, n, head);
+    if (rc < 0) return R4D_NO(rc);
+    const auto* input = static_cast<const float*>(x->data);
+    const auto* t = static_cast<const float*>(time->data);
+    const auto* w = static_cast<const float*>(table->data);
+    const auto* cut = split ? static_cast<const int32_t*>(split->data) : nullptr;
+    const dim3 grid(static_cast<unsigned>(rows));
+    if (y->dtype == RAD_F32)
+        hipLaunchKernelGGL(wan_mod_norm<float>, grid, dim3(kT), 0, (hipStream_t)s,
+                           input, t, w, cut, static_cast<float*>(y->data), (int)rows, (int)n,
+                           (int)group, round, eps, x->stride[0], time->stride[0], y->stride[0]);
+    else
+        hipLaunchKernelGGL(wan_mod_norm<uint16_t>, grid, dim3(kT), 0, (hipStream_t)s,
+                           input, t, w, cut, static_cast<uint16_t*>(y->data), (int)rows, (int)n,
+                           (int)group, round, eps, x->stride[0], time->stride[0], y->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_gated_add(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *x = r4d_opt(a, 0), *update = r4d_opt(a, 1), *time = r4d_opt(a, 2),
+                    *table = r4d_opt(a, 3), *split = r4d_opt(a, 4);
+    if (!x || !update) return R4D_NO(RAD_E_INVAL);
+    const int64_t n = r4d_geti_or(a, "n", 0), rows = x->shape[0], gate = r4d_geti_or(a, "gate", -1);
+    const bool gated = gate != -1;
+    if (n < 1 || n > 4096 || rows > INT32_MAX || (gated && gate != 2 && gate != 5))
+        return R4D_NO(RAD_E_SHAPE);
+    if (gated ? (!time || !table) : (time || table || split)) return R4D_NO(RAD_E_INVAL);
+    int rc = check_matrix(x, RAD_F32, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    rc = check_matrix(update, RAD_BF16, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    if (gated) {
+        rc = check_modulation(time, table, split, n, false);
+        if (rc < 0) return R4D_NO(rc);
+    }
+    hipLaunchKernelGGL(wan_gated_add, dim3(wan_blocks(rows * n)), dim3(kT), 0, (hipStream_t)s,
+                       static_cast<float*>(x->data), static_cast<const uint16_t*>(update->data),
+                       time ? static_cast<const float*>(time->data) : nullptr,
+                       table ? static_cast<const float*>(table->data) : nullptr,
+                       split ? static_cast<const int32_t*>(split->data) : nullptr, (int)rows, (int)n,
+                       (int)gate, x->stride[0], update->stride[0], time ? time->stride[0] : 0);
     return st_of(hipGetLastError());
 }
 

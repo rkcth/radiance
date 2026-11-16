@@ -995,6 +995,15 @@ static const RadParamSpec pWanTable[] = { P_INT("M"), P_STR("dtype") };
 static const RadParamSpec pWanRope[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
 static const RadOperandSpec oWanTable[] = { OPD("geom"), OUT("table") };
 static const RadOperandSpec oWanRope[] = { INOUT("q"), INOUT("k"), OPD("table") };
+static const RadParamSpec pWanModNorm[] = { P_INT("M"), P_INT("n"), P_INT("group"),
+                                            P_F64O("eps"), P_INTO("round_norm"), P_STR("dtype") };
+static const RadParamSpec pWanGate[] = { P_INT("M"), P_INT("n"), P_INT("gate"), P_STR("dtype") };
+static const RadOperandSpec oWanModNorm[] = {
+    OPD("x"), OPD("time"), WGT("table"), OPD_O("split"), OUT("y"),
+};
+static const RadOperandSpec oWanGate[] = {
+    INOUT("x"), OPD("update"), OPD_O("time"), WGT_O("table"), OPD_O("split"),
+};
 static const RadOperandSpec oWanUnpatch[] = { OPD("patches"), OPD("geom"), OUT("velocity") };
 /* ---- video sparse attention (ref_vsa.cpp). `segs` cuts the rows into dense segments and the
  * video grid, last; `geom` is the request's RadVideoGeom on the device (RAD_VGEOM_*). The two ops
@@ -2056,7 +2065,9 @@ static const RadOpSchema kSchemas[] = {
   "T x H x W gets f32(scale) * (2 (c + 0.5) / n - 1) on each axis, in f32 as torch makes it, "
   "the rest of the period 0; y f32 [3, >= M] component-major at its own row pitch." },
 { "wan_rope_table", ARR(pWanTable), ARR(oWanTable), "Wan's three-axis rotary coefficients." },
-{ "wan_rope", ARR(pWanRope), ARR(oWanRope), "Apply Wan rotary coefficients to BF16 queries and keys." },
+{ "wan_rope", ARR(pWanRope), ARR(oWanRope), "Apply Wan rotary coefficients to queries and keys." },
+{ "wan_mod_norm", ARR(pWanModNorm), ARR(oWanModNorm), "Wan's timestep-modulated layer normalization." },
+{ "wan_gated_add", ARR(pWanGate), ARR(oWanGate), "Wan's FP32 residual update with an optional gate." },
 { "wan_unpatch", ARR(pMnD), ARR(oWanUnpatch), "Expand Wan head patches into F32 NDHWC velocity rows." },
 { "vsa_select", ARR(pVsa), ARR(oVsaSelect),
   "video sparse attention's tile selection. Tiles: each dense segment of `segs` in chunks of "
@@ -2834,6 +2845,10 @@ SIMPLE("ref_grid_pos3", "grid_pos3", "elem", "a video decoder's rotary positions
        DT_FLOAT, ref_grid_pos3),
 SIMPLE("ref_wan_rope_table", "wan_rope_table", "elem", "Wan rotary coefficients", "f32", ref_wan_rope_table),
 SIMPLE("ref_wan_rope", "wan_rope", "elem", "Wan rotary on queries and keys", "bf16/f32", ref_wan_rope),
+SIMPLE("ref_wan_mod_norm", "wan_mod_norm", "norm", "Wan's timestep-modulated layer normalization",
+       "f32 input, f32 or bf16 output", ref_wan_mod_norm),
+SIMPLE("ref_wan_gated_add", "wan_gated_add", "elem", "Wan's FP32 residual update",
+       "f32 state and bf16 update", ref_wan_gated_add),
 SIMPLE("ref_wan_unpatch", "wan_unpatch", "elem", "Wan patch velocity to voxel velocity", "bf16/f32", ref_wan_unpatch),
 SIMPLE("ref_vsa_select", "vsa_select", "attn",
        "video sparse attention's top-k tiles by pooled score, and the coarse branch",
