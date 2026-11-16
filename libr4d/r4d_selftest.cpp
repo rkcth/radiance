@@ -45,6 +45,7 @@
 #include "rad_encoding.h"
 #include "rad_philox.h"
 #include "rad_sample.h"
+#include "rad_unipc_math.h"
 #include "rad_yarn.h"
 
 #include <dlfcn.h>
@@ -10567,6 +10568,48 @@ void flow_rm_cases(const Plugin& pl) {
         bad += differ(down_f32(dx0, wantx0.size()), wantx0);
         ok((nm + " exact, both INOUT gaps untouched").c_str(), bad == 0,
            fmt("%lld values differ", (long long)bad));
+    }
+}
+
+void flow_unipc_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "flow_unipc_step_f32");
+    if (!r) { ok("flow_unipc_step_f32", false, "row absent"); return; }
+    const int64_t M = 19, n = 48, xld = n + 5, hld = 3 * n + 11;
+    // First prediction, a corrected prediction using all history, and terminal x0.
+    const std::vector<std::vector<float>> coefficients = {
+        { .9f, 0, 0, 0, 0, .8f, .2f, 0 },
+        { .72f, .8f, .2f, -.01f, .06f, .5f, .5f, -.1f },
+        { .36f, .5f, .5f, -.06f, .2f, 0, 1, 0 },
+    };
+    for (const bool bf : { false, true }) {
+        std::vector<float> x = randv(M * xld, 2.0f), history(M * hld, 15.0f);
+        std::vector<float> v = randv(M * n, 1.0f);
+        for (int64_t row = 0; row < M; ++row)
+            std::fill_n(history.begin() + row * hld, 3 * n, 0.0f);
+        void* dx = up_f32(x);
+        void* dh = up_f32(history);
+        void* dv = bf ? up_bf16(v) : up_f32(v);
+        RadTensor tx = T(dx, RAD_F32, { M, n }); tx.stride[0] = xld;
+        RadTensor th = T(dh, RAD_F32, { M, 3 * n }); th.stride[0] = hld;
+        const std::string name = fmt("flow_unipc_step_f32 %s velocity", bf ? "bf16" : "f32");
+        for (const auto& c : coefficients) {
+            const int rc = launch(r, { T(dv, bf ? RAD_BF16 : RAD_F32, { M, n }),
+                                       T(up_f32(c), RAD_F32, { rad_unipc::COUNT }), th, tx },
+                                  { PI("M", M), PI("n", n), PS("dtype", "f32") });
+            if (rc != RAD_OK) { ok(name.c_str(), false, "rc " + std::to_string(rc)); break; }
+            for (int64_t row = 0; row < M; ++row) {
+                for (int64_t col = 0; col < n; ++col) {
+                    float& sample = x[row * xld + col];
+                    float* h = history.data() + row * hld + col;
+                    sample = rad_unipc::advance(c.data(), sample, v[row * n + col],
+                                                h[0], h[n], h[2 * n]);
+                }
+            }
+            const int64_t bad = differ(down_f32(dx, x.size()), x) +
+                                differ(down_f32(dh, history.size()), history);
+            ok((name + ", sample and history including pitch gaps").c_str(), bad == 0,
+               fmt("%lld values differ", (long long)bad));
+        }
     }
 }
 
@@ -32780,6 +32823,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("rms_mod_bf16")) vid::rms_mod_cases(pl, false);
     if (sel("flow_x0_step_f32")) vid::flow_x0_cases(pl);
     if (sel("flow_res_multistep_f32")) vid::flow_rm_cases(pl);
+    if (sel("flow_unipc_step_f32")) vid::flow_unipc_cases(pl);
     if (sel("grid_pos3")) vid::grid_pos3_cases(pl);
     if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
     /* A video latent upscaler's ops, at its source and target sizes. */

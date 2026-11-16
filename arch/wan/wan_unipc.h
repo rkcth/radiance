@@ -2,6 +2,8 @@
  * depend only on the sigma grid and can be shared by all latent elements. */
 #pragma once
 
+#include "rad_unipc_math.h"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +23,17 @@ struct UniPCStep {
     float predict_sample;
     float predict_clean;
     float predict_delta;
+
+    void coefficients(float* values) const {
+        values[rad_unipc::SIGMA] = sigma;
+        values[rad_unipc::CORRECT_SAMPLE] = correct_sample;
+        values[rad_unipc::CORRECT_CLEAN] = correct_clean;
+        values[rad_unipc::CORRECT_PREVIOUS_DELTA] = correct_previous_delta;
+        values[rad_unipc::CORRECT_CURRENT_DELTA] = correct_current_delta;
+        values[rad_unipc::PREDICT_SAMPLE] = predict_sample;
+        values[rad_unipc::PREDICT_CLEAN] = predict_clean;
+        values[rad_unipc::PREDICT_DELTA] = predict_delta;
+    }
 };
 
 inline float flow_log_snr(float sigma) {
@@ -105,18 +118,10 @@ struct UniPCState {
 // to a latent element and starts at zero for each new request.
 inline float unipc_update(const UniPCStep& step, UniPCState& state, float sample,
                           float velocity) {
-    const float clean = sample - step.sigma * velocity;
-    if (step.correct_sample > 0.0f) {
-        sample = step.correct_sample * state.last_sample + step.correct_clean * state.last_clean +
-                 step.correct_previous_delta * (state.older_clean - state.last_clean) +
-                 step.correct_current_delta * (clean - state.last_clean);
-    }
-    const float next = step.predict_sample * sample + step.predict_clean * clean +
-                       step.predict_delta * (state.last_clean - clean);
-    state.last_sample = sample;
-    state.older_clean = state.last_clean;
-    state.last_clean = clean;
-    return next;
+    float coefficients[rad_unipc::COUNT];
+    step.coefficients(coefficients);
+    return rad_unipc::advance(coefficients, sample, velocity, state.last_sample, state.last_clean,
+                              state.older_clean);
 }
 
 }  // namespace wan

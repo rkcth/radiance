@@ -68,6 +68,7 @@
 #include "rad_plugin.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_N */
 #include "rad_sample.h"
+#include "rad_unipc_math.h"
 
 #include <algorithm>
 #include <cmath>
@@ -3067,6 +3068,16 @@ int ref_flow_res_multistep_shape(const RadParam* p, int n_p, int operand, RadOpd
     o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* order */
     o.t(F, { M, n });                                         /* x, INOUT */
     return o.finish("flow_res_multistep", operand, out);
+}
+int ref_flow_unipc_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0 || n > INT32_MAX / 3) return RAD_E_SHAPE;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });
+    o.t_fill(RAD_F32, { rad_unipc::COUNT }, RAD_FILL_SIGMOID, 0);
+    o.t(RAD_F32, { M, 3 * n });
+    o.t(RAD_F32, { M, n });
+    return o.finish("flow_unipc_step", operand, out);
 }
 int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

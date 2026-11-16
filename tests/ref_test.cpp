@@ -1329,7 +1329,7 @@ TEST(op_vocabulary) {
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
-        "rms_mod", "flow_x0_step", "flow_res_multistep", "patch_unfold",
+        "rms_mod", "flow_x0_step", "flow_res_multistep", "flow_unipc_step", "patch_unfold",
         "vtile_gather",
         "vtile_stitch", "grid_pos3", "snake_aa",
         /* Its step-distilled form's video sparse attention: the tile selection and the
@@ -7411,6 +7411,42 @@ TEST(flow_x0_step_blends_toward_the_clean_estimate_in_f32_steps) {
     CHECK_EQ(x.at(1), -2.275f);
 }
 
+TEST(flow_unipc_step_updates_two_inout_views_and_refuses_overlapping_rows) {
+    T v(RAD_BF16, { 2, 1 }), coeff(RAD_F32, { 8 });
+    T history(RAD_F32, { 2, 5 }), x(RAD_F32, { 2, 2 });
+    history.t.shape[1] = 3;
+    x.t.shape[1] = 1;
+    x.f({ 1, 9, 1, 9 });
+    history.f({ 0, 0, 0, 8, 8, 0, 0, 0, 8, 8 });
+    auto step = [&] {
+        A a;
+        a.t(v).t(coeff).t(history).t(x).i("M", 2).i("n", 1).s("dtype", "f32");
+        return run("flow_unipc_step", a);
+    };
+    v.f({ .5f, .5f });
+    coeff.f({ .5f, 0, 0, 0, 0, .5f, .5f, 0 });
+    CHECK_OK(step());
+    CHECK_EQ(x.at(0), .875f);
+    CHECK_EQ(history.at(0), 1.0f);
+    CHECK_EQ(history.at(1), .75f);
+    v.f({ 1, 1 });
+    coeff.f({ .25f, .5f, .5f, 0, .25f, .25f, .75f, -.125f });
+    CHECK_OK(step());
+    for (int row = 0; row < 2; ++row) {
+        CHECK_EQ(x.at(2 * row), .6640625f);
+        CHECK_EQ(x.at(2 * row + 1), 9.0f);
+        CHECK_EQ(history.at(5 * row), .84375f);
+        CHECK_EQ(history.at(5 * row + 1), .625f);
+        CHECK_EQ(history.at(5 * row + 2), .75f);
+        CHECK_EQ(history.at(5 * row + 3), 8.0f);
+        CHECK_EQ(history.at(5 * row + 4), 8.0f);
+    }
+    history.t.stride[0] = 2;
+    CHECK_EQ(step(), RAD_E_STRIDE);
+    history.t.rank = 3;
+    CHECK_EQ(step(), RAD_E_SHAPE);
+}
+
 /* patch_unfold: patch rows (f, i, j) of columns (c, a, b, d) dealt to voxel rows (t, yy, xx) and
  * denormalised, f32(f32(x mul[c]) + add[c]) with the lists in f32. Two 1 x 2 x 2 patches side by
  * side (geom (1, 1, 2)), x[p][col] = 100 p + col: voxel row (yy, xx) reads patch xx / 2 at column
@@ -10622,6 +10658,7 @@ std::vector<Geo> geometries() {
         G("rms_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).i("gated", 1).s("dtype", "bf16")),
         G("flow_x0_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("flow_res_multistep", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("flow_unipc_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("patch_unfold", "M", 32, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
                                    .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
         G("vtile_gather", "M", 60, a.i("M", R).i("n", 8).i("tile", 2).i("overlap", 1)

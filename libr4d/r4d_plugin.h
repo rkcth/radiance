@@ -326,6 +326,7 @@ int     r4d_rad_rms_mod_quant_i8      (const RadArgs*, RadStream);
 int     r4d_rad_rms_mod_had_quant_i8g (const RadArgs*, RadStream);
 int     r4d_rad_flow_x0_step          (const RadArgs*, RadStream);
 int     r4d_rad_flow_res_multistep    (const RadArgs*, RadStream);
+int     r4d_rad_flow_unipc_step       (const RadArgs*, RadStream);
 int     r4d_rad_patch_unfold          (const RadArgs*, RadStream);
 int     r4d_rad_vtile_gather          (const RadArgs*, RadStream);
 int     r4d_rad_vtile_stitch          (const RadArgs*, RadStream);

@@ -17,6 +17,7 @@
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_q8.h"
+#include "rad_unipc_math.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -244,6 +245,21 @@ __global__ __launch_bounds__(kT) void flow_rm_kernel(
     const float d = xv + sgv * ldv(v, r * v_ld + c);
     *xp = two ? ra * xv + b1 * d + b2 * (*op) : ra * xv + omr * d;
     *op = d;
+}
+
+// ---------------------------------------------------------------------------- flow_unipc_step
+template <typename TV>
+__global__ __launch_bounds__(kT) void flow_unipc_kernel(
+    const TV* __restrict__ v, const float* __restrict__ coeff, float* __restrict__ history,
+    float* __restrict__ x, int64_t n, int64_t v_ld, int64_t h_ld, int64_t x_ld, int64_t total) {
+    const int64_t id = static_cast<int64_t>(blockIdx.x) * kT + threadIdx.x;
+    if (id >= total) return;
+    const int64_t row = id / n;
+    const int64_t col = id % n;
+    float& sample = x[row * x_ld + col];
+    float* hist = history + row * h_ld + col;
+    sample = rad_unipc::advance(coeff, sample, ldv(v, row * v_ld + col),
+                                hist[0], hist[n], hist[2 * n]);
 }
 
 // ---------------------------------------------------------------------------- patch_unfold
@@ -774,6 +790,39 @@ extern "C" int r4d_rad_flow_res_multistep(const RadArgs* a, RadStream s) {
     if (is_f32(v)) R4D_FRM(float);
     else           R4D_FRM(uint16_t);
 #undef R4D_FRM
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_flow_unipc_step(const RadArgs* a, RadStream s) {
+    const RadTensor *v = r4d_opt(a, 0), *coeff = r4d_opt(a, 1);
+    const RadTensor *history = r4d_opt(a, 2), *x = r4d_opt(a, 3);
+    if (!v || !coeff || !history || !x) return R4D_NO(RAD_E_INVAL);
+    if ((!is_f32(v) && !is_bf16(v)) || !is_f32(coeff) || !is_f32(history) || !is_f32(x))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0 || n > INT32_MAX / 3 || coeff->rank != 1 ||
+        coeff->shape[0] != rad_unipc::COUNT) return R4D_NO(RAD_E_SHAPE);
+    if (v->rank != 2 || x->rank != 2 || history->rank != 2 ||
+        v->shape[1] != n || x->shape[1] != n || history->shape[1] != 3 * n)
+        return R4D_NO(RAD_E_SHAPE);
+    const int64_t xl = x->stride[0], vl = v->stride[0], hl = history->stride[0];
+    if (v->stride[1] != 1 || x->stride[1] != 1 || history->stride[1] != 1 ||
+        vl < n || xl < n || hl < 3 * n || coeff->stride[0] != 1)
+        return R4D_NO(RAD_E_STRIDE);
+    const int64_t rx = x->shape[0];
+    if (rx <= 0 || v->shape[0] < rx || history->shape[0] < rx ||
+        rx > static_cast<int64_t>(INT32_MAX) * kT / n ||
+        rx > (INT64_MAX - n) / xl || rx > (INT64_MAX - n) / vl ||
+        rx > (INT64_MAX - 3 * n) / hl)
+        return R4D_NO(RAD_E_SHAPE);
+    const int64_t total = rx * n;
+#define R4D_UNIPC(TV) \
+    hipLaunchKernelGGL(flow_unipc_kernel<TV>, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s, \
+                       (const TV*)v->data, (const float*)coeff->data, (float*)history->data, \
+                       (float*)x->data, n, vl, hl, xl, total)
+    if (is_f32(v)) R4D_UNIPC(float);
+    else           R4D_UNIPC(uint16_t);
+#undef R4D_UNIPC
     return st_of(hipGetLastError());
 }
 

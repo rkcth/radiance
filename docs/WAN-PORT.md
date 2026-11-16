@@ -33,6 +33,14 @@ at step index zero. This matters when consecutive sigmas truncate to the
 same integer timestep. The test covers solver arithmetic, before it is
 connected to the transformer and device latent state.
 
+The host and gfx1201 `flow_unipc_step` operations now apply those
+coefficients to latent and history buffers. The host test checks numerical
+results and rejects overlapping rows. On one R9700, three device updates
+each with F32 and BF16 velocity matched the host arithmetic exactly,
+including untouched tensor padding. The reference and device passes share
+the elementwise update. The Wan graph still needs to stage the coefficients
+and supply its predicted velocity.
+
 The verified Diffusers files store the text encoder in BF16 and the
 transformer and VAE in FP32. The BF16 conversion recipe is limited to the
 latter two components. `rad-convert` requires the Wan architecture's

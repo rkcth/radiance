@@ -2967,6 +2967,10 @@ static const RadOperandSpec oFlowRM[] = {
     { "r", RAD_OPD_IN, 0 }, { "hb1", RAD_OPD_IN, 0 }, { "hb2", RAD_OPD_IN, 0 },
     { "order", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
 };
+static const RadOperandSpec oFlowUniPC[] = {
+    { "v", RAD_OPD_IN, 0 }, { "coefficients", RAD_OPD_IN, 0 },
+    { "history", RAD_OPD_INOUT, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
 static const RadParamSpec pPatchUnfold[] = { P_INT("M"), P_INT("C"), P_INT("pt"), P_INT("ph"),
                                              P_INT("pw"), P_STR("mul"), P_STR("add"),
                                              P_STR("dtype") };
@@ -4128,6 +4132,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("flow_res_multistep", pGenMn, oFlowRM,
            "x = r x + hb1 (x + sigma v) + hb2 x0, r = sigma_next / sigma, x0 the previous estimate; "
            "order<2 is Euler."),
+    SCHEMA("flow_unipc_step", pGenMn, oFlowUniPC,
+           "Flow-prediction UniPC BH2 corrector and predictor. F32 history per row is "
+           "[last corrected sample | last clean estimate | older clean estimate]."),
     SCHEMA("patch_unfold", pPatchUnfold, oPatchUnfold,
            "patch rows unfolded to voxel rows and denormalised with f32 lists."),
     SCHEMA("vtile_gather", pVtileGather, oVtileGather,
@@ -10603,6 +10610,13 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenF32), NOTUNE,
   nullptr, nullptr, r4d_rad_flow_res_multistep },
+
+{ "flow_unipc_step_f32", "flow_unipc_step", "elem",
+  "flow-prediction UniPC BH2 corrector and predictor", "any M, row pitches honoured",
+  "f32 state, history and coefficients, f32 or bf16 velocity",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_flow_unipc_step },
 
 { "patch_unfold_f32", "patch_unfold", "elem",
   "patch rows to denormalised voxel rows, the geometry read on the device",

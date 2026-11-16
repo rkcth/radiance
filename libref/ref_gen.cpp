@@ -11,6 +11,7 @@
 #include "ref_gemm.h"
 #include "ref_ops.h"
 #include "rad_philox.h"
+#include "rad_unipc_math.h"
 
 #include <algorithm>
 #include <vector>
@@ -507,6 +508,46 @@ int ref_flow_res_multistep(const RadArgs* a, RadStream) {
                                  : r * xv + omr * d;
             stt(x, xb + c * xs, nx);
             stt(x0, ob + c * os, d);
+        }
+    }
+    return RAD_OK;
+}
+
+int ref_flow_unipc_step(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *v = &a->t[0], *coeff = &a->t[1], *history = &a->t[2], *x = &a->t[3];
+    if ((v->dtype != RAD_F32 && v->dtype != RAD_BF16) || coeff->dtype != RAD_F32 ||
+        history->dtype != RAD_F32 || x->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0 || n > INT32_MAX / 3 || coeff->rank != 1 ||
+        coeff->shape[0] != rad_unipc::COUNT) return RAD_E_SHAPE;
+    if (v->rank != 2 || x->rank != 2 || history->rank != 2 ||
+        v->shape[1] != n || x->shape[1] != n || history->shape[1] != 3 * n)
+        return RAD_E_SHAPE;
+    if (v->stride[1] != 1 || x->stride[1] != 1 || history->stride[1] != 1 ||
+        v->stride[0] < n || x->stride[0] < n || history->stride[0] < 3 * n ||
+        coeff->stride[0] != 1) return RAD_E_STRIDE;
+    const int64_t rows = x->shape[0];
+    if (rows <= 0 || v->shape[0] < rows || history->shape[0] < rows ||
+        rows > (INT64_MAX - n) / x->stride[0] ||
+        rows > (INT64_MAX - n) / v->stride[0] ||
+        rows > (INT64_MAX - 3 * n) / history->stride[0]) return RAD_E_SHAPE;
+    const float* values = static_cast<const float*>(coeff->data);
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t vb = r * v->stride[0], xb = r * x->stride[0];
+        const int64_t hb = r * history->stride[0];
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t h = hb + c;
+            float last_sample = ldt(history, h);
+            float last_clean = ldt(history, h + n);
+            float older_clean = ldt(history, h + 2 * n);
+            const float next = rad_unipc::advance(values, ldt(x, xb + c), ldt(v, vb + c),
+                                                  last_sample, last_clean, older_clean);
+            stt(x, xb + c, next);
+            stt(history, h, last_sample);
+            stt(history, h + n, last_clean);
+            stt(history, h + 2 * n, older_clean);
         }
     }
     return RAD_OK;

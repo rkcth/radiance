@@ -1658,6 +1658,7 @@ bf16 tensor and keeps f32 where it computes in f32; the libref function says whi
 | `rms_mod_had_quant_i8g` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`?, `colmap`? |
 | `flow_x0_step` | `M`(range) `n` `dtype` | `v`, `t`, `sigma`, `sigma_next`, `x`:inout |
 | `flow_res_multistep` | `M`(range) `n` `dtype` | `v`, `x0`:inout, `sigma`, `r`, `hb1`, `hb2`, `order`, `x`:inout |
+| `flow_unipc_step` | `M`(range) `n` `dtype` | `v`, `coefficients`, `history`:inout, `x`:inout |
 | `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
 | `vtile_gather` | `M`(range) `n` `tile` `overlap` `frames` `period` `n_reg` `dtype` | `x`, `reg`w, `geom` → `y` |
 | `vtile_stitch` | `M`(range) `tile` `overlap` `scale` `pt` `skip` `keep` `blend` `period` `mean` `std` | `x`, `geom`, `prev`:inout → `y` |
@@ -1707,6 +1708,14 @@ reads its entry's rows of `s` and `g`.
   Euler step `x = f32(f32(r x) + f32(f32(1 - r) d))`, which a step with no previous estimate on its
   grid takes (core/gen/video_driver.cpp's `stage_sched` has the coefficients, `hb1 + hb2 = 1 - r`).
   `sigma`, `r`, `hb1`, `hb2` and `order` are one f32 value each; `v` f32 or bf16.
+- `flow_unipc_step` advances flow-prediction UniPC BH2 by one evaluation. The
+  clean estimate is `x - sigma * v`; the corrector uses saved history before
+  the predictor advances the sample. `coefficients` is a contiguous eight-value
+  f32 vector in `rad_unipc_math.h` order. The f32 `history` has `3*n` columns per
+  row, holding the last corrected sample, last clean estimate, and older clean
+  estimate. Zero the history for a new trajectory. The operation updates it and
+  the f32 sample `x` in place. Velocity `v` can be f32 or bf16. Each matrix
+  has contiguous columns and a row pitch at least its width.
 
 **The decoder** runs over a request's latent geometry, which `geom`, i32 on the device, carries
 (the parameters are fixed at declare). `mul`, `add`, `mean` and `std` are space-separated lists

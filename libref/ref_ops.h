@@ -198,6 +198,7 @@ int ref_kd_step(const RadArgs*, RadStream);
 int ref_rms_mod(const RadArgs*, RadStream);
 int ref_flow_x0_step(const RadArgs*, RadStream);
 int ref_flow_res_multistep(const RadArgs*, RadStream);
+int ref_flow_unipc_step    (const RadArgs*, RadStream);
 /* ref_video.cpp */
 int ref_patch_unfold(const RadArgs*, RadStream);
 int ref_vtile_gather(const RadArgs*, RadStream);
@@ -488,6 +489,7 @@ REF_SHAPE_FN(ref_kd_step);
 REF_SHAPE_FN(ref_rms_mod);
 REF_SHAPE_FN(ref_flow_x0_step);
 REF_SHAPE_FN(ref_flow_res_multistep);
+REF_SHAPE_FN(ref_flow_unipc_step);
 REF_SHAPE_FN(ref_patch_unfold);
 REF_SHAPE_FN(ref_vtile_gather);
 REF_SHAPE_FN(ref_vtile_stitch);

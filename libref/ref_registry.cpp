@@ -903,6 +903,8 @@ static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD(
                                           INOUT("x") };
 static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
                                           OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
+static const RadOperandSpec oFlowUniPC[] = { OPD("v"), OPD("coefficients"),
+                                             INOUT("history"), INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
                                           P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
                                           P_STR("dtype") };
@@ -1999,6 +2001,9 @@ static const RadOpSchema kSchemas[] = {
   "then d written back for the next). order<2 makes it Euler (x = r x + (1 - r) d), the first "
   "step, a schedule restart and the last step; there hb1 + hb2 = 1 - r. sigma, r, hb1, hb2 and "
   "order one f32 each; x and x0 f32 (MiniMax-H3's DPM-Solver++2M / res_multistep)." },
+{ "flow_unipc_step", ARR(pMnD), ARR(oFlowUniPC),
+  "Flow-prediction UniPC BH2 corrector and predictor. F32 history per row is "
+  "[last corrected sample | last clean estimate | older clean estimate]." },
 { "patch_unfold", ARR(pPatchUnfold), ARR(oPatchUnfold),
   "patch rows [F Hp Wp, C pt ph pw] (geom = (F, Hp, Wp)) unfolded to voxel rows "
   "[(F pt) (Hp ph) (Wp pw), C] and denormalised, f32(f32(x * mul[c]) + add[c]) with `mul` and "
@@ -2784,6 +2789,8 @@ SIMPLE("ref_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the cl
        DT_FLOAT, ref_flow_x0_step),
 SIMPLE("ref_flow_res_multistep", "flow_res_multistep", "elem",
        "a second-order sampler step on the clean estimate", DT_FLOAT, ref_flow_res_multistep),
+SIMPLE("ref_flow_unipc_step", "flow_unipc_step", "elem",
+       "flow-prediction UniPC BH2 corrector and predictor", DT_FLOAT, ref_flow_unipc_step),
 SIMPLE("ref_patch_unfold", "patch_unfold", "elem", "patch rows to denormalised voxel rows",
        DT_FLOAT, ref_patch_unfold),
 SIMPLE("ref_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out of the latent",
