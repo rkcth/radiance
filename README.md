@@ -16,6 +16,38 @@ slowly than a card.
 
 To support the development of radiance: [Patreon](https://patreon.com/StillDeadCode).
 
+## Shared serving preview for Radiance 2.1
+
+This fork of [StillDeadcode's Radiance](https://codeberg.org/StillDeadcode/radiance)
+serves Swift Flash Next and registered image generators on one listener.
+The image queue selects a model and local LoRA strengths per request.
+Radiance can retain image weights in host RAM between switches and lend
+idle generator VRAM to the text model's MoE experts.
+
+Start with the [two-card profile](deploy/compose/swift-shared.radiance.yaml)
+and the [shared-serving guide](docs/GUIDE.md#serving-text-and-images-together).
+Build the executable and plugins together for ABI 41. Set your checkpoint
+paths and memory limits, then run `radiance --config FILE --check`.
+Use `GET /v1/models` to list the served model IDs.
+
+| Model package verified on two Radeon AI PRO R9700s | Checkpoint | Download status |
+| --- | --- | --- |
+| Qwen Image 2.1 (uncensored), IQ8R | `qwen-image-2.1-uc-iq8r.rad` | Gated upload pending under `rkcth/Radiance-IQ8R-from-Qwen-Image-2.1-Uncensored` |
+| Krea 2 Raw, IQ8R, with Turbo and Registered Outpaint adapters | `krea-2-raw-edit-iq8r.rad` | Gated upload pending under `rkcth/Krea-2-Raw-Radiance-Edit-IQ8R` |
+
+The Qwen IQ8R conversion starts from the selected
+[uncensored checkpoint](https://huggingface.co/0xSojalSec/Qwen-Image-2.1-Uncensored-HF).
+Krea generation, one- and two-reference editing, and registered outfill
+were tested. For two references, reserve two in `image-gen-max-refs`.
+For a stacked Krea adapter request, configure `max-lora-rank: 128`.
+The optional Identity Edit V2 adapter is available from its
+[publisher](https://huggingface.co/conradlocke/krea2-identity-edit/blob/f33b26291c640e8ec50b0da420bfee3c9a660daa/krea2_identity_edit_v2_r64.safetensors).
+
+The verified shared profile uses a text primary and serves one generator
+job at a time. Switches and image work can pause text streaming. Other
+models in the upstream catalog have their own upstream support and were
+outside this release's shared-serving GPU validation.
+
 ## Models
 
 | model | container | get it | fleet file |
