@@ -5493,6 +5493,10 @@ int Engine::load_model() {
                  * restore reads it again (refill_weights). */
                 if (file_) dev_page_refilled(base);
             }
+    /* Bringup done: everything this engine loads is loaded. From here the stuck-exit watchdog
+     * treats a device that advances nothing as a hang; before here it treats it as a slow load
+     * (device.h's dev_engine_ready). */
+    dev_engine_ready.store(true, std::memory_order_release);
     return RAD_OK;
 }
 
