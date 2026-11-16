@@ -5,6 +5,7 @@
 #include "../arch/wan/wan_time.h"
 #include "../arch/wan/wan_vae_time.h"
 #include "../arch/wan/wan_vae_encoder.h"
+#include "../arch/wan/wan_vae_decoder.h"
 
 TEST(wan_umt5_declares_each_checkpoint_tensor_and_runs_packed_conditioning) {
     RadBuilder builder{};
@@ -421,6 +422,71 @@ TEST(wan_vae_encoder_uses_last_temporal_taps_and_spatial_checkpoint_weights) {
     CHECK_EQ(enc.mean(6).handle, enc.output());
     CHECK_EQ(enc.mean(6).cols, 48);
     CHECK_LINT(b, &run);
+}
+
+TEST(wan_vae_decoder_emits_one_frame_then_four_and_declares_causal_history) {
+    using namespace rad::arch;
+    RadBuilder b{};
+    Names names("wan");
+    const auto latent = decl_b(&b, "latent", RAD_BF16, {24, 48}, RAD_BUF_PERSIST);
+    const auto geom = decl_b(&b, "geometry", RAD_I32, {3}, RAD_BUF_PERSIST);
+    const auto rgb = decl_b(&b, "frames", RAD_U8, {4 * 24 * 256, 3}, RAD_BUF_PERSIST);
+    wan::VaeDecoder decoder;
+    REQUIRE_EQ(decoder.declare(&b, names, 24, 2, latent, geom, grp_layer(3)), RAD_OK);
+    REQUIRE_EQ(decoder.declare_rgb(&b, names, rgb), RAD_OK);
+    auto* mid = find_map(b, "wan.vae.decoder.mid_block.attentions.0.to_qkv.weight");
+    REQUIRE(mid);
+    CHECK_EQ(mid->mode, RAD_MAP_COPY);
+    auto* after = find_w(b, "wan.vae.decoder.up_blocks.3.resnets.0.conv1.weight");
+    REQUIRE(after);
+    CHECK_EQ(after->d.shape[0], 256);
+    CHECK_EQ(after->d.shape[1], 512);
+    CHECK_EQ(after->d.shape[2], 3);
+    auto* time = find_w(b, "wan.vae.decoder.up_blocks.1.upsampler.time_conv.weight");
+    REQUIRE(time);
+    CHECK_EQ(time->d.shape[0], 2048);
+    CHECK_EQ(time->d.shape[1], 1024);
+    CHECK(!find_w(b, "wan.vae.decoder.up_blocks.2.upsampler.time_conv.weight"));
+
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        RadCtx run{};
+        run.b = &b;
+        REQUIRE_EQ(decoder.step(&run, 4, 6, 1, chunk), RAD_OK);
+        CHECK(run.step_fail.empty());
+        REQUIRE(!run.issues.empty());
+        int spatial_history = 0, time_history = 0, shortcuts = 0;
+        for (const auto& issue : run.issues) {
+            const auto* op = b.op_of(issue.op);
+            if (op->op == "wan_vae_history") {
+                if (pint(op, "temporal")) {
+                    ++time_history;
+                    CHECK_EQ(pint(op, "reset"), chunk == 1);
+                } else {
+                    ++spatial_history;
+                    CHECK_EQ(pint(op, "reset"), chunk == 0);
+                }
+            }
+            if (op->op == "wan_vae_expand" && !pint(op, "temporal")) {
+                CHECK_EQ(pint(op, "drop"), chunk == 0 && shortcuts < 2 ? 1 : 0);
+                ++shortcuts;
+            }
+        }
+        const int64_t frames = chunk == 0 ? 1 : 4;
+        const auto& end = run.issues.back();
+        CHECK(b.op_of(end.op)->op == "tile_stitch");
+        const auto& cast = run.issues.at(run.issues.size() - 3);
+        CHECK(b.op_of(cast.op)->op == "cast");
+        CHECK_EQ(cast.opd.front().handle, decoder.output());
+        CHECK_EQ(cast.opd.back().handle, end.opd.front().handle);
+        CHECK_EQ(end.opd.front().rows, frames * 24 * 64);
+        CHECK_EQ(end.opd.back().rows, frames * 4 * 16);
+        CHECK_EQ(end.opd.back().cols, 6 * 16 * 3);
+        CHECK(end.opd.back().raw == rad_buf_ptr(&run, rgb));
+        CHECK_EQ(spatial_history, 30);
+        CHECK_EQ(time_history, chunk == 0 ? 0 : 2);
+        CHECK_EQ(shortcuts, 3);
+        CHECK_LINT(b, &run);
+    }
 }
 
 RAD_TEST_MAIN()

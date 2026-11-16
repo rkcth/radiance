@@ -154,6 +154,15 @@ relative RMSE and 0.999992 cosine similarity. The comparison is before
 per-channel latent normalization. The same device passed the independent
 640- and 1024-wide per-frame attention checks against the CPU reference.
 
+The full decoder runs the post-quant projection, 14 residual blocks,
+frame-local middle attention, three spatial upsample stages, and two
+temporal upsample stages. It emits one frame from the first latent
+and four from each later latent. At 32 × 48 output, three consecutive
+latent chunks on one R9700 matched the pinned BF16-cast Diffusers
+decoder with relative RMSE of 0.577%, 0.760%, and 0.552%. The RGB
+packer widened the decoded patches to FP32 and matched reference
+unpatching and normalization byte for byte on the same device patches.
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,
