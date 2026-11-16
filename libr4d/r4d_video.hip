@@ -749,6 +749,13 @@ __global__ __launch_bounds__(kT) void wan_unpatch(
     }
 }
 
+__global__ void wan_vae_frame_cu(const int32_t* geom, int32_t* out, int n) {
+    const int i = threadIdx.x;
+    int64_t plane = 0;
+    if (i < n)
+        out[i] = rad_wan_vae::frame_plane(geom, n, plane) ? static_cast<int32_t>(i * plane) : 0;
+}
+
 template<bool Temporal>
 __global__ __launch_bounds__(kT) void wan_vae_history(
     const uint16_t* x, uint16_t* cache, uint16_t* out, int64_t plane, int64_t frames, int64_t n,
@@ -883,6 +890,21 @@ extern "C" int r4d_rad_wan_gated_add(const RadArgs* a, RadStream s) {
                        table ? static_cast<const float*>(table->data) : nullptr,
                        split ? static_cast<const int32_t*>(split->data) : nullptr, (int)rows, (int)n,
                        (int)gate, x->stride[0], update->stride[0], time ? time->stride[0] : 0);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_vae_frame_cu(const RadArgs* a, RadStream s) {
+    const RadTensor *geom = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!geom || !y) return R4D_NO(RAD_E_INVAL);
+    const int rc = rad_wan_dit::check_grid(geom);
+    if (rc < 0) return R4D_NO(rc);
+    if (y->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    if (y->rank != 1 || y->shape[0] < 2 || y->shape[0] > rad_wan_vae::max_chunk_frames + 1)
+        return R4D_NO(RAD_E_SHAPE);
+    if (y->stride[0] != 1) return R4D_NO(RAD_E_STRIDE);
+    hipLaunchKernelGGL(wan_vae_frame_cu, dim3(1), dim3(32), 0, (hipStream_t)s,
+                       static_cast<const int32_t*>(geom->data), static_cast<int32_t*>(y->data),
+                       static_cast<int>(y->shape[0]));
     return st_of(hipGetLastError());
 }
 

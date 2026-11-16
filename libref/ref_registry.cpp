@@ -945,7 +945,9 @@ static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
 static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
                                         P_STR("pad"), P_INT("up"), P_STR("dtype") };
-static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadParamSpec pL2Norm[] = {
+    P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"), P_INTO("round_length"),
+};
 static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
 static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
                                             P_STR("dtype") };
@@ -1005,6 +1007,8 @@ static const RadOperandSpec oWanGate[] = {
     INOUT("x"), OPD("update"), OPD_O("time"), WGT_O("table"), OPD_O("split"),
 };
 static const RadOperandSpec oWanUnpatch[] = { OPD("patches"), OPD("geom"), OUT("velocity") };
+static const RadParamSpec pWanVaeFrameCu[] = { P_INT("M") };
+static const RadOperandSpec oWanVaeFrameCu[] = { OPD("geom"), OUT("cu") };
 static const RadParamSpec pWanVaeHistory[] = {
     P_INT("M"), P_INT("temporal"), P_INT("reset"), P_STR("dtype"),
 };
@@ -2078,6 +2082,7 @@ static const RadOpSchema kSchemas[] = {
 { "wan_mod_norm", ARR(pWanModNorm), ARR(oWanModNorm), "Wan's timestep-modulated layer normalization." },
 { "wan_gated_add", ARR(pWanGate), ARR(oWanGate), "Wan's FP32 residual update with an optional gate." },
 { "wan_unpatch", ARR(pMnD), ARR(oWanUnpatch), "Expand Wan head patches into F32 NDHWC velocity rows." },
+{ "wan_vae_frame_cu", ARR(pWanVaeFrameCu), ARR(oWanVaeFrameCu), "Wan VAE per-frame attention offsets." },
 { "wan_vae_history", ARR(pWanVaeHistory), ARR(oWanVaeHistory), "Wan VAE causal history and temporal taps." },
 { "wan_vae_expand", ARR(pWanVaeExpand), ARR(oWanVaeExpand), "Wan VAE temporal shuffle and shortcut upsample." },
 { "vsa_select", ARR(pVsa), ARR(oVsaSelect),
@@ -2861,6 +2866,8 @@ SIMPLE("ref_wan_mod_norm", "wan_mod_norm", "norm", "Wan's timestep-modulated lay
 SIMPLE("ref_wan_gated_add", "wan_gated_add", "elem", "Wan's FP32 residual update",
        "f32 state and bf16 update", ref_wan_gated_add),
 SIMPLE("ref_wan_unpatch", "wan_unpatch", "elem", "Wan patch velocity to voxel velocity", "bf16/f32", ref_wan_unpatch),
+SIMPLE("ref_wan_vae_frame_cu", "wan_vae_frame_cu", "elem",
+       "Wan VAE per-frame attention offsets.", "i32", ref_wan_vae_frame_cu),
 SIMPLE("ref_wan_vae_history", "wan_vae_history", "elem", "Wan VAE causal history", "bf16", ref_wan_vae_history),
 SIMPLE("ref_wan_vae_expand", "wan_vae_expand", "elem", "Wan VAE temporal shuffle and shortcut", "bf16", ref_wan_vae_expand),
 SIMPLE("ref_vsa_select", "vsa_select", "attn",

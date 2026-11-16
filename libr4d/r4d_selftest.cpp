@@ -10742,6 +10742,26 @@ void wan_modulation_cases(const Plugin& pl) {
        rs == RAD_OK && down_f32(x, 4) == std::vector<float>{1.375f, -.25f, 1.875f, .75f});
 }
 
+void wan_vae_spatial_cases(const Plugin& pl) {
+    const auto* frame_cu = find(pl, "wan_vae_frame_cu");
+    const auto* norm = find(pl, "l2norm_chan_bf16");
+    if (!frame_cu || !norm) { ok("Wan VAE spatial ops", false, "row absent"); return; }
+    void* offsets = dalloc(3 * sizeof(int32_t));
+    int rc = launch(frame_cu, {T(up_i32({2, 2, 3}), RAD_I32, {3}), T(offsets, RAD_I32, {3})},
+                    {PI("M", 3)});
+    ok("Wan VAE frame offsets delimit spatial planes",
+       rc == RAD_OK && down_i32(offsets, 3) == std::vector<int32_t>{0, 6, 12});
+    void* out = dalloc(8 * sizeof(uint16_t));
+    std::vector<float> x = {6, 1, 0, 0, 0, 0, 0, 0};
+    std::vector<float> gain(8, 1.0f);
+    rc = launch(norm, {T(up_bf16(x), RAD_BF16, {1, 8}),
+                       T(up_bf16(gain), RAD_BF16, {8, 1, 1, 1}),
+                       T(out, RAD_BF16, {1, 8})},
+                {PI("M", 1), PI("n", 8), PI("round_length", 1), PS("act", "none"), PS("dtype", "bf16")});
+    ok("Wan VAE normalization rounds the length before dividing",
+       rc == RAD_OK && down_bf16(out, 8) == std::vector<float>{2.78125f, 0.46484375f, 0, 0, 0, 0, 0, 0});
+}
+
 void wan_vae_time_cases(const Plugin& pl) {
     const auto* h = find(pl, "wan_vae_history_bf16");
     const auto* u = find(pl, "wan_vae_expand_bf16");
@@ -11173,14 +11193,14 @@ void attn_dense_h80_cases(const Plugin& pl) {
     check("attn_dense_h80_bf16 16 heads over two images", down_bf16(dout, want.size()), want, 2e-2);
 }
 
-/* One wide head over every pixel, 384 and 512. */
-void attn_wide_cases(const Plugin& pl) {
-    for (const int64_t hd : { 384, 512 }) {
+/* One wide head over every pixel within each spatial plane. */
+void attn_wide_cases(const Plugin& pl, std::initializer_list<int> widths) {
+    for (const int64_t hd : widths) {
         const std::string row = fmt("attn_dense_h%lld_bf16", (long long)hd);
         const RadKernelInfo* r = find(pl, row.c_str());
         if (!r) { ok(row.c_str(), false, "row absent"); continue; }
         const int64_t N = 300;
-        const std::vector<int32_t> cu = { 0, (int32_t)N };
+        const std::vector<int32_t> cu = { 0, 139, (int32_t)N };
         std::vector<float> qkv = randv((size_t)(N * 3 * hd), 1.0f);
         for (float& x : qkv) x = bfr(x);
         void* d = up_bf16(qkv);
@@ -11190,7 +11210,7 @@ void attn_wide_cases(const Plugin& pl) {
             return t;
         };
         void* dout = dalloc((size_t)(N * hd) * 2);
-        const int rc = launch(r, { col(0), col(1), col(2), T(up_i32(cu), RAD_I32, { 2 }),
+        const int rc = launch(r, { col(0), col(1), col(2), T(up_i32(cu), RAD_I32, { 3 }),
                                    T(dout, RAD_BF16, { N, hd }) },
                               { PI("M", N), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
                                 PS("dtype", "bf16") });
@@ -11203,8 +11223,10 @@ void attn_wide_cases(const Plugin& pl) {
                 v[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + 2 * hd + t)];
             }
         std::vector<float> want((size_t)(N * hd));
-        host_attn(q, k, v, hd, hd, 1, 1, hd, 0, N, 0, N, false, &want);
-        check(row + " one head over 300 rows", down_bf16(dout, want.size()), want, 2e-2);
+        for (size_t segment = 1; segment < cu.size(); ++segment)
+            host_attn(q, k, v, hd, hd, 1, 1, hd, cu[segment - 1], cu[segment],
+                      cu[segment - 1], cu[segment], false, &want);
+        check(row + " one head per spatial plane", down_bf16(dout, want.size()), want, 2e-2);
     }
 }
 
@@ -33058,6 +33080,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("wan_rope_table_f32") || sel("wan_rope_bf16") || sel("wan_rope_f32")) vid::wan_rotary_cases(pl);
     if (sel("wan_mod_norm") || sel("wan_gated_add")) vid::wan_modulation_cases(pl);
     if (sel("wan_unpatch")) vid::wan_unpatch_cases(pl);
+    if (sel("wan_vae_frame_cu")) vid::wan_vae_spatial_cases(pl);
     if (sel("wan_vae_history_bf16") || sel("wan_vae_expand_bf16")) vid::wan_vae_time_cases(pl);
     if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
     /* A video latent upscaler's ops, at its source and target sizes. */
@@ -33077,7 +33100,8 @@ static void device_phase(const Plugin& pl) {
     if (sel("attn_cross_h64_bf16")) g3::attn_cross_cases(pl, 64);
     if (sel("attn_dense_gqa")) g3::attn_dense_gqa_cases(pl);
     if (sel("attn_dense_h80_bf16")) g3::attn_dense_h80_cases(pl);
-    if (sel("attn_dense_h384_bf16") || sel("attn_dense_h512_bf16")) g3::attn_wide_cases(pl);
+    if (sel("attn_dense_h384_bf16") || sel("attn_dense_h512_bf16")) g3::attn_wide_cases(pl, {384, 512});
+    if (sel("attn_dense_h640_bf16") || sel("attn_dense_h1024_bf16")) g3::attn_wide_cases(pl, {640, 1024});
     if (sel("rms_mod_bf16")) g3::rms_mod_forms(pl);
     if (sel("timestep_embed_bf16")) g3::timestep_round_cases(pl);
     /* LTX-2's. */

@@ -946,13 +946,16 @@ int ref_l2norm_chan(const RadArgs* a, RadStream) {
     if (rows <= 0 || rows_of(x, n) < rows) return RAD_E_SHAPE;
     const float sq = (float)std::sqrt((double)n);
     const uint32_t dt = y->dtype;
+    const bool round_length = p_int(a, "round_length", 0) != 0;
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), xs = laststride(x);
         const int64_t yb = rowoff(y, r, n), ys = laststride(y);
         float ss = 0.0f;
         for (int64_t c = 0; c < n; ++c) { const float v = ldt(x, xb + c * xs); ss += v * v; }
-        const float nrm = std::max(std::sqrt(ss), 1e-12f);
+        const float length = std::sqrt(ss);
+        const float clamped = std::max(length, 1e-12f);
+        const float nrm = round_length ? round_dt(dt, clamped) : clamped;
         for (int64_t c = 0; c < n; ++c) {
             const float n1 = round_dt(dt, ldt(x, xb + c * xs) / nrm);
             const float n2 = round_dt(dt, n1 * sq);

@@ -142,6 +142,18 @@ the reference exactly with and without the first-chunk crop. The probe
 used the registered 3D convolution weight relayout and ran ten chunks
 through two interleaved lanes, including a new sequence in a reused lane.
 
+The first-frame encoder reuses the image VAE graph. Causal convolutions
+take the last temporal tap, spatial resamplers and attention projections
+read their native 2D weights, and the first-frame shortcut includes left
+zero padding on temporal downsample stages. The encoder opts into rounding
+the L2 norm to BF16 before division, as in the pinned implementation.
+
+Using a 64 × 96 input and the pinned BF16-cast weights, all 68 encoder ops
+ran on one R9700. The latent mean matched the Diffusers encoder with 0.392%
+relative RMSE and 0.999992 cosine similarity. The comparison is before
+per-channel latent normalization. The same device passed the independent
+640- and 1024-wide per-frame attention checks against the CPU reference.
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,

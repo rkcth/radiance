@@ -281,6 +281,22 @@ int ref_wan_gated_add(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+int ref_wan_vae_frame_cu(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *geom = &a->t[0], *y = &a->t[1];
+    RAD_REF_TRY(rad_wan_dit::check_grid(geom));
+    if (y->dtype != RAD_I32) return RAD_E_DTYPE;
+    if (y->rank != 1 || y->shape[0] < 2 || y->shape[0] > rad_wan_vae::max_chunk_frames + 1)
+        return RAD_E_SHAPE;
+    if (y->stride[0] != 1) return RAD_E_STRIDE;
+    int64_t plane = 0;
+    if (!rad_wan_vae::frame_plane(static_cast<const int32_t*>(geom->data), y->shape[0], plane))
+        return RAD_E_SHAPE;
+    auto* cu = static_cast<int32_t*>(y->data);
+    for (int32_t i = 0; i < y->shape[0]; ++i) cu[i] = static_cast<int32_t>(i * plane);
+    return RAD_OK;
+}
+
 int ref_wan_vae_history(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *history = &a->t[1], *out = &a->t[2];

@@ -342,6 +342,7 @@ int     r4d_rad_wan_rope               (const RadArgs*, RadStream);
 int     r4d_rad_wan_mod_norm           (const RadArgs*, RadStream);
 int     r4d_rad_wan_gated_add          (const RadArgs*, RadStream);
 int     r4d_rad_wan_unpatch            (const RadArgs*, RadStream);
+int     r4d_rad_wan_vae_frame_cu          (const RadArgs*, RadStream);
 int     r4d_rad_wan_vae_history        (const RadArgs*, RadStream);
 int     r4d_rad_wan_vae_expand         (const RadArgs*, RadStream);
 int     r4d_rad_snake_aa              (const RadArgs*, RadStream);

@@ -1333,7 +1333,7 @@ TEST(op_vocabulary) {
         "rms_mod", "flow_x0_step", "flow_res_multistep", "flow_unipc_step", "patch_unfold",
         "vtile_gather",
         "vtile_stitch", "grid_pos3", "wan_rope_table", "wan_rope", "wan_mod_norm", "wan_gated_add",
-        "wan_unpatch", "wan_vae_history", "wan_vae_expand", "snake_aa",
+        "wan_unpatch", "wan_vae_frame_cu", "wan_vae_history", "wan_vae_expand", "snake_aa",
         /* Its step-distilled form's video sparse attention: the tile selection and the
          * block-sparse attention over it. */
         "vsa_select", "attn_vsa",
@@ -7762,6 +7762,25 @@ TEST(wan_block_modulation_and_gates_select_the_first_frame_row) {
     CHECK_EQ(head.at(0), 4.0f); CHECK_EQ(head.at(1), 6.0f);
 }
 
+TEST(wan_vae_frame_cu_separates_each_spatial_plane) {
+    T dims(RAD_I32, {3}); dims.n({2, 2, 3});
+    T offsets(RAD_I32, {3});
+    A a; a.t(dims).t(offsets).i("M", 3);
+    CHECK_OK(run("wan_vae_frame_cu", a));
+    const auto* cu = static_cast<const int32_t*>(offsets.t.data);
+    CHECK_EQ(cu[0], 0); CHECK_EQ(cu[1], 6); CHECK_EQ(cu[2], 12);
+}
+
+TEST(wan_vae_norm_rounds_length_before_division) {
+    T x(RAD_BF16, {1, 8}); x.f({6, 1, 0, 0, 0, 0, 0, 0});
+    T gain(RAD_BF16, {8, 1, 1, 1}); gain.f(std::vector<float>(8, 1.0f));
+    T y(RAD_BF16, {1, 8});
+    A a; a.t(x).t(gain).t(y).i("M", 1).i("n", 8).i("round_length", 1)
+        .s("act", "none").s("dtype", "bf16");
+    CHECK_OK(run("l2norm_chan", a));
+    CHECK_EQ(y.at(0), 2.78125f); CHECK_EQ(y.at(1), 0.46484375f);
+}
+
 TEST(wan_vae_decoder_history_tracks_short_and_long_chunks) {
     T x(RAD_BF16, {2, 2}); x.f({1, 2, 3, 4});
     T history(RAD_BF16, {4, 2}); history.f({33, 33, 33, 33, 33, 33, 33, 33});
@@ -10868,6 +10887,7 @@ std::vector<Geo> geometries() {
         G("wan_mod_norm", "M", 4, a.i("M", R).i("n", 8).i("group", 3).s("dtype", "bf16")),
         G("wan_gated_add", "M", 4, a.i("M", R).i("n", 8).i("gate", 5).s("dtype", "f32")),
         G("wan_unpatch", "M", 16, a.i("M", R).i("n", 2).s("dtype", "bf16")),
+        G("wan_vae_frame_cu", "M", 3, a.i("M", R)),
         G("wan_vae_history", "M", 4, a.i("M", R).i("temporal", 1).i("reset", 0).s("dtype", "bf16")),
         G("wan_vae_expand", "M", 8, a.i("M", R).i("cin", 8).i("cout", 8).i("st", 2)
                                        .i("s", 2).i("drop", 1).i("temporal", 0).s("dtype", "bf16")),

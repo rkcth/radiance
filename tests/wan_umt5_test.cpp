@@ -4,6 +4,7 @@
 #include "../arch/wan/wan_dit_io.h"
 #include "../arch/wan/wan_time.h"
 #include "../arch/wan/wan_vae_time.h"
+#include "../arch/wan/wan_vae_encoder.h"
 
 TEST(wan_umt5_declares_each_checkpoint_tensor_and_runs_packed_conditioning) {
     RadBuilder builder{};
@@ -374,6 +375,51 @@ TEST(wan_vae_causal_convolution_excludes_history_outputs) {
     CHECK_EQ(run.issues[2].n, 16);
     CHECK_EQ(run.issues[3].opd.at(0).offset, 2 * 4 * 8);
     CHECK_EQ(run.issues[3].opd.back().rows, 8);
+    CHECK_LINT(b, &run);
+}
+
+TEST(wan_vae_encoder_uses_last_temporal_taps_and_spatial_checkpoint_weights) {
+    using namespace rad::arch;
+    RadBuilder b{};
+    Names names("wan");
+    const auto input = decl_b(&b, "patches", RAD_BF16, {12 * 64, 12}, RAD_BUF_PERSIST);
+    const auto cu = decl_b(&b, "offsets", RAD_I32, {2}, RAD_BUF_PERSIST);
+    wan::VaeEncoder enc;
+    REQUIRE_EQ(enc.declare(&b, names, 12, input, cu, 2), RAD_OK);
+    const auto* conv = find_map(b, "wan.vae.encoder.conv_in.weight");
+    const auto* resample = find_map(b, "wan.vae.encoder.down_blocks.2.downsampler.resample.1.weight");
+    const auto* attention = find_map(b, "wan.vae.encoder.mid_block.attentions.0.to_qkv.weight");
+    REQUIRE(conv && resample && attention);
+    CHECK_EQ(conv->mode, RAD_MAP_TAP);
+    CHECK_EQ(resample->mode, RAD_MAP_COPY);
+    CHECK_EQ(attention->mode, RAD_MAP_COPY);
+    CHECK(attention->src == (std::vector<std::string>{"vae.encoder.mid_block.attentions.0.to_qkv.weight"}));
+    const auto* w = find_w(b, "wan.vae.encoder.conv_in.weight");
+    REQUIRE(w);
+    CHECK_EQ(w->d.shape[1], 12);
+    CHECK_EQ(w->d.rank, 4u);
+    RadCtx run{};
+    run.b = &b;
+    REQUIRE_EQ(enc.step(&run, 2, 3), RAD_OK);
+    int shortcuts = 0, attention_calls = 0;
+    for (const auto& issue : run.issues) {
+        const auto* op = b.op_of(issue.op);
+        if (op->op == "l2norm_chan") CHECK_EQ(pint(op, "round_length"), 1);
+        if (op->op == "s2d_avg_add") {
+            CHECK_EQ(pint(op, "ft"), shortcuts == 0 ? 1 : 2);
+            ++shortcuts;
+        }
+        if (op->op == "attn_dense") {
+            ++attention_calls;
+            CHECK_EQ(pint(op, "head_dim"), 640);
+            CHECK_EQ(issue.n, 6);
+            CHECK_EQ(issue.opd[3].handle, cu);
+        }
+    }
+    CHECK_EQ(shortcuts, 3);
+    CHECK_EQ(attention_calls, 1);
+    CHECK_EQ(enc.mean(6).handle, enc.output());
+    CHECK_EQ(enc.mean(6).cols, 48);
     CHECK_LINT(b, &run);
 }
 

@@ -2804,7 +2804,9 @@ static const RadOperandSpec oConvNhwc[] = {
 };
 static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
                                         P_STR("pad"), P_INT("up"), P_STR("dtype") };
-static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadParamSpec pL2Norm[] = {
+    P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"), P_INTO("round_length"),
+};
 static const RadOperandSpec oL2Norm[] = {
     { "x", RAD_OPD_IN, 0 }, { "gamma", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
 };
@@ -3041,6 +3043,10 @@ static const RadOperandSpec oWanGate[] = {
 };
 static const RadOperandSpec oWanUnpatch[] = {
     { "patches", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "velocity", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pWanVaeFrameCu[] = { P_INT("M") };
+static const RadOperandSpec oWanVaeFrameCu[] = {
+    { "geom", RAD_OPD_IN, 0 }, { "cu", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pWanVaeHistory[] = {
     P_INT("M"), P_INT("temporal"), P_INT("reset"), P_STR("dtype"),
@@ -4212,6 +4218,7 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("wan_mod_norm", pWanModNorm, oWanModNorm, "Wan's timestep-modulated layer normalization."),
     SCHEMA("wan_gated_add", pWanGate, oWanGate, "Wan's FP32 residual update with an optional gate."),
     SCHEMA("wan_unpatch", pGenMn, oWanUnpatch, "Expand Wan head patches into F32 NDHWC velocity rows."),
+    SCHEMA("wan_vae_frame_cu", pWanVaeFrameCu, oWanVaeFrameCu, "Wan VAE per-frame attention offsets."),
     SCHEMA("wan_vae_history", pWanVaeHistory, oWanVaeHistory, "Wan VAE causal history and temporal taps."),
     SCHEMA("wan_vae_expand", pWanVaeExpand, oWanVaeExpand, "Wan VAE temporal shuffle and shortcut upsample."),
     SCHEMA("conv3d_ndhwc", pConv3d, oConv3d,
@@ -6121,6 +6128,12 @@ static const RadConstraint cAttnDenseH512[] = {
 };
 static const RadConstraint cAttnDenseH768[] = {
     C_EQ("head_dim", 768), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH640[] = {
+    C_EQ("head_dim", 640), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH1024[] = {
+    C_EQ("head_dim", 1024), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cAttnDenseH1152[] = {
     C_EQ("head_dim", 1152), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
@@ -10191,6 +10204,22 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cAttnDenseH768), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense_wide },
 
+{ "attn_dense_h640_bf16", "attn_dense", "attn",
+  "one 640-wide head over every pixel in each video frame",
+  "head_dim 640 split across eight waves, 16 queries a workgroup",
+  "bf16 query / key / value / out, bf16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH640), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_wide },
+
+{ "attn_dense_h1024_bf16", "attn_dense", "attn",
+  "one 1024-wide head over every pixel in each video frame",
+  "head_dim 1024 split across eight waves, 16 queries a workgroup",
+  "bf16 query / key / value / out, bf16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH1024), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_wide },
+
 { "attn_dense_h1152_bf16", "attn_dense", "attn",
   "one 1152-wide head over every row of a segment: an image decoder's mid-block attention",
   "head_dim 1152 split across eight waves, 16 queries a workgroup",
@@ -10776,6 +10805,11 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "Wan patch velocity to voxel velocity", "1 x 2 x 2 patches, pitched rows", "bf16 or f32 to f32",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, nullptr, 0, NOTUNE,
   nullptr, nullptr, r4d_rad_wan_unpatch },
+
+{ "wan_vae_frame_cu", "wan_vae_frame_cu", "elem",
+  "Wan VAE per-frame attention offsets.", "bounded frame count", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_wan_vae_frame_cu },
 
 { "wan_vae_history_bf16", "wan_vae_history", "elem",
   "Wan VAE causal history and temporal taps", "positive chunk/frame size, pitched rows", "bf16",

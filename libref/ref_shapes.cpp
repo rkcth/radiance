@@ -3616,6 +3616,15 @@ int ref_wan_unpatch_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("wan_unpatch", operand, out);
 }
 
+int ref_wan_vae_frame_cu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t offsets = gi(p, n_p, "M", 0);
+    if (offsets < 2 || offsets > 9) return RAD_E_SHAPE;
+    Opd o;
+    o.t_idx({3}, 0, offsets - 1, 0);
+    o.t(RAD_I32, {offsets});
+    return o.finish("wan_vae_frame_cu", operand, out);
+}
+
 int ref_wan_vae_history_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t rows = gi(p, n_p, "M", 0);
     const bool temporal = gi(p, n_p, "temporal", 0) != 0;

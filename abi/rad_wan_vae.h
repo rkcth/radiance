@@ -6,6 +6,18 @@
 namespace rad_wan_vae {
 
 constexpr int64_t max_spatial_axis = 8192;
+constexpr int64_t max_chunk_frames = 8;
+
+#if defined(__HIPCC__)
+__host__ __device__
+#endif
+inline bool frame_plane(const int32_t* geom, int64_t offsets, int64_t& plane) {
+    if (geom[0] + 1LL != offsets || geom[0] < 1 || geom[0] > max_chunk_frames ||
+        geom[1] < 1 || geom[1] > max_spatial_axis || geom[2] < 1 || geom[2] > max_spatial_axis)
+        return false;
+    plane = (int64_t)geom[1] * geom[2];
+    return true;
+}
 
 inline int check_history(const RadTensor* x, const RadTensor* history, const RadTensor* out,
                          bool temporal, int64_t& plane, int64_t& frames) {
