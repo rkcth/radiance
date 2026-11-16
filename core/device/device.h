@@ -107,8 +107,8 @@ extern "C" int rad_link_hold(RadStream s, int on);
 /* The launches this thread issues between `on` 1 and `on` 0 are a collective's: their blocks wait
  * for the other ranks' blocks of the same launch on another card. A recorded pass keeps the mark.
  *
- * rad_dev_cards_claim tells the backend which cards an engine's collectives run on (`on` 1, once
- * per engine with more than one rank) and that the engine is gone (`on` 0). On a card more than one
+ * rad_dev_cards_claim tells the backend which cards an engine uses (`on` 1, once per engine)
+ * and that the engine is gone (`on` 0). On a card more than one
  * engine has claimed, nothing may wait on the card behind a collective except the collective's own
  * blocks (aql.cpp, "collectives on a shared card"). A claim that makes a card shared returns once
  * everything issued before it on that card's streams has finished. */

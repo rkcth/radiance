@@ -4802,15 +4802,14 @@ int Engine::start() {
         r->device = devs[i];
         ranks_.push_back(std::move(r));
     }
-    /* Collectives run on these cards from here on; another engine's on the same cards must not be
-     * able to starve them of wave slots (rad_dev_cards_claim). */
-    if (cfg_.tp > 1) {
-        const int cs = rad_dev_cards_claim(devs.data(), cfg_.tp, 1);
-        if (cs < 0) {
-            RAD_ERR("device: the ranks' cards could not be claimed: %s", rad_strerror(cs));
-            return cs;
-        }
-        cards_claimed_ = true;
+    /* A single-rank engine can occupy wave slots on one of a peer engine's collective cards.
+     * Claim every engine's cards before it creates any work on them. The backend records the
+     * claim before draining outstanding work, so teardown also releases it on a drain failure. */
+    cards_claimed_ = true;
+    const int cs = rad_dev_cards_claim(devs.data(), cfg_.tp, 1);
+    if (cs < 0) {
+        RAD_ERR("device: the ranks' cards could not be claimed: %s", rad_strerror(cs));
+        return cs;
     }
 
     /* Peer access, measured before selection. Kernels that touch another card's memory constrain
