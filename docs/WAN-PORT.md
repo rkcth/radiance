@@ -49,6 +49,14 @@ transformer and VAE in FP32. The BF16 conversion recipe is limited to the
 latter two components. `rad-convert` requires the Wan architecture's
 declaration before emitting a runnable container.
 
+Wan's UMT5 relative-position attention now runs in libref and on gfx1201.
+A seeded BF16 comparison with pinned Wan's PyTorch expression used 64 heads
+and packed sequences of 127 and 511 tokens. The two R9700s produced identical
+outputs. Against PyTorch, GPU RMSE was `5.79e-6` and host RMSE was `8.13e-6`.
+Both paths had a maximum absolute error of `0.001953125`. The GPU regression
+also covers a full 512-token sequence, direction-specific bias, and untouched
+padding in pitched buffers. These checks precede the full encoder graph.
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,

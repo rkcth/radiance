@@ -455,6 +455,10 @@ static const RadParamSpec pAttnDense[] = { P_INT("M"), P_INT("head_dim"), P_INT(
                                            P_INTO("window_right") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
+static const RadParamSpec pAttnUmt5[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oAttnUmt5[] = {
+    OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"), WGT("bias"), OUT("out"),
+};
 static const RadParamSpec pAttnDenseRef[] = {
     P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
     P_F64O("scale"),
@@ -1608,6 +1612,9 @@ static const RadOpSchema kSchemas[] = {
   "Dense attention with a logit bias on target queries to reference keys. mode_cu gives "
   "each sequence's text, reference and target starts and the last sequence's end. A bias "
   "of negative infinity restricts reference queries to reference keys instead." },
+{ "attn_umt5", ARR(pAttnUmt5), ARR(oAttnUmt5),
+  "UMT5 BF16 bidirectional attention with an unscaled query-key dot and learned relative bias. "
+  "Each packed sequence uses its own key range and 32 signed distance buckets." },
 { "attn_cross", ARR(pAttnCross), ARR(oAttnCross),
   "attn_dense with each entry's keys a run of their own: queries rows [cu[s], cu[s+1]), keys and "
   "values rows [cu_k[s], cu_k[s+1]); with `causal` a query sees key j of its run when j <= its own "
@@ -2609,6 +2616,8 @@ SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_s
        ref_attn_dense),
 SIMPLE("ref_attn_dense_ref", "attn_dense_ref", "attn", "dense attention with reference key bias",
        DT_FLOAT, ref_attn_dense_ref),
+SIMPLE("ref_attn_umt5", "attn_umt5", "attn", "UMT5 signed relative-position attention",
+       "bf16, h64", ref_attn_umt5),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",
        "dense varlen attention, keys bounded apart from the queries (cu_k)", DT_FLOAT,
        ref_attn_cross),

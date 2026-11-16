@@ -69,6 +69,7 @@
 #include "rad_runtime.h"   /* RAD_VGEOM_N */
 #include "rad_sample.h"
 #include "rad_unipc_math.h"
+#include "rad_umt5_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1628,6 +1629,22 @@ int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
 
 int ref_attn_dense_ref_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return attn_dense_shape(p, n_p, operand, out, true);
+}
+
+int ref_attn_umt5_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t m = gi(p, n_p, "M", 0), heads = gi(p, n_p, "heads", 0);
+    if (heads < 1 || heads > 128 || m < 1 || m > INT32_MAX) return RAD_E_SHAPE;
+    const int64_t width = heads * rad_umt5::head_width;
+    // Use as few balanced sequences as the per-sequence limit allows.
+    const int64_t segments = (m + rad_umt5::max_tokens - 1) / rad_umt5::max_tokens;
+    Opd o;
+    o.t(RAD_BF16, { m, width });
+    o.t(RAD_BF16, { m, width });
+    o.t(RAD_BF16, { m, width });
+    o.t_idx({ segments + 1 }, m, -1, RAD_OPD_F_IDX_CU);
+    o.t(RAD_BF16, { rad_umt5::buckets, heads });
+    o.t(RAD_BF16, { m, width });
+    return o.finish("attn_umt5", operand, out);
 }
 
 int ref_attn_cross_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

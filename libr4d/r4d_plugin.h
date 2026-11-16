@@ -259,6 +259,7 @@ int     r4d_rad_seg_sinusoid          (const RadArgs*, RadStream);
  * (an image decoder's mid block). */
 int     r4d_rad_attn_prefix_self      (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense_h128       (const RadArgs*, RadStream);
+int     r4d_rad_attn_umt5             (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense_ref_h128   (const RadArgs*, RadStream);
 int     r4d_rad_attn_cross            (const RadArgs*, RadStream);
 int     r4d_rad_table_add             (const RadArgs*, RadStream);

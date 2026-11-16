@@ -216,6 +216,11 @@ static const RadOperandSpec oAttnDense[] = {
     { "cu_seqlens", RAD_OPD_IN,  0 },
     { "out",        RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pAttnUmt5[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oAttnUmt5[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "bias", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },
+};
 static const RadParamSpec pAttnDenseRef[] = {
     P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
     P_F64O("scale"),
@@ -3521,6 +3526,9 @@ static const RadOpSchema kSchemas[] = {
            "Dense attention with a logit bias on target queries to reference keys. mode_cu "
            "contains each sequence's text, reference and target starts and the last sequence's end. A bias "
   "of negative infinity restricts reference queries to reference keys instead."),
+    SCHEMA("attn_umt5", pAttnUmt5, oAttnUmt5,
+           "UMT5 BF16 bidirectional attention with an unscaled query-key dot and learned relative "
+           "bias. Each packed sequence uses its own key range and 32 signed distance buckets."),
     SCHEMA("attn_cross", pAttnCross, oAttnCross,
            "attn_dense with each entry's keys a run of their own: queries rows [cu[s], cu[s+1]), "
            "keys and values rows [cu_k[s], cu_k[s+1]); `causal` counts from each run's start."),
@@ -6049,6 +6057,7 @@ static const RadConstraint cAttnPrefixSelf[] = {
     C_EQ("head_dim", 128), C_LE("gqa", 8), C_EQ("block_size", 16), C_IN("q_dtype", "bf16"),
     C_IN("kv_dtype", "bf16"),
 };
+static const RadConstraint cAttnUmt5[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cAttnDenseH128[] = {
     C_EQ("head_dim", 128), C_LE("gqa", 8), C_IN("dtype", "bf16"),
 };
@@ -10070,6 +10079,13 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH128), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense_h128 },
+
+{ "attn_umt5_bf16", "attn_umt5", "attn",
+  "UMT5 signed relative-position attention", "head_dim 64, up to 512 tokens per sequence",
+  "bf16 operands and learned bias, f32 softmax",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnUmt5), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_umt5 },
 
 { "attn_dense_ref_h128_bf16", "attn_dense_ref", "attn",
   "dense attention with a logit bias on target queries to reference keys",
