@@ -1794,9 +1794,19 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->max_lanes);
         return RAD_E_INVAL;
     }
-    /* Form 0 counts grid points, form 1 evaluations. */
+    if (d->sched_kind == RAD_VIDEO_SCHEDULE_UNIPC &&
+        (has_audio || d->n_rungs != 0 || d->dyn_shift != 0 || d->shift_terminal != 0.0 ||
+         d->upscale_max != 0.0 || d->max_steps > 1000 || !std::isfinite(d->shift_video) ||
+         d->shift_video > 100.0)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': UniPC needs video only, a shift in "
+                         "(0, 100] and up to 1000 evaluations, with no rungs, dynamic shifting "
+                         "or upscaler", nm);
+        return RAD_E_INVAL;
+    }
+    /* Form 0 counts grid points. Form 1 can declare trained evaluations. */
     const int64_t rung_steps = d->sched_kind == 1 ? d->n_rungs : d->n_rungs + 1;
-    if (d->sched_kind < 0 || d->sched_kind > 1 || d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
+    if (d->sched_kind < 0 || d->sched_kind > RAD_VIDEO_SCHEDULE_UNIPC ||
+        d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
         (d->n_rungs > 0 && (d->default_steps != rung_steps || d->max_steps != rung_steps))) {
         err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %lld "
                          "steps, which default_steps and max_steps must both be (%lld, %lld)", nm,

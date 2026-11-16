@@ -427,6 +427,23 @@ TEST(a_video_only_declaration_requires_consistent_soundtrack_fields) {
     incomplete = d;
     incomplete.audio_streams = 1;
     CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+
+    d.sched_kind = RAD_VIDEO_SCHEDULE_UNIPC;
+    CHECK_EQ(declare(d), RAD_OK);
+    RadVideoGenDecl unsupported = d;
+    unsupported.max_steps = 1001;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.dyn_shift = 1;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.upscale_max = 2.0;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.audio_channels = unsupported.audio_latent_channels = 1;
+    unsupported.sample_rate = 48000;
+    unsupported.audio_rate = 100;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
 }
 
 TEST(buffer_uses_drive_liveness) {

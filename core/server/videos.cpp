@@ -267,7 +267,8 @@ void Server::video_caps(json& caps, const IVideoGen* gen) {
     caps["video_max_ref_images"] = std::min(kMaxRefImages, (int32_t)info.max_ref_images);
     caps["video_max_ref_videos"] = std::min(kMaxRefVideos, (int32_t)info.max_ref_videos);
     caps["video_max_ref_audios"] = std::min(kMaxRefAudios, (int32_t)info.max_ref_audios);
-    caps["video_samplers"] = json::array({ "euler", "res_multistep" });
+    caps["video_samplers"] = info.unipc_only ? json::array({ "unipc" })
+                                            : json::array({ "euler", "res_multistep" });
     caps["video_shift"]       = info.shift_video;
     if (info.channels > 0) caps["video_audio_shift"] = info.shift_audio;
 }
@@ -672,9 +673,16 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                                   (unit + 1) + ")");
         r->steps = (int32_t)v;
     }
+    r->sampler = info.unipc_only ? RAD_SAMPLER_UNIPC : RAD_SAMPLER_EULER;
     if (has(body, "sampler")) {
         const std::string sm = body["sampler"].is_string() ? body["sampler"].get<std::string>() : "";
-        if (sm.empty() || sm == "euler") r->sampler = RAD_SAMPLER_EULER;
+        if (info.unipc_only) {
+            if (sm != "unipc") {
+                ApiError e = err_unsupported("sampler", "this model uses the UniPC sampler");
+                e.supported = { "unipc" };
+                return error_response(e, req.peer);
+            }
+        } else if (sm.empty() || sm == "euler") r->sampler = RAD_SAMPLER_EULER;
         else if (sm == "res_multistep") r->sampler = RAD_SAMPLER_RES_MULTISTEP;
         else {
             ApiError e = err_unsupported("sampler", "the sampler is euler (first order) or "
@@ -1279,7 +1287,11 @@ json Server::video_json(const VideoJob& j) {
     o["seconds"] = j.seconds;
     o["size"] = j.size;
     o["seed"] = j.seed;
-    o["sampler"] = j.sampler == RAD_SAMPLER_RES_MULTISTEP ? "res_multistep" : "euler";
+    switch (j.sampler) {
+    case RAD_SAMPLER_UNIPC: o["sampler"] = "unipc"; break;
+    case RAD_SAMPLER_RES_MULTISTEP: o["sampler"] = "res_multistep"; break;
+    default: o["sampler"] = "euler"; break;
+    }
     if (j.shift_video > 0.0) o["shift"] = j.shift_video;
     if (j.shift_audio > 0.0) o["audio_shift"] = j.shift_audio;
     if (j.refine > 0) {

@@ -402,6 +402,52 @@ TEST(a_video_only_request_finishes_without_an_audio_pass) {
     CHECK_EQ(frames, 5);
 }
 
+TEST(unipc_stages_wan_timesteps_and_coefficients_for_each_video_step) {
+    VideoFixture f;
+    f.build();
+    auto& d = f.prog.video_gen;
+    d.sample_rate = d.audio_rate = d.audio_channels = d.audio_latent_channels = 0;
+    d.audio_out = RAD_NULL_HANDLE;
+    d.shift_audio = 0;
+    d.shift_video = 5;
+    d.default_steps = 4;
+    d.sched_kind = RAD_VIDEO_SCHEDULE_UNIPC;
+    REQUIRE_EQ(f.start(), RAD_OK);
+
+    std::string why;
+    auto euler = f.req();
+    euler->sampler = RAD_SAMPLER_EULER;
+    CHECK_EQ(f.drv.submit(std::move(euler), &why), RAD_E_INVAL);
+    CHECK(why.find("sampler") != std::string::npos);
+    auto request = f.req();
+    REQUIRE_EQ(f.drv.submit(std::move(request), &why), RAD_OK);
+    const int32_t expected_times[] = { 999, 937, 833, 624 };
+    const auto sched = gen::video_schedule(d, 4);
+    REQUIRE_EQ(sched.steps, 4);
+    REQUIRE_EQ(sched.unipc.size(), 4u);
+    const RadBatch* pass = f.drv.next(0);
+    REQUIRE(pass && pass->gen == RAD_GEN_PASS_VCOND);
+    for (int i = 0; i < 4; ++i) {
+        CHECK_EQ(pass->vgen_b->t_video[i], static_cast<float>(expected_times[i]));
+        CHECK_EQ(pass->vgen_b->t_audio[i], 0.0f);
+    }
+    CHECK_OK(f.drv.done());
+    for (int i = 0; i < 4; ++i) {
+        pass = f.drv.next(i + 1);
+        REQUIRE(pass && pass->gen == RAD_GEN_PASS_VSTEP);
+        const RadVideoGenBatch& batch = *pass->vgen_b;
+        CHECK_EQ(batch.sampler, RAD_SAMPLER_UNIPC);
+        CHECK_EQ(batch.sched[0], static_cast<float>(expected_times[i]));
+        CHECK_EQ(batch.sched[1], sched.sig_v[i]);
+        CHECK_EQ(batch.sched[2], sched.sig_v[i + 1]);
+        float coefficients[rad_unipc::COUNT];
+        sched.unipc[i].coefficients(coefficients);
+        for (int k = 0; k < rad_unipc::COUNT; ++k)
+            CHECK_EQ(batch.sched[RAD_VIDEO_UNIPC_COEFF_OFFSET + k], coefficients[k]);
+        CHECK_OK(f.drv.done());
+    }
+}
+
 /* A second request is conditioned while the first waits for its first step, and denoised once the
  * first has finished: requests are denoised one after another. */
 TEST(a_second_request_is_conditioned_early_and_denoised_after_the_first) {

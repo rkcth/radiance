@@ -1,5 +1,5 @@
 #include "rad_test.h"
-#include "../arch/wan/wan_unipc.h"
+#include "../core/gen/wan_unipc.h"
 
 #include <array>
 #include <cmath>

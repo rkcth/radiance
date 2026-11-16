@@ -1195,6 +1195,23 @@ TEST(a_video_only_model_refuses_soundtrack_options_and_finishes_an_mp4) {
     CHECK_EQ(str_at(v.wait(str_at(video, "id")), "status"), std::string("completed"));
 }
 
+TEST(a_unipc_model_reports_its_sampler_and_refuses_other_samplers) {
+    Videos v;
+    v.gen.inf.unipc_only = true;
+    v.gen.inf.step_evals = true;
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "euler" } })), std::string("sampler"));
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "res_multistep" } })), std::string("sampler"));
+    for (const auto& body : { Videos::body(), Videos::body({ { "sampler", "unipc" },
+                                                          { "num_inference_steps", 1 } }) }) {
+        const HttpResponse r = v.create(body);
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().sampler, RAD_SAMPLER_UNIPC);
+        const json video = json::parse(r.body, nullptr, false);
+        CHECK_EQ(str_at(video, "sampler"), std::string("unipc"));
+        CHECK_EQ(str_at(v.wait(str_at(video, "id")), "status"), std::string("completed"));
+    }
+}
+
 /* input_reference: refused by a text-only model; on a model that starts from a picture, a data URL
  * in JSON or a file in a form becomes the first frame at the size the first steps run at (the
  * small size under latent upscaling), an even colour staying that colour; task i2va goes with it. */

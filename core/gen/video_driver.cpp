@@ -146,11 +146,18 @@ static std::vector<float> flow_sigmas(const RadVideoGenDecl& d, int32_t n, int64
 
 VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t video_tokens,
                              bool refine, double shift_video, double shift_audio) {
-    /* A request's shift replaces the declaration's, form 0 only. */
+    /* A request's shift replaces the declaration's for form 0 and UniPC. */
     const double sv = shift_video > 0.0 ? shift_video : d.shift_video;
     const double sa = d.audio_channels == 0 ? sv
                     : shift_audio > 0.0 ? shift_audio : d.shift_audio;
     VideoSchedule v;
+    if (d.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC) {
+        v.unipc = wan::unipc_plan(steps, sv);
+        v.steps = static_cast<int32_t>(v.unipc.size());
+        for (const auto& step : v.unipc) v.sig_v.push_back(step.sigma);
+        if (v.steps > 0) v.sig_v.push_back(0.0f);
+        return v;
+    }
     if (d.sched_kind == 1) {
         if (d.n_rungs > 0) {
             if (steps != d.n_rungs) return v;
@@ -700,7 +707,7 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
                   " pixels, the long side at most " + std::to_string(d.max_aspect) +
                   " times the short");
     const int32_t steps = r->steps > 0 ? r->steps : (int32_t)d.default_steps;
-    const bool evals = d.sched_kind == 1;   /* form 1 counts evaluations, form 0 grid points */
+    const bool evals = d.sched_kind != 0;   /* form 0 counts grid points */
     const int32_t rung_steps = evals ? d.n_rungs : d.n_rungs + 1;
     if (d.n_rungs > 0 && steps != rung_steps)
         return no("num_inference_steps must be " + std::to_string(rung_steps) + ": this model "
@@ -711,6 +718,11 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
                   std::to_string(d.max_steps) + (evals ? " (model evaluations)" :
                   " (sigma grid points, the last one 0)"));
 
+    const bool unipc = d.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC;
+    if (r->sampler == -1) r->sampler = unipc ? RAD_SAMPLER_UNIPC : RAD_SAMPLER_EULER;
+    if (unipc ? r->sampler != RAD_SAMPLER_UNIPC
+              : r->sampler != RAD_SAMPLER_EULER && r->sampler != RAD_SAMPLER_RES_MULTISTEP)
+        return no("this model does not support the requested sampler");
     auto j = std::make_unique<Job>();
     if (d.audio_channels == 0 && r->shift_audio != 0.0)
         return no("this model has no soundtrack schedule");
@@ -1032,8 +1044,13 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     float* tv = hptr<float>(R_TV);
     float* ta = hptr<float>(R_TA);
     for (int32_t i = 0; i < j.sched.steps; ++i) {
-        tv[i] = 1.0f - j.sched.sig_v[(size_t)i];
-        ta[i] = 1.0f - j.sched.sig_a[(size_t)i];
+        if (j.sched.unipc.empty()) {
+            tv[i] = 1.0f - j.sched.sig_v[(size_t)i];
+            ta[i] = 1.0f - j.sched.sig_a[(size_t)i];
+        } else {
+            tv[i] = static_cast<float>(j.sched.unipc[i].timestep);
+            ta[i] = 0.0f;
+        }
     }
     reg_[R_TOK].used = (T + N) * 4;
     reg_[R_POS].used = (T + N) * 4;
@@ -1107,6 +1124,17 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
  * upscale (i == split) and one to sigma 0. */
 void VideoDriver::stage_sched(const Job& j, int32_t i, bool to_clean) {
     float* s = hptr<float>(R_SCHED);
+    if (!j.sched.unipc.empty()) {
+        const auto& step = j.sched.unipc[i];
+        std::fill_n(s, 16, 0.0f);
+        s[0] = static_cast<float>(step.timestep);
+        s[1] = step.sigma;
+        s[2] = j.sched.sig_v[i + 1];
+        static_assert(RAD_VIDEO_UNIPC_COEFF_OFFSET + rad_unipc::COUNT <= 16);
+        step.coefficients(s + RAD_VIDEO_UNIPC_COEFF_OFFSET);
+        reg_[R_SCHED].used = 16 * 4;
+        return;
+    }
     s[0] = 1.0f - j.sched.sig_v[(size_t)i];
     s[1] = j.sched.sig_v[(size_t)i];
     s[2] = to_clean ? 0.0f : j.sched.sig_v[(size_t)i + 1];

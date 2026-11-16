@@ -800,8 +800,9 @@ struct VideoGenInfo {
      * the server fits media to; `max_enc_side` 0 means no video encoder, so no keyframes either. */
     int64_t max_ref_images = 0, max_ref_videos = 0, max_ref_audios = 0;
     int64_t max_enc_frames = 0, max_enc_side = 0, max_enc_samples = 0, enc_ratio = 0;
-    /* `steps` counts model evaluations rather than sigma grid points (RadVideoGenDecl form 1). */
+    /* `steps` counts model evaluations rather than sigma grid points. */
     bool    step_evals = false;
+    bool    unipc_only = false;
     /* Guidance (RadVideoGenDecl::guidance): the terms a request may name, their defaults and the
      * negative prompt a guided request gets when it names none. */
     bool    guidance = false;

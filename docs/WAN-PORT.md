@@ -38,8 +38,11 @@ coefficients to latent and history buffers. The host test checks numerical
 results and rejects overlapping rows. On one R9700, three device updates
 each with F32 and BF16 velocity matched the host arithmetic exactly,
 including untouched tensor padding. The reference and device passes share
-the elementwise update. The Wan graph still needs to stage the coefficients
-and supply its predicted velocity.
+the elementwise update. The video driver now accepts a video-only UniPC
+declaration. It stages the integer model timestep and eight coefficients
+for each pass. The HTTP API selects and reports `unipc` for that declaration
+and rejects alternate samplers. The Wan graph still needs to bind these
+operands and supply its predicted velocity.
 
 The verified Diffusers files store the text encoder in BF16 and the
 transformer and VAE in FP32. The BF16 conversion recipe is limited to the

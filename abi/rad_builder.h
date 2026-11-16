@@ -1364,6 +1364,8 @@ enum { RAD_GEN_PASS_VCOND = 8, RAD_GEN_PASS_VSTEP = 9, RAD_GEN_PASS_ADECODE = 10
        RAD_GEN_PASS_VDECODE = 11, RAD_GEN_PASS_VUPSCALE = 12,
        RAD_GEN_PASS_VENCODE = 13, RAD_GEN_PASS_AENCODE = 14 };
 
+enum { RAD_VIDEO_SCHEDULE_UNIPC = 2 };
+
 typedef struct RadVideoGenDecl {
     const char* name;             /* "minimax-h3" -- the served model id and messages */
 
@@ -1418,7 +1420,11 @@ typedef struct RadVideoGenDecl {
      * `base_seq` (`base_shift`) to `max_seq` (`max_shift`); then, with `shift_terminal` > 0,
      * stretched so the last is shift_terminal; and a closing 0. A trained schedule (n_rungs > 0)
      * is the rungs taken to f32 and a closing 0, with default_steps and max_steps both n_rungs.
-     * Both modalities step the same sigmas; shift_video and shift_audio are unused. */
+     * Both modalities step the same sigmas; shift_video and shift_audio are unused.
+     * RAD_VIDEO_SCHEDULE_UNIPC: Wan's shifted 1000-step flow training grid and
+     * order-two UniPC BH2 update, with integer model timesteps. The request
+     * names the number of evaluations. Only video, with no trained rungs or
+     * latent upscaler. shift_video supplies the default shift. */
     int32_t       sched_kind;
     int32_t       dyn_shift;
     double        base_shift, max_shift;
