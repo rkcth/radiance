@@ -281,6 +281,35 @@ Wan finished denoising a 512 × 320 clip. Both video and text stopped
 advancing at the VAE decode stage. The watchdog shut down the isolated
 process. This run does not qualify concurrent video for deployment.
 
+After extending the shared-card queue barrier to cover a one-rank
+neighbour, a focused run used one 197,718-token prompt and seven
+shorter prompts. Eight live text streams reached 296,124 KV tokens.
+Every stream delivered output during video generation. The text-to-video
+request completed in 48.45 seconds including a cold switch, and
+image-to-video took 38.02 seconds with Wan resident. Both MP4s decoded to
+49 frames at 512 × 320 and 24 fps. The image-to-video first frame measured
+36.08 dB PSNR against the supplied image. Peak sampled VRAM was
+31.27 and 30.97 GiB, and minimum available host RAM was 69.30 GiB.
+
+Wan unloaded in 0.30 seconds and every returning chat reused its
+cached prefix. The longest gap between streaming deltas was 4.54 seconds
+with the video requests and 1.49 seconds after unloading. The common
+eight-stream decode window delivered 25.0 SSE deltas per second during
+the mixed round and 149.2 after unloading. SSE deltas can carry several
+tokens, so those rates describe stream delivery.
+
+The full rerun processed 1,001,342 cold prompt tokens in 211.33 seconds.
+The cached return peaked at 1,016,468 live KV tokens across eight chats.
+All eight streams delivered output during video generation. The
+text-to-video and image-to-video requests completed in 69.96 and 52.04
+seconds, respectively. Both MP4s matched the seeded clips from the
+focused run byte for byte. The maximum stream gap was 16.80 seconds
+with Wan and 0.92 seconds after unloading. The common eight-stream
+decode window went from 21.6 SSE deltas per second in the mixed round
+to 206.8 after unloading. Both cached rounds reused 999,424 prompt
+tokens. Peak sampled VRAM was 31.27 and 30.97 GiB, and minimum available
+host RAM was 69.02 GiB. No GPU stall or memory fault was logged.
+
 ## Reference and qualification checklist
 
 1. Use the existing Diffusers component loader to retain component prefixes.
