@@ -216,6 +216,15 @@ static const RadOperandSpec oAttnDense[] = {
     { "cu_seqlens", RAD_OPD_IN,  0 },
     { "out",        RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pAttnDenseRef[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
+    P_F64O("scale"),
+};
+static const RadOperandSpec oAttnDenseRef[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 }, { "mode_cu", RAD_OPD_IN, 0 },
+    { "ref_log_bias", RAD_OPD_IN, 0 },
+};
 static const RadParamSpec pAttnCross[] = {
     P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
     P_F64O("scale"),
@@ -3504,6 +3513,10 @@ static const RadOpSchema kSchemas[] = {
            "dense attention over cu_seqlens segments (rows cu/cu_div), with attn_paged's window "
            "rule over a segment's positions and optional blocks of `block` rows that attend "
            "within themselves."),
+    SCHEMA("attn_dense_ref", pAttnDenseRef, oAttnDenseRef,
+           "Dense attention with a logit bias on target queries to reference keys. mode_cu "
+           "contains each sequence's text, reference and target starts and the last sequence's end. A bias "
+  "of negative infinity restricts reference queries to reference keys instead."),
     SCHEMA("attn_cross", pAttnCross, oAttnCross,
            "attn_dense with each entry's keys a run of their own: queries rows [cu[s], cu[s+1]), "
            "keys and values rows [cu_k[s], cu_k[s+1]); `causal` counts from each run's start."),
@@ -10040,6 +10053,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH128), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense_h128 },
+
+{ "attn_dense_ref_h128_bf16", "attn_dense_ref", "attn",
+  "dense attention with a logit bias on target queries to reference keys",
+  "head_dim 128, 1/2/4/8 query heads a KV head",
+  "bf16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH128), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_ref_h128 },
 
 { "attn_cross_h128_bf16", "attn_cross", "attn",
   "dense varlen attention with the keys bounded apart from the queries (cross attention)",

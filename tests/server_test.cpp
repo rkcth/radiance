@@ -2254,6 +2254,191 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
     f.sched.join_all();
 }
 
+TEST(named_text_requests_use_the_selected_tokenizer_and_scheduler) {
+    FakeScheduler supplemental;
+    supplemental.reply = "supplement";
+    FakeTokenizer tokenizer;
+    tokenizer.add_bos = true;
+    FakeChatTemplate chat;
+    auto endpoint = std::make_shared<TextEndpoint>();
+    endpoint->scheduler = &supplemental;
+    endpoint->parser.tok = &tokenizer;
+    endpoint->parser.chat = &chat;
+    endpoint->limits.model_id = "secondary";
+    endpoint->limits.max_ctx = 128;
+    endpoint->limits.default_max_tokens = 32;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps&) {
+        o.image_model_id = "image";
+        o.select_text = [&](const std::string& model, const auto&, auto* out, auto*) -> int {
+            if (model != "secondary") return RAD_E_NOTFOUND;
+            *out = endpoint;
+            return RAD_OK;
+        };
+    } });
+    const auto primary = f.post("/v1/completions", R"({"prompt":"hi"})");
+    REQUIRE_EQ(primary.status, 200);
+    CHECK_EQ(json::parse(primary.body).at("model").get<std::string>(), "test-model");
+
+    const auto completion = f.post("/v1/completions", R"({"model":"secondary","prompt":"hi"})");
+    REQUIRE_EQ(completion.status, 200);
+    const auto body = json::parse(completion.body);
+    CHECK_EQ(body.at("model").get<std::string>(), "secondary");
+    CHECK_EQ(body.at("choices").at(0).at("text").get<std::string>(), "supplement");
+    REQUIRE_EQ(supplemental.prompts.size(), (size_t)1);
+    REQUIRE(!supplemental.prompts.front().empty());
+    CHECK_EQ(supplemental.prompts.front().front(), tokenizer.bos());
+
+    const auto dialogue = f.post("/v1/chat/completions",
+        R"({"model":"secondary","messages":[{"role":"user","content":"hi"}]})");
+    REQUIRE_EQ(dialogue.status, 200);
+    CHECK_EQ(json::parse(dialogue.body).at("model").get<std::string>(), "secondary");
+    CHECK(has(chat.last_prompt, "hi"));
+    CHECK(f.tmpl.last_prompt.empty());
+    CHECK_EQ(f.post("/v1/completions", R"({"model":"unknown","prompt":"hi"})").status, 404);
+    CHECK_EQ(f.post("/v1/completions", R"({"model":4,"prompt":"hi"})").status, 400);
+    CHECK_EQ(f.sched.submitted.size(), (size_t)1);
+    CHECK_EQ(supplemental.submitted.size(), (size_t)2);
+    supplemental.join_all();
+    supplemental.check_reaped();
+}
+
+TEST(text_readiness_requires_a_completed_token) {
+    Fixture f;
+    std::string why;
+    const auto deadline = [] { return std::chrono::steady_clock::now() + std::chrono::seconds(5); };
+    CHECK_EQ(f.srv->probe_text_completion(deadline(), &why), RAD_OK);
+    f.sched.reply.clear();
+    CHECK_EQ(f.srv->probe_text_completion(deadline(), &why), RAD_E_STATE);
+    CHECK_EQ(why, "text readiness completion produced no tokens");
+    CHECK_EQ(f.srv->probe_text_completion(std::chrono::steady_clock::now(), &why), RAD_E_CANCELLED);
+    CHECK_EQ(f.sched.submitted.size(), (size_t)2);
+
+    f.sched.hang = true;
+    const auto cancel_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    CHECK_EQ(f.srv->probe_text_completion(cancel_at, &why), RAD_E_CANCELLED);
+    CHECK(f.sched.saw_cancel());
+    CHECK_EQ(f.sched.submitted.size(), (size_t)3);
+    f.sched.join_all();
+    f.srv->stop();
+    f.sched.check_reaped();
+}
+
+TEST(a_disconnected_named_text_request_keeps_the_engine_until_reap) {
+    struct DeferredScheduler : FakeScheduler {
+        void cancel(uint64_t id) override { cancelled.push_back(id); }
+    };
+    struct Runtime {
+        DeferredScheduler scheduler;
+        FakeTokenizer tokenizer;
+        FakeChatTemplate chat;
+    };
+    auto runtime = std::make_shared<Runtime>();
+    runtime->scheduler.manual = true;
+    std::shared_ptr<const TextEndpoint> endpoint;
+    std::weak_ptr<void> bridge;
+    {
+        Deps deps;
+        deps.sched = &runtime->scheduler;
+        deps.tok = &runtime->tokenizer;
+        deps.text_owner = std::make_shared<int>(0);
+        bridge = deps.text_owner;
+        ServerOptions options;
+        options.model_id = "secondary";
+        options.max_ctx = 128;
+        options.default_max_tokens = 32;
+        options.embedding_model = true;
+        Server embedding(deps, options);
+        CHECK(!embedding.retain_text_endpoint(runtime));
+        options.embedding_model = false;
+
+        deps.chat = &runtime->chat;
+        runtime->chat.efforts = {"\"high\"", "\"low\""};
+        Server probe(deps, options);
+        CHECK(!probe.retain_text_endpoint({}));
+        const auto efforts = probe.probe_reasoning_efforts();
+        REQUIRE(!efforts.empty());
+        endpoint = probe.retain_text_endpoint(runtime);
+        REQUIRE(endpoint);
+        CHECK(endpoint->limits.reasoning_efforts == efforts);
+    }
+    CHECK(!bridge.expired());
+    CHECK_EQ(endpoint->limits.max_ctx, 128);
+    std::weak_ptr<Runtime> weak_runtime = runtime;
+    std::weak_ptr<const TextEndpoint> weak_endpoint = endpoint;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps&) {
+        o.select_text = [&](const std::string&, const auto&, auto* out, auto*) -> int {
+            if (!endpoint) return RAD_E_NOTFOUND;
+            *out = endpoint;
+            return RAD_OK;
+        };
+    } });
+    {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/completions";
+        q.body = R"({"model":"secondary","prompt":"hi","stream":true})";
+        auto response = f.srv->router().dispatch(q);
+        REQUIRE(response.streaming());
+        REQUIRE_EQ(runtime->scheduler.submitted.size(), (size_t)1);
+        endpoint.reset();
+        runtime.reset();
+        response.on_close(false);
+    }
+    {
+        auto retained = weak_runtime.lock();
+        REQUIRE(retained);
+        CHECK(!weak_endpoint.expired());
+        CHECK(retained->scheduler.saw_cancel());
+        CHECK(retained->scheduler.reaped.empty());
+        CHECK(f.sched.submitted.empty());
+        retained->scheduler.finish(0, Finish::Cancelled);
+        f.srv->stop();
+        retained->scheduler.check_reaped();
+        CHECK(weak_endpoint.expired());
+    }
+    CHECK(weak_runtime.expired());
+}
+
+TEST(a_disconnected_generation_holds_its_adapter_until_reaped) {
+    struct DeferredScheduler : FakeScheduler {
+        void cancel(uint64_t id) override { cancelled.push_back(id); }
+    } scheduler;
+    scheduler.manual = true;
+    std::weak_ptr<void> adapter;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.sched = &scheduler;
+        o.lora_acquire = [&](const std::string&, int32_t* slot, uint64_t* uid,
+                             std::shared_ptr<void>* hold) {
+            *slot = 0;
+            *uid = 1;
+            *hold = std::make_shared<int>(0);
+            adapter = *hold;
+            return (int)RAD_OK;
+        };
+    } });
+    bool gone = false;
+    {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/completions";
+        q.body = R"({"model":"ad","prompt":"hi","stream":true})";
+        q.closed = [&] { return gone; };
+        auto response = f.srv->router().dispatch(q);
+        REQUIRE(response.streaming());
+        REQUIRE_EQ(scheduler.submitted.size(), (size_t)1);
+        gone = true;
+        response.on_close(false);
+    }
+    CHECK(scheduler.saw_cancel());
+    CHECK(scheduler.reaped.empty());
+    CHECK(!adapter.expired());
+
+    scheduler.finish(0, Finish::Cancelled);
+    f.srv->stop();
+    scheduler.check_reaped();
+    CHECK(adapter.expired());
+}
+
 /* A model leaving its cards ends its streams even when the engine has stopped answering: the
  * response's lease is what keeps the server alive, so a stream that waits for the engine keeps a
  * park or an unload waiting, and a server freed under it faults at the client's hang-up. */
@@ -2827,8 +3012,8 @@ TEST(an_adapter_in_use_drains_on_unload_and_frees_itself_when_its_last_request_e
         r.on_close(false);
     }
     f.sched.join_all();
+    CHECK_EQ(f.post("/v1/unload_lora_adapter", unload).status, 404);   /* freed after reap */
     CHECK_EQ(table.in_flight("ad"), 0);
-    CHECK_EQ(f.post("/v1/unload_lora_adapter", unload).status, 404);   /* freed by itself */
 
     /* The slot cools before it is written again, then the name loads afresh; idle, it unloads at
      * once. */

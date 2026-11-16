@@ -146,6 +146,34 @@ void RadFile::drop_range(int64_t off, int64_t bytes) const {
     ::posix_fadvise(fd_, (off_t)off, (off_t)bytes, POSIX_FADV_DONTNEED);
 }
 
+static bool read_identity(int fd, RadFile::Identity* out, bool* unlinked = nullptr) {
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) return false;
+    if (unlinked) *unlinked = st.st_nlink == 0;
+#ifdef __APPLE__
+    const auto& modified = st.st_mtimespec;
+    const auto& changed = st.st_ctimespec;
+#else
+    const auto& modified = st.st_mtim;
+    const auto& changed = st.st_ctim;
+#endif
+    *out = {static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+            static_cast<int64_t>(st.st_size), modified.tv_sec, modified.tv_nsec,
+            changed.tv_sec, changed.tv_nsec};
+    return true;
+}
+
+bool RadFile::matches_open_file(int fd) const {
+    Identity current{};
+    bool unlinked = false;
+    if (!read_identity(fd, &current, &unlinked)) return false;
+    if (current == identity_) return true;
+    if (!unlinked) return false;
+    current.changed_s = identity_.changed_s;
+    current.changed_ns = identity_.changed_ns;
+    return current == identity_;
+}
+
 int RadFile::open(const char* path) {
     close();
     if (!path || !*path) return RAD_E_INVAL;
@@ -154,9 +182,12 @@ int RadFile::open(const char* path) {
     fd_ = ::open(path, O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) { RAD_ERR("%s: %s", path, std::strerror(errno)); return RAD_E_IO; }
 
-    struct stat st{};
-    if (::fstat(fd_, &st) != 0) { RAD_ERR("%s: %s", path, std::strerror(errno)); close(); return RAD_E_IO; }
-    size_ = (int64_t)st.st_size;
+    if (!read_identity(fd_, &identity_)) {
+        RAD_ERR("%s: %s", path, std::strerror(errno));
+        close();
+        return RAD_E_IO;
+    }
+    size_ = identity_.size;
     if (size_ < (int64_t)sizeof(RadFileHeader)) {
         RAD_ERR("%s: %lld bytes is shorter than a .rad header (%zu)", path,
                 (long long)size_, sizeof(RadFileHeader));

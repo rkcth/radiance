@@ -221,6 +221,8 @@ public:
 
     int  init(const CtxDesc& d);
     void shutdown();
+    int drain_streams();
+    int64_t arena_allocation_bytes() const { return arena_.bytes(); }
 
     /* ---------------------------------------------------------- the hot path */
     int issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n);

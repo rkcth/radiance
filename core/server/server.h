@@ -24,6 +24,9 @@
 #include "sink.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,6 +34,7 @@
 #include <vector>
 
 namespace rad {
+namespace lora { struct PinnedAdapter; }
 namespace server {
 
 struct Deps {
@@ -46,9 +50,41 @@ struct Deps {
     IGrammarCompiler* grammar = nullptr;   /* absent -> response_format is 501 */
     IEmbedder*        embed   = nullptr;   /* absent -> /v1/embeddings is 501 */
     IMultimodal*      mm      = nullptr;   /* absent -> image and audio parts are 501 */
-    IImageGen*        images  = nullptr;   /* absent -> the images endpoints are 501 */
-    IAudioGen*        audio   = nullptr;   /* absent -> /v1/audio/speech is 501 */
-    IVideoGen*        videos  = nullptr;   /* absent -> /v1/videos is 501 */
+    /* Image conditioning has its own vocabulary. Both pointers travel with the model. */
+    struct ImageEndpoint {
+        ImageEndpoint() = default;
+        ImageEndpoint(IImageGen* gen, ITokenizer* tok, std::shared_ptr<void> owner = {})
+            : gen(gen), tok(tok), owner(std::move(owner)) {}
+
+        IImageGen*  gen = nullptr;
+        ITokenizer* tok = nullptr;
+        std::shared_ptr<void> owner;
+        std::string model_id;
+        std::function<int(const std::vector<std::pair<std::string, double>>&, int32_t*,
+                          std::shared_ptr<void>*, std::string*, std::string*)> lora_acquire;
+        std::function<int(const std::vector<lora::PinnedAdapter>&, int32_t*,
+                          std::shared_ptr<void>*, std::string*, std::string*)> pinned_lora_acquire;
+        std::function<int(const std::vector<lora::PinnedAdapter>&, std::string*)> validate_loras;
+        std::function<std::vector<std::string>()> lora_names;
+        std::function<int(const std::string&, const std::string&, std::string*)> lora_load;
+        std::function<int(const std::string&, std::string*, int*)> lora_unload;
+        explicit operator bool() const { return gen && tok; }
+    } images;
+    struct AudioEndpoint {
+        IAudioGen* gen = nullptr;
+        ITokenizer* tok = nullptr;
+        std::shared_ptr<void> owner;
+        explicit operator bool() const { return gen && tok; }
+    } audio;
+    struct VideoEndpoint {
+        IVideoGen* gen = nullptr;
+        ITokenizer* tok = nullptr;
+        IMultimodal* mm = nullptr;
+        std::shared_ptr<void> owner;
+        std::function<int(const std::vector<std::pair<std::string, double>>&, int32_t*,
+                          std::shared_ptr<void>*, std::string*, std::string*)> lora_acquire{};
+        explicit operator bool() const { return gen && tok; }
+    } videos;
     IShapeGen*        shapes  = nullptr;   /* absent -> /generate is 501 */
     const SpeechFormat* speech = nullptr;  /* absent -> /v1/audio/transcriptions is 501 */
 
@@ -75,10 +111,60 @@ struct Deps {
         std::function<std::string()> json;
     };
     ControlVectorSwitch control_vector;
+
+    /* Backs sched, tok, chat, grammar and mm. These bridges can still borrow Engine state.
+     * Retain that Engine separately. Other Deps fields, including embed and speech,
+     * have their own lifetimes. */
+    std::shared_ptr<void> text_owner;
+};
+
+enum class ImageSelection { Active, Warm, Cold };
+
+struct ImageDispatchTiming {
+    ImageSelection selection = ImageSelection::Active;
+    int64_t queued_ns = 0;
+    int64_t selection_ns = 0;
+};
+
+enum class GeneratorKind { Image, Audio, Video };
+
+struct TextEndpoint {
+    /* The lease must outlive the bridge owner and the borrowed scheduler. */
+    std::shared_ptr<void> engine_lease;
+    std::shared_ptr<void> bridge_owner;
+    IScheduler* scheduler = nullptr;
+    OaiDeps parser;
+    OaiLimits limits;
+    Deps::ControlVectorSwitch control_vector;
 };
 
 struct ServerOptions {
     std::string model_id = "radiance";
+    /* Nonblocking lookup before HTTP admission. Return an owned endpoint for a ready model.
+     * An empty endpoint with RAD_OK leaves the request on the primary path. */
+    std::function<int(const std::string&, const std::function<bool()>&,
+                      std::shared_ptr<const TextEndpoint>*, std::string*)> select_text;
+    int64_t text_selection_max_ctx = 0;
+    std::shared_ptr<const TextEndpoint> supplemental_text;
+    std::string image_model_id;       /* the separate image model in shared mode */
+    std::function<Deps::ImageEndpoint()> acquire_image;
+    std::function<std::vector<std::string>()> image_model_ids;
+    std::function<std::string()> image_status;
+    std::function<std::vector<std::string>()> image_lora_names;
+    std::function<int(const std::vector<std::pair<std::string, double>>&,
+                      std::vector<lora::PinnedAdapter>*, std::shared_ptr<void>*, std::string*, bool reclaim_cache)> pin_image_loras;
+    std::function<int(const std::string&, const std::function<bool()>&, std::string*)> unload_image;
+    std::function<int(const std::string&, size_t, size_t, size_t, const std::function<bool()>&,
+                      Deps::ImageEndpoint*, std::shared_ptr<void>*, ImageDispatchTiming*,
+                      std::string*)> queue_image;
+    std::function<GeneratorKind(const std::string&)> generator_kind;
+    /* A successful selection returns a turn that protects the runtime through driver retirement. */
+    std::function<int(const std::string&, size_t, size_t, size_t, const std::function<bool()>&,
+                      Deps::AudioEndpoint*, std::shared_ptr<void>*, std::string*)> queue_audio;
+    std::function<int(const std::string&, size_t, size_t, size_t, const std::function<bool()>&,
+                      Deps::VideoEndpoint*, std::shared_ptr<void>*, std::string*)> queue_video;
+    std::function<int(const std::string&, const std::string&, std::string*)> load_image;
+    std::function<int(const std::string&, const std::string&, std::string*)> register_image;
     /* An embedding model (rad_declare_pooled) generates nothing: /v1/chat/completions and
      * /v1/completions answer 501 naming /v1/embeddings. */
     bool        embedding_model = false;
@@ -225,6 +311,12 @@ HttpResponse dashboard_page();
 class Server {
 public:
     Server(const Deps& d, const ServerOptions& o);
+    /* Retain this server's text dependencies and limits after startup template probes.
+     * The lease must keep the Engine and its borrowed state alive through retirement. */
+    std::shared_ptr<const TextEndpoint> retain_text_endpoint(std::shared_ptr<void> engine_lease) const;
+    /* Run a short completion through the attached text engine without opening a listener.
+     * Call after starting the engine's workers, before publishing the endpoint. */
+    int probe_text_completion(std::chrono::steady_clock::time_point deadline, std::string* why);
     /* Stop the scheduler before destroying the Server: `Request::sink` is a raw pointer into
      * storage this object owns, and an unfinished request still writes into it. The destructor
      * waits a bounded time for cancelled requests, then leaks the rest rather than free memory a
@@ -339,11 +431,14 @@ private:
     bool realtime_loop(RealtimeSession& s, WsConn& ws);
     HttpResponse handle_models(const HttpRequest& req);
     HttpResponse handle_loras(const HttpRequest& req);
+    HttpResponse handle_validate_loras(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
     std::optional<HttpResponse> refuse_text(const std::string& peer,
                                             ApiShape shape = ApiShape::OpenAI);
     /* A parsed generation request, in any API's shape: admitted, run, answered in `r.shape`. */
-    HttpResponse serve(const HttpRequest& req, OaiRequest& r);
+    HttpResponse serve(const HttpRequest& req, OaiRequest& r,
+                       const std::shared_ptr<const TextEndpoint>& endpoint = {});
+    HttpResponse handle_text(const HttpRequest& req, bool chat);
     json native_result(const OaiRequest& r, const Generation& g, const std::string& content);
 
     /* ------------------------------------------------------------------ images.cpp */
@@ -353,10 +448,11 @@ private:
     HttpResponse handle_speech(const HttpRequest& req);
     /* The audio a speech request describes, `text` its input, as the generator's request; -1 with
      * `err` naming the field. Shared by the route and the realtime session. */
-    int speech_request(const json& body, const std::string& text,
+    int speech_request(const IAudioGen& audio, const ITokenizer& tokenizer,
+                       const json& body, const std::string& text,
                        std::unique_ptr<gen::AudioRequest>* out, ApiError* err);
-    HttpResponse stream_speech(std::shared_ptr<gen::AudioTicket> ticket, const AudioGenInfo& info,
-                               int64_t n_tok, uint64_t seed, bool sse, bool wav);
+    HttpResponse stream_speech(std::shared_ptr<gen::AudioTicket> ticket, int64_t rate,
+                               int64_t channels, int64_t n_tok, uint64_t seed, bool sse, bool wav);
 
     /* ------------------------------------------------------------------ videos.cpp
      * OpenAI's video jobs: created by POST, made in the background, polled and downloaded. */
@@ -396,6 +492,10 @@ private:
     HttpResponse handle_tokenizer_info(const HttpRequest& req);
     HttpResponse handle_server_info(const HttpRequest& req);
     HttpResponse handle_diagnostics(const HttpRequest& req);
+    Deps::ImageEndpoint image_endpoint() const;
+    HttpResponse handle_image_admin(const HttpRequest& req, bool activate);
+    HttpResponse handle_image_status(const HttpRequest& req);
+    HttpResponse handle_unload_image(const HttpRequest& req);
     HttpResponse handle_lora_admin(const HttpRequest& req, bool load);
     /* What this deployment can do (chat, tools, reasoning, grammar, media, logprobs, reasoning
      * efforts), shared by /server_info's `capabilities` and the model entry so they agree. */
@@ -446,7 +546,8 @@ private:
     void  drain_graveyard(int timeout_ms);
 
     /* Turn a parsed request into `n_choices` submitted engine requests. */
-    int   submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiError* err);
+    int   submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiError* err,
+                     const std::shared_ptr<const TextEndpoint>& endpoint = {});
     void  cancel_all(std::vector<Generation>& gens, bool count_disconnect);
     /* While `gens` run: once the client has left (499) or the server is stopping, every
      * generation is cancelled and retired, `n` queue places are released, and the answer is
@@ -461,8 +562,10 @@ private:
     bool  pump(std::vector<Generation>& gens, const OaiRequest& r);
     bool  all_done(const std::vector<Generation>& gens) const;
 
-    HttpResponse blocking_completion(const HttpRequest& req, OaiRequest& r);
-    HttpResponse streaming_completion(const HttpRequest& req, OaiRequest& r);
+    HttpResponse blocking_completion(const HttpRequest& req, OaiRequest& r,
+                                     const std::shared_ptr<const TextEndpoint>& endpoint);
+    HttpResponse streaming_completion(const HttpRequest& req, OaiRequest& r,
+                                      const std::shared_ptr<const TextEndpoint>& endpoint);
 
     /* `quiet` says the request's line at the debug level: one of the many small passes a
      * realtime session makes, which its own lines account for. */
@@ -477,6 +580,11 @@ private:
     Metrics        metrics_;
     HttpTransport  transport_;
 
+    /* Adapted image requests wait in arrival order after HTTP admission. Only
+     * the head tries to acquire a slot, and it releases this lock before doing so. */
+    std::mutex image_adapter_mu_;
+    std::condition_variable image_adapter_turn_;
+    std::list<int> image_adapter_waiters_;
     std::atomic<int64_t> in_flight_{0};
     /* Generation jobs (an image, a shape, speech): they do not pass through the scheduler, so
      * its figures say nothing about them. A job ends when its response has been sent. */
@@ -499,8 +607,14 @@ private:
     /* Sinks whose HTTP side is gone but whose engine side may still be mid-step. Held until the
      * scheduler reports the request terminal, because Request::sink is a raw pointer and freeing
      * it under a running step is a use-after-free. */
-    std::mutex                          grave_m_;
-    std::vector<std::shared_ptr<Sink>>  grave_;
+    struct RetiredGeneration {
+        IScheduler* scheduler;
+        std::shared_ptr<const void> text_owner;
+        std::shared_ptr<void> lora_hold;
+        std::shared_ptr<Sink> sink;
+    };
+    std::mutex                     grave_m_;
+    std::vector<RetiredGeneration> grave_;
 
     /* The video jobs, oldest first, and the threads that make them (videos.cpp); deleted jobs
      * wait in `videos_gone_` until their threads are done. */

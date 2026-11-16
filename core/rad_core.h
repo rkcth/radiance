@@ -396,6 +396,14 @@ public:
     /* A generator's slots pack each combination's ranks from j = 0: the ranks pool p takes in
      * slot s at [p * S + s], 0 for a pool the combination does not reach (no adapter op runs). */
     std::vector<int32_t>       lora_rused;
+    struct LoraReplacement {
+        rad_buf slots = 0;
+        int64_t rows = 0;
+        bool row_mixer = false;
+        std::vector<int64_t> source_rows;
+        std::string module;
+    };
+    std::map<rad_weight, LoraReplacement> lora_replacements;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
@@ -803,6 +811,21 @@ enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
+    std::string supplemental_text_model;
+    int supplemental_text_device = -1;
+    int64_t supplemental_text_host_pool_mib = 0;
+    std::string image_model;           /* local checkpoint for the shared HTTP service */
+    int image_text_rank = -1;        /* -1 inherits the text rank layout */
+    std::vector<std::string> image_model_reserve; /* additional checkpoints to size at startup */
+    int64_t image_reload_headroom_mib = 0; /* extra VRAM per shared generator rank */
+    int64_t unloaded_image_expert_pool_mib = 0; /* optional expert cache after explicit unload */
+    TablePlacement image_embedding_placement = TablePlacement::Auto; /* shared image overrides only */
+    TablePlacement video_tower_placement = TablePlacement::Vram; /* shared video only */
+    bool image_model_fifo = false;   /* dispatch strictly in arrival order */
+    int64_t image_lora_snapshot_mib = 2048; /* immutable adapter sources for admitted images */
+    bool image_snapshot_pageable = true; /* generator weight snapshots, including active loans */
+    bool image_weight_loan = true; /* allow text experts to borrow idle generator weight memory */
+    int64_t image_model_cache_mib = 0; /* image snapshot RAM budget, including the active model */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
     std::string model_revision;        /* --model-revision: the hub revision a repo id fetches;
@@ -811,6 +834,7 @@ struct Config {
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
 
     int   tp = 1;
+    std::vector<int> device_ordinals; /* optional ordered backend ordinals, one per rank */
     /* The tensor-parallel wire, a deployment choice. 1 is the exact bf16 all-reduce. 0 accepts a
      * lossy wire: at two ranks libr4d sends a Walsh-Hadamard-rotated 6-bit payload (6 bits per
      * element plus a bf16 scale per 64) instead of 16 bits per element, 2.4x fewer bytes over

@@ -51,7 +51,9 @@ const Replaced kReplaced[] = {
 };
 
 /* Flags given more than once on a command line; a YAML sequence repeats them. */
-const char* const kRepeatable[] = { "lora", "allow-host", "trusted-proxy" };
+const char* const kRepeatable[] = {
+    "lora", "allow-host", "trusted-proxy", "image-model-reserve", "device-ordinal",
+};
 
 /* The fleet's own keys on a model. `defaults:` may carry every one but aliases (read_model_keys). */
 const char* const kModelFleetKeys[] = { "aliases", "priority", "pin", "ttl", "flex", "park" };

@@ -404,16 +404,17 @@ json Server::capabilities() const {
     caps["video"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Video);
     caps["audio"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Audio);
     caps["logprobs"]  = opt_.supports_logprobs;
-    caps["image_generation"] = deps_.images != nullptr;
-    caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
-    caps["audio_generation"] = deps_.audio != nullptr;
-    caps["video_generation"] = deps_.videos != nullptr;
+    const auto images = image_endpoint();
+    caps["image_generation"] = static_cast<bool>(images);
+    caps["image_edit"]       = images && images.gen->info().max_refs > 0;
+    caps["audio_generation"] = static_cast<bool>(deps_.audio);
+    caps["video_generation"] = static_cast<bool>(deps_.videos);
     caps["shape_generation"] = deps_.shapes != nullptr;
     /* The decision protocol /v1/systemone serves (ServerOptions::decision_type), so a proxy can
      * route to a decision model without trying a generation; null when it serves none. */
     caps["decision"] = opt_.decision_type.empty() ? json(nullptr) : json(opt_.decision_type);
     /* What a video request may carry. */
-    if (deps_.videos) video_caps(caps, deps_.videos);
+    if (deps_.videos) video_caps(caps, deps_.videos.gen);
     if (deps_.shapes) shape_caps(caps, deps_.shapes);
     /* The efforts a chat request may send, probed from the template at startup; null when it
      * takes any word. "none" and "minimal" are this server's and turn thinking off. */

@@ -61,6 +61,16 @@ public:
     void close();
     bool is_open() const { return base_ != nullptr; }
 
+    struct Identity {
+        uint64_t device, inode;
+        int64_t size, modified_s, modified_ns, changed_s, changed_ns;
+        bool operator==(const Identity&) const = default;
+    };
+
+    const Identity& identity() const { return identity_; }
+    int fd() const { return fd_; }
+    /* Check a held inode. Unlink can change ctime without changing its contents. */
+    bool matches_open_file(int fd) const;
     const char*          path()   const { return path_.c_str(); }
     const RadFileHeader& header() const { return *hdr_; }
     const uint8_t*       base()   const { return base_; }
@@ -161,6 +171,7 @@ private:
     int64_t     size_ = 0;
     std::vector<std::pair<int64_t, int64_t>> keep_;   /* keep_cached: (blob offset, bytes) */
     int         fd_   = -1;
+    Identity    identity_{};
 
     const RadFileHeader*  hdr_  = nullptr;
     const RadFileKV*      meta_ = nullptr;

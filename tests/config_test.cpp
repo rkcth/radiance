@@ -69,6 +69,131 @@ TEST(help_is_reported_separately_from_an_error) {
 
 /* An unknown flag is an error naming it, not a warning: a typo in a budget flag would otherwise
  * yield a plan the operator did not ask for. */
+TEST(device_ordinals_are_an_ordered_rank_binding) {
+    Config c;
+    CHECK_EQ(parse({"--device-ordinal", "1", "--device-ordinal", "0", "--tp", "2"}, &c), RAD_OK);
+    CHECK_EQ(c.device_ordinals.size(), 2u);
+    if (c.device_ordinals.size() == 2) {
+        CHECK_EQ(c.device_ordinals[0], 1);
+        CHECK_EQ(c.device_ordinals[1], 0);
+    }
+    CHECK_EQ(parse_fresh({"--device-ordinal", "-1"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--device-ordinal", "0", "--device-ordinal", "0", "--tp", "2"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--device-ordinal", "0", "--tp", "2"}), RAD_E_INVAL);
+}
+
+TEST(supplemental_text_requires_a_model_device_pair_and_http_serving) {
+    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--supplemental-text-device", "1"}), RAD_E_INVAL);
+    Config cfg;
+    REQUIRE_EQ(parse({"--supplemental-text-model", "/m/secondary.rad",
+                      "--supplemental-text-device", "1"}, &cfg), RAD_OK);
+    CHECK_EQ(cfg.supplemental_text_model, "/m/secondary.rad");
+    CHECK_EQ(cfg.supplemental_text_device, 1);
+    CHECK_EQ(cfg.supplemental_text_host_pool_mib, 0);
+    CHECK(cfg.image_model.empty());
+    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
+                          "--supplemental-text-device", "1", "--debug-graph"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
+                          "--supplemental-text-device", "1", "--calib-corpus", "/c.jsonl",
+                          "--calib-dir", "/d"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
+                          "--supplemental-text-device", "1", "--kld-record", "/r",
+                          "--kld-corpus", "/c.jsonl"}), RAD_E_INVAL);
+}
+
+TEST(supplemental_text_host_pool_requires_a_supplemental_model) {
+    Config cfg;
+    REQUIRE_EQ(parse({"--supplemental-text-model", "/m/secondary.rad",
+                      "--supplemental-text-device", "1",
+                      "--supplemental-text-host-pool-mib", "4096"}, &cfg), RAD_OK);
+    CHECK_EQ(cfg.supplemental_text_host_pool_mib, 4096);
+    CHECK_EQ(cfg.host_pool_mib, 0);
+    CHECK_EQ(parse_fresh({"--supplemental-text-host-pool-mib", "0"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
+                          "--supplemental-text-device", "1",
+                          "--supplemental-text-host-pool-mib", "-1"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
+                          "--supplemental-text-device", "1",
+                          "--supplemental-text-host-pool-mib", "1099511627776"}), RAD_E_INVAL);
+}
+
+TEST(shared_image_weight_loans_are_opt_out) {
+    Config cfg;
+    CHECK(cfg.image_weight_loan);
+    CHECK_EQ(parse_fresh({"--no-image-weight-loan"}), RAD_E_INVAL);
+    REQUIRE_EQ(parse({"--image-model", "/m/image.rad", "--no-image-weight-loan"}, &cfg), RAD_OK);
+    CHECK(!cfg.image_weight_loan);
+}
+
+TEST(shared_image_can_select_a_text_rank) {
+    Config c;
+    CHECK_EQ(parse({"--image-text-rank", "1", "--image-model", "/m/image.rad", "--tp", "2"}, &c), RAD_OK);
+    CHECK_EQ(c.image_text_rank, 1);
+    CHECK_EQ(parse_fresh({"--image-text-rank", "0"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-text-rank", "1", "--image-model", "/m/image.rad"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-text-rank", "-1", "--image-model", "/m/image.rad"}), RAD_E_INVAL);
+}
+
+TEST(shared_image_reload_headroom_is_opt_in) {
+    Config c;
+    CHECK_EQ(c.image_reload_headroom_mib, 0);
+    REQUIRE_EQ(parse({"--image-model", "/m/image.rad", "--image-reload-headroom-mib", "64"}, &c), RAD_OK);
+    CHECK_EQ(c.image_reload_headroom_mib, 64);
+    CHECK_EQ(parse_fresh({"--image-reload-headroom-mib", "64"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--image-reload-headroom-mib", "-1"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--image-reload-headroom-mib",
+                          "8796093022208"}), RAD_E_INVAL);
+}
+
+TEST(unloaded_image_expert_pool_is_opt_in) {
+    Config c;
+    CHECK_EQ(c.unloaded_image_expert_pool_mib, 0);
+    REQUIRE_EQ(parse({"--image-model", "/m/image.rad", "--unloaded-image-expert-pool-mib", "64"}, &c), RAD_OK);
+    CHECK_EQ(c.unloaded_image_expert_pool_mib, 64);
+    CHECK_EQ(parse_fresh({"--unloaded-image-expert-pool-mib", "64"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--unloaded-image-expert-pool-mib", "-1"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--unloaded-image-expert-pool-mib",
+                          "8796093022208"}), RAD_E_INVAL);
+}
+
+TEST(shared_video_tower_placement_is_independent_of_text) {
+    Config c;
+    CHECK_EQ(parse({"--image-model", "/m/image.rad", "--video-tower-placement", "ram",
+                    "--vision-tower-placement", "vram"}, &c), RAD_OK);
+    CHECK(c.video_tower_placement == TablePlacement::Ram);
+    CHECK(c.tower_placement == TablePlacement::Vram);
+    CHECK_EQ(parse_fresh({"--video-tower-placement", "ram"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--video-tower-placement", "auto"}),
+             RAD_E_INVAL);
+}
+
+TEST(shared_image_embedding_placement_is_independent_of_text) {
+    Config c;
+    CHECK_EQ(parse({"--image-model", "/m/image.rad", "--image-embedding-placement", "vram",
+                    "--embedding-placement", "ram"}, &c), RAD_OK);
+    CHECK(c.image_embedding_placement == TablePlacement::Vram);
+    CHECK(c.embedding_placement == TablePlacement::Ram);
+    CHECK_EQ(parse_fresh({"--image-embedding-placement", "vram"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--image-embedding-placement", "disk"}),
+             RAD_E_INVAL);
+}
+
+TEST(shared_image_snapshot_memory_defaults_to_pageable) {
+    Config defaults, pageable, pinned;
+    REQUIRE_EQ(parse({"--image-model", "/m/image.rad"}, &defaults), RAD_OK);
+    CHECK(defaults.image_snapshot_pageable);
+    REQUIRE_EQ(parse({"--image-model", "/m/image.rad",
+                      "--image-snapshot-memory", "pageable"}, &pageable), RAD_OK);
+    CHECK(pageable.image_snapshot_pageable);
+    REQUIRE_EQ(parse({"--image-model", "/m/image.rad",
+                      "--image-snapshot-memory", "pinned"}, &pinned), RAD_OK);
+    CHECK(!pinned.image_snapshot_pageable);
+    CHECK_EQ(parse_fresh({"--image-snapshot-memory", "pageable"}), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad",
+                          "--image-snapshot-memory", "auto"}), RAD_E_INVAL);
+}
+
 TEST(an_unknown_option_is_refused) {
     Config c;
     CHECK_EQ(parse({ "--not-a-flag" }, &c), RAD_E_INVAL);
@@ -560,6 +685,23 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
 /* A legal value for every option that takes one, with any option it cannot be given without. */
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
+        { "--device-ordinal", { "0" } },
+        { "--image-model", { "/m/image.rad" } },
+        { "--supplemental-text-model", { "/m/secondary.rad", "--supplemental-text-device", "1" } },
+        { "--supplemental-text-device", { "1", "--supplemental-text-model", "/m/secondary.rad" } },
+        { "--supplemental-text-host-pool-mib", { "4096", "--supplemental-text-model",
+                                              "/m/secondary.rad", "--supplemental-text-device", "1" } },
+        { "--image-text-rank", { "0", "--image-model", "/m/image.rad" } },
+        { "--image-model-reserve", { "/m/other.rad", "--image-model", "/m/image.rad" } },
+        { "--image-reload-headroom-mib", { "64", "--image-model", "/m/image.rad" } },
+        { "--unloaded-image-expert-pool-mib", { "64", "--image-model", "/m/image.rad" } },
+        { "--image-model-fifo", { "--image-model", "/m/image.rad" } },
+        { "--no-image-weight-loan", { "--image-model", "/m/image.rad" } },
+        { "--video-tower-placement", { "ram", "--image-model", "/m/image.rad" } },
+        { "--image-embedding-placement", { "vram", "--image-model", "/m/image.rad" } },
+        { "--image-lora-snapshot-mib", { "64", "--image-model", "/m/image.rad", "--max-loras", "1" } },
+        { "--image-snapshot-memory", { "pageable", "--image-model", "/m/image.rad" } },
+        { "--image-model-cache-mib", { "128", "--image-model", "/m/image.rad" } },
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
         { "--model-revision", { "v1.2" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
@@ -666,14 +808,13 @@ TEST(every_listed_option_parses_and_is_reported_as_given) {
         if (name == "--help" || name == "--draft-model") continue;
         CHECK(std::find(names.begin(), names.end(), name) != names.end());
         std::vector<std::string> args{ "--model", "/m/x.rad", name };
-        if (!arg.empty()) {
-            auto it = legal_values().find(name);
-            if (it == legal_values().end()) {
-                std::fprintf(stderr, "    no legal value listed for %s %s\n", name.c_str(), arg.c_str());
-                CHECK(false);
-                continue;
-            }
+        const auto it = legal_values().find(name);
+        if (it != legal_values().end()) {
             args.insert(args.end(), it->second.begin(), it->second.end());
+        } else if (!arg.empty()) {
+            std::fprintf(stderr, "    no legal value listed for %s %s\n", name.c_str(), arg.c_str());
+            CHECK(false);
+            continue;
         }
         Config c;
         Argv a(args);
@@ -1451,6 +1592,16 @@ TEST(spec_ngram_sets_the_window_and_refuses_another) {
     CHECK_EQ(g.spec_ngram_min, 1);
     CHECK_EQ(g.spec_ngram_max, 8);
     CHECK_EQ(g.n_spec, -1);              /* the range alone changes no window */
+}
+
+TEST(host_headroom_mib_must_fit_in_a_signed_byte_count) {
+    Config c;
+    const int64_t max_mib = INT64_MAX >> 20;
+    const auto largest = std::to_string(max_mib);
+    const auto oversized = std::to_string(max_mib + 1);
+    CHECK_EQ(parse({"--host-headroom-mib", largest.c_str()}, &c), RAD_OK);
+    CHECK_EQ(c.host_headroom_mib, max_mib);
+    CHECK_EQ(parse_fresh({"--host-headroom-mib", oversized.c_str()}), RAD_E_INVAL);
 }
 
 /* --gpu-headroom is an alias for --gpu-headroom-mib; both set the same field. */

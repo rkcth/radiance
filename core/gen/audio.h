@@ -77,6 +77,7 @@ struct AudioRequest {
     int32_t  steps = 0;            /* 0: the model's default */
     float    cfg = 0.0f;           /* 0: the model's default */
     uint64_t seed = 0;
+    std::shared_ptr<void> dispatch_hold; /* keeps the shared model selected through retirement */
     std::shared_ptr<AudioTicket> ticket;
 };
 

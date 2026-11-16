@@ -102,8 +102,8 @@ set(RAD_TEST_SHARDS_gbnf_test 4)
 # entries below run the device tests on a card.
 #
 # RAD_TEST_STRICT=1: a plugin or fixture this build makes is never legitimately absent, so a test
-# that cannot find one fails rather than skips. RAD_TEST_TMPDIR puts radtest::tmpdir() in the build
-# tree, on disk, where O_DIRECT works.
+# that cannot find one fails rather than skips. RAD_TEST_TMPDIR defaults to the build tree, on
+# disk, where O_DIRECT works. Set RAD_TEST_TMP_ROOT to use a different fixture directory.
 #
 # RAD_TEST_CPU_BUDGET: a unit binary that spends more CPU seconds than this fails (rad_test.h), so
 # a slow case or a spinning thread pool is caught when it lands. Sanitised and Debug builds run
@@ -123,10 +123,12 @@ if(RAD_ASAN OR RAD_TSAN OR CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(RAD_TEST_TIMEOUT 600)
   set(RAD_TEST_CPU_BUDGET 0)
 endif()
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tmp)
+set(RAD_TEST_TMP_ROOT "${CMAKE_BINARY_DIR}/tmp" CACHE PATH
+    "Root for test fixtures; use a native filesystem for tests that replace open files")
+file(MAKE_DIRECTORY "${RAD_TEST_TMP_ROOT}")
 set(RAD_TEST_OMP_ENV "OMP_WAIT_POLICY=passive" "OMP_NUM_THREADS=${RAD_TEST_OMP_THREADS}")
 set(RAD_TEST_CARD_ENV "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home" ${RAD_TEST_OMP_ENV}
-                      "RAD_TEST_STRICT=1" "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp"
+                      "RAD_TEST_STRICT=1" "RAD_TEST_TMPDIR=${RAD_TEST_TMP_ROOT}"
                       ${RAD_TEST_SAN_ENV})
 set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 
@@ -279,6 +281,7 @@ foreach(t ${RAD_TESTS})
   # engine binary.
   if(n STREQUAL "mem_test")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
+    add_dependencies(${n} radtest_rows)
   endif()
   if(n STREQUAL "dspark_device_test")
     if(RAD_HIP_FOUND AND TARGET libr4d)
@@ -396,7 +399,21 @@ endforeach()
 # 6 to 17 s by build type and load, mostly libref's GEMMs and decode steps and the engine's own
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
+  # The fixture exercises draft coupling and Qwen3-ASR through loaded plugins.
+  add_dependencies(engine_e2e_test spechub qwen3asr_bf16)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+  set_property(TEST engine_e2e_test APPEND PROPERTY ENVIRONMENT "RAD_E2E_SKIP_VISION_EDIT=1")
+  add_test(NAME shared_single_image_rank_e2e COMMAND engine_e2e_test
+    shared_service_serves_text_and_repeated_images_on_one_listener)
+  set_tests_properties(shared_single_image_rank_e2e PROPERTIES LABELS "e2e" SKIP_RETURN_CODE 77
+    ENVIRONMENT "${RAD_TEST_ENV};RAD_E2E_SINGLE_IMAGE_RANK=1" TIMEOUT 300)
+  add_test(NAME shared_pageable_image_snapshot_e2e COMMAND engine_e2e_test
+    shared_service_serves_text_and_repeated_images_on_one_listener)
+  set_tests_properties(shared_pageable_image_snapshot_e2e PROPERTIES LABELS "e2e" SKIP_RETURN_CODE 77
+    ENVIRONMENT "${RAD_TEST_ENV};RAD_E2E_PAGEABLE_IMAGE_SNAPSHOT=1" TIMEOUT 300)
+  add_test(NAME qwen_vision_edit_e2e COMMAND engine_e2e_test qwen_image_with_vision_serves_an_edit)
+  set_tests_properties(qwen_vision_edit_e2e PROPERTIES LABELS "e2e" SKIP_RETURN_CODE 77
+    ENVIRONMENT "${RAD_TEST_ENV}" TIMEOUT 600)
 endif()
 if(TARGET clef_decision_test)
   set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)

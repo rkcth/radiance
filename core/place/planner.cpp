@@ -138,12 +138,20 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes) {
  * weight may be on a card at all; without it pin_mapped keeps it in the container's mapping.
  * Declare rejects only ops with no kernel in either domain, so a host-only op (e.g.
  * `embed_lookup_q` with no device kernel loaded) does reach the planner. */
-static void resolve_sites(const Program& prog, std::vector<uint8_t>* host_ok,
+static bool uses_device_gdn_state(const OpInfo& op) {
+    return op.op == "gdn_conv_prep" || op.op == "gdn_conv_update" ||
+           op.op == "gdn_recurrent_update" || op.op == "gdn_chunk_scan" ||
+           op.op == "gdn_conv_recurrent_update" || op.op == "gdn_conv_recurrent_update_had";
+}
+
+static void resolve_sites(const Program& prog, bool host_backend, std::vector<uint8_t>* host_ok,
                           std::vector<uint8_t>* device_ok) {
     host_ok->assign(prog.weights.size(), 1u);
     device_ok->assign(prog.weights.size(), 1u);
     for (const OpInfo& o : prog.ops) {
-        bool host = !o.bands.empty();
+        /* GPU GDN kernels share the device KV pool. Spilling their weights to
+         * RAM leaves the convolution and recurrent state in device memory. */
+        bool host = !o.bands.empty() && (host_backend || !uses_device_gdn_state(o));
         bool dev  = !o.bands.empty();
         for (const Band& b : o.bands) {
             if (!b.dom[RAD_DOMAIN_HOST]) host = false;
@@ -152,8 +160,6 @@ static void resolve_sites(const Program& prog, std::vector<uint8_t>* host_ok,
         for (rad_weight w : o.weights) {
             if (w == RAD_NULL_HANDLE || w >= host_ok->size()) continue;
             if (!host) (*host_ok)[w] = 0u;
-            /* No device kernel leaves host as the only option. Declare rejects a band with neither
-             * kernel, so `!dev` here implies `host`. */
             if (!dev) (*device_ok)[w] = 0u;
         }
     }
@@ -167,7 +173,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
     *out = WeightFootprint{};
 
     std::vector<uint8_t> host_ok, device_ok;
-    resolve_sites(prog, &host_ok, &device_ok);
+    resolve_sites(prog, host_backend, &host_ok, &device_ok);
 
     /* build_units: a model-level weight is its own unit, everything else groups by the declared
      * (layer, expert). */
@@ -592,7 +598,9 @@ int Planner::assign_layer_offload(Plan* p) {
     std::map<int32_t, int64_t> bytes_of;
     std::map<int32_t, int32_t> first_of;
     for (const MoveUnit& mu : p->units) {
-        if (mu.layer < 0) continue;
+        /* Forced host and mapped units are already outside total. Spilling their
+         * layers cannot free any of the VRAM this strategy is budgeting. */
+        if (mu.layer < 0 || mu.preplaced()) continue;
         if (!bytes_of.count(mu.layer)) { layers.push_back(mu.layer); first_of[mu.layer] = -1; }
         bytes_of[mu.layer] += mu.slot_bytes;
         int32_t& first = first_of[mu.layer];
@@ -613,7 +621,7 @@ int Planner::assign_layer_offload(Plan* p) {
     bool any_stage = ssd_;
     std::map<int32_t, int64_t> stride_of;
     for (const MoveUnit& mu : p->units) {
-        if (mu.layer < 0 || mu.slab_class < 0) continue;
+        if (mu.layer < 0 || mu.slab_class < 0 || mu.preplaced()) continue;
         stride_of[mu.slab_class] = p->classes[(size_t)mu.slab_class].stride;
         if (!host_kernel(mu)) any_stage = true;
     }
@@ -1187,7 +1195,20 @@ int Planner::plan(Plan* out) {
         return RAD_E_INVAL;
     }
 
-    resolve_sites(prog, &host_ok_, &device_ok_);
+    if (!in_.host_backend) {
+        for (const OpInfo& op : prog.ops) {
+            if (!uses_device_gdn_state(op) || op.bands.empty()) continue;
+            const auto missing = std::find_if(op.bands.begin(), op.bands.end(), [](const Band& band) {
+                return !band.dom[RAD_DOMAIN_DEVICE];
+            });
+            if (missing != op.bands.end()) {
+                RAD_ERR("placement: '%s' needs a device kernel in every band to access GDN state "
+                        "on the GPU (missing through %lld)", op.op.c_str(), (long long)missing->hi);
+                return RAD_E_NOKERNEL;
+            }
+        }
+    }
+    resolve_sites(prog, in_.host_backend, &host_ok_, &device_ok_);
     build_units(prog, out);
     /* Before build_classes and assign: mapped units get no class and no budget. */
     pin_mapped(prog, out);

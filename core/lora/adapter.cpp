@@ -2,6 +2,7 @@
 #include "adapter.h"
 
 #include "rad_plugin.h"
+#include "engine_hostmem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <map>
 #include <regex>
 #include <thread>
+#include <sys/stat.h>
 #include <unordered_map>
 
 namespace rad {
@@ -265,7 +267,7 @@ const Suffix kSuffix[] = {
     { ".oft_diag", -2, 0, "an OFT rotation" },
     { ".oft_R.weight", -2, 0, "an OFT rotation" },
     { ".boft_R", -2, 0, "a BOFT rotation" },
-    { ".diff_b", -3, 0, "a bias delta" },
+    { ".diff_b", -4, 0, nullptr },
     { ".w_norm", -3, 0, "a norm's weight delta" },
     { ".b_norm", -3, 0, "a norm's bias delta" },
     { ".lora_B.bias", -3, 0, "a bias on lora_B" },
@@ -278,8 +280,30 @@ const Suffix kSuffix[] = {
 /* ================================================================== the file */
 int AdapterFile::open(const std::string& path, std::string* err) {
     mods_.clear();
+    biases_.clear();
     skipped_.clear();
     if (st_.open(path) != RAD_OK) return fail(err, RAD_E_IO, path + ": cannot open as safetensors");
+    return group_tensors(path, err);
+}
+
+int AdapterFile::open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err) {
+    mods_.clear();
+    biases_.clear();
+    skipped_.clear();
+    const int opened = st_.open_snapshot(path, max_bytes);
+    if (opened < 0)
+        return fail(err, opened, path + ": could not snapshot adapter: " + rad_strerror(opened));
+    const int grouped = group_tensors(path, err);
+    if (grouped < 0) {
+        mods_.clear();
+        biases_.clear();
+        skipped_.clear();
+        st_.close();
+    }
+    return grouped;
+}
+
+int AdapterFile::group_tensors(const std::string& path, std::string* err) {
     std::map<std::string, FileModule> by;
     std::map<std::string, const StTensor*> alphas;
     for (const StTensor& t : st_.tensors()) {
@@ -294,6 +318,7 @@ int AdapterFile::open(const std::string& path, std::string* err) {
         if (hit->kind == -2)
             return fail(err, RAD_E_UNSUPPORTED, fmt("%s: %s is %s; that kind of adapter is not "
                                                     "served", path.c_str(), t.name.c_str(), hit->why));
+        if (hit->kind == -4) { biases_.emplace(key, &t); continue; }
         if (hit->kind == -3) { skipped_.push_back({ t.name, hit->why }); continue; }
         if (hit->kind == -1) { alphas[key] = &t; continue; }
         FileModule& m = by[key];
@@ -331,16 +356,80 @@ int AdapterFile::open(const std::string& path, std::string* err) {
                                                missing));
         mods_.push_back(m);
     }
-    if (mods_.empty()) return fail(err, RAD_E_FORMAT, path + ": no adapter modules in the file");
+    if (mods_.empty() && biases_.empty()) return fail(err, RAD_E_FORMAT, path + ": no adapter modules in the file");
     return RAD_OK;
 }
 
 const char* AdapterFile::kind_name() const {
+    if (mods_.empty()) return "bias";
     int n[4] = { 0, 0, 0, 0 };
     for (const FileModule& m : mods_) ++n[m.kind];
     const int k = (int)(std::max_element(n, n + 4) - n);
     static const char* const kName[] = { "LoRA", "LoHa", "LoKr", "full" };
     return kName[k];
+}
+
+int AdapterSnapshots::acquire(const std::string& path, uint64_t budget, int64_t host_headroom,
+                              std::shared_ptr<const Source>* out, std::string* err,
+                              int64_t* pressure_bytes) {
+    if (pressure_bytes) *pressure_bytes = 0;
+    out->reset();
+    const std::lock_guard lock(mutex_);
+
+    /* The caller supplies a canonical local path. Include timestamps and inode in
+     * the key so atomic replacements leave existing request holds undisturbed. */
+    const auto revision = [](const struct stat& st) {
+#ifdef __APPLE__
+        const auto& modified = st.st_mtimespec;
+        const auto& changed = st.st_ctimespec;
+#else
+        const auto& modified = st.st_mtim;
+        const auto& changed = st.st_ctim;
+#endif
+        return fmt("%llu:%llu:%lld:%lld:%lld:%lld:%lld",
+                   (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+                   (long long)st.st_size, (long long)modified.tv_sec, (long long)modified.tv_nsec,
+                   (long long)changed.tv_sec, (long long)changed.tv_nsec);
+    };
+    struct stat before{};
+    if (::stat(path.c_str(), &before) != 0 || !S_ISREG(before.st_mode))
+        return fail(err, RAD_E_NOTFOUND, "adapter source is no longer a local file");
+    if (before.st_size < 8) return fail(err, RAD_E_FORMAT, "adapter source is incomplete");
+    const std::string key = revision(before);
+    for (auto it = sources_.begin(); it != sources_.end();) {
+        if (auto source = it->second.lock()) {
+            if (it->first == key) {
+                *out = std::move(source);
+                return RAD_OK;
+            }
+            ++it;
+        } else {
+            it = sources_.erase(it);
+        }
+    }
+
+    const auto bytes = static_cast<uint64_t>(before.st_size);
+    const uint64_t used = used_->load(std::memory_order_relaxed);
+    if (used > budget || bytes > budget - used)
+        return fail(err, RAD_E_FULL, "the queued adapter snapshot budget is full");
+    std::string why;
+    if (!lockable_room(before.st_size, 0, host_headroom, false, &why)) {
+        if (pressure_bytes) *pressure_bytes = before.st_size;
+        return fail(err, RAD_E_FULL, "host memory for a queued adapter snapshot: " + why);
+    }
+
+    auto source = std::make_shared<Source>();
+    used_->fetch_add(bytes, std::memory_order_relaxed);
+    source->charge_.used = used_;
+    source->charge_.bytes = bytes;
+    TRY(source->file.open_snapshot(path, bytes, err));
+    struct stat after{};
+    if (::stat(path.c_str(), &after) != 0 || key != revision(after))
+        return fail(err, RAD_E_STATE, "adapter source changed while being snapshotted");
+    source->revision = key;
+    sources_.emplace(key, source);
+    *out = std::move(source);
+    return RAD_OK;
 }
 
 /* ================================================================== deltas */
@@ -645,6 +734,8 @@ KeyMap::KeyMap(const Program& prog, const std::vector<Site>& sites) : prog_(&pro
             }
             adaptable_[src.module] = { rows, s.K_full > 0 ? s.K_full : -1 };
         }
+    for (const auto& [weight, replacement] : prog.lora_replacements)
+        if (replacement.row_mixer) adaptable_[replacement.module] = {1, replacement.rows};
     for (const LoraRoot& r : prog.lora_roots) {
         Root R;
         R.native = r.native;
@@ -767,6 +858,35 @@ struct Part {
 };
 
 }  /* namespace */
+
+int compose_biases(const KeyMap& km, const std::vector<Strength>& ads,
+                   std::map<std::string, std::vector<float>>* out, std::string* err) {
+    out->clear();
+    for (const auto& ad : ads) {
+        for (const auto& [key, t] : ad.file->biases()) {
+            std::string why;
+            const auto targets = km.resolve(key, &why);
+            if (targets.size() != 1 || targets[0].from_lo || targets[0].from_hi || targets[0].to_lo)
+                return fail(err, RAD_E_UNSUPPORTED, ad.name + ": unsupported bias target " + key);
+            const auto& name = targets[0].module;
+            const int64_t expected = km.rows(name);
+            if (!float_dtype(t->dtype) || t->shape.size() != 1 || t->shape[0] <= 0 ||
+                (expected > 0 && t->shape[0] != expected))
+                return fail(err, RAD_E_SHAPE, ad.name + ": invalid bias shape or dtype for " + key);
+            const int64_t rows = t->shape[0];
+            auto& delta = (*out)[name];
+            if (!delta.empty() && delta.size() != (size_t)rows)
+                return fail(err, RAD_E_SHAPE, ad.name + ": inconsistent bias shape for " + key);
+            delta.resize((size_t)rows);
+            for (int64_t i = 0; i < rows; ++i) {
+                delta[(size_t)i] += (float)(ad.weight * elem(*t, i));
+                if (!std::isfinite(delta[(size_t)i]))
+                    return fail(err, RAD_E_INVAL, ad.name + ": nonfinite bias for " + key);
+            }
+        }
+    }
+    return RAD_OK;
+}
 
 int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
             std::map<std::string, Composite>* out, ComposeReport* rep, std::string* err) {

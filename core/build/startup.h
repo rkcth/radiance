@@ -79,7 +79,8 @@ int rad_tools_load_plugins(const std::string& radiance_home,
                            const std::string& arch_id,
                            const std::string& quant,
                            LoadedPlugins* out,
-                           bool imported = false);
+                           bool imported = false, bool reuse_registry = false,
+                           const std::string& tune_machine = {});
 
 /* The architecture plugin's rad_arch_probe answers, given before declare. */
 /* `gen_max_pixels`, `gen_max_refs`: the probe's inputs (RadArchProbe), the deployment's

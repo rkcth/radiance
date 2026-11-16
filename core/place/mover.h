@@ -86,6 +86,16 @@ public:
         return (int)segs_.size() - 1;
     }
     int64_t seg_lo(int k) const { return segs_[(size_t)k].lo; }
+    bool can_remove_last_segment(int k) const {
+        return k > 0 && (size_t)k == segs_.size() - 1 &&
+               segs_.back().live == segs_.back().lo;
+    }
+    void remove_last_segment() {
+        n_ = segs_.back().lo;
+        segs_.pop_back();
+        held_.resize((size_t)n_);
+        rebuild();
+    }
 
     void add_free(int64_t slot) {
         if (slot < 0 || slot >= n_) return;
@@ -504,7 +514,7 @@ public:
      * The fleet is the third lender (docs/MULTIMODEL.md §6.7): VRAM no model of the fleet holds,
      * backed into a range the engine reserved for it and given back when the fleet needs it. */
 
-    enum Lender { kLendKV = 0, kLendArena = 1, kLendFleet = 2, kLenders = 3 };
+    enum Lender { kLendKV = 0, kLendArena = 1, kLendFleet = 2, kLendImage = 3, kLenders = 4 };
 
     /* The bytes one stretch must span for lend_from to cut a slot for every unit it would carve
      * one for (each movable unit in the pinned pool), with each slot's alignment and the empty
@@ -515,6 +525,10 @@ public:
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
      * loan covers a prefix of a large loan's slots and the deepest slot is given back first. */
     int     lend_from(int lender, const std::vector<LoanStrip>& strips);
+
+    /* The image owner can release its allocations after a full recall and this detach.
+     * The image segment must be the last lender registered in each class. */
+    int     detach_image_loan();
 
     /* How much a lender lends, in its own measure. A target, not a transaction: newly covered
      * slots can be filled at once, while uncovered ones empty as their units drop and their
@@ -559,6 +573,10 @@ public:
     /* The loan that covers every slot carved from this lender; more would sit empty. Zero when
      * nothing is carved. */
     int64_t loan_ceiling(int lender) const;
+
+    /* Bytes of movable pinned experts that could occupy a new loan. Read while
+     * dispatch is parked so the tiers and slot ownership cannot change. */
+    int64_t lendable_host_bytes() const;
 
     /* Fills free lent slots and empties slots the loan no longer covers: the half-swaps the heat
      * engine never proposes, since its decisions need a victim. Every free slot past the turnover
@@ -796,6 +814,7 @@ private:
     std::vector<ClassPools> pools_;
     std::vector<UnitState>  unit_;
     std::vector<Move>       moves_;
+    size_t base_move_records_ = 0;
     /* Per unit, how many records are Copying it, so unit_in_flight() needs no walk of the
      * records. The prefill stager asks about every pooled unit it stages, and the record count
      * grows with the move budget. */

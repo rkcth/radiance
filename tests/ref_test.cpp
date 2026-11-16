@@ -1290,7 +1290,7 @@ TEST(op_vocabulary) {
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa", "grid_embed_cpe", "grid_embed_pad", "window_order",
-        "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
+        "attn_paged", "attn_dense", "attn_dense_ref", "kv_store", "kv_store_streamed", "rope", "rope_table",
         "attn_paged_sink",
         "qk_norm_rope", "qsa_block_key",
         /* libr4d's row-form names, served by the base op's row. */
@@ -3518,6 +3518,28 @@ TEST(op_attn_dense) {
     CHECK_NEAR(o.at(1), w0 / sum, 1e-6);
     CHECK_NEAR(o.at(2), w0 / sum, 1e-6);
     CHECK_NEAR(o.at(3), 1.0f / sum, 1e-6);
+}
+
+TEST(op_attn_dense_ref_boost_and_registered_outfill) {
+    T q(RAD_F32, {3, 1, 1}); q.f({0, 0, 0});
+    T k(RAD_F32, {3, 1, 1}); k.f({0, 0, 0});
+    T v(RAD_F32, {3, 1, 1}); v.f({0, 6, 0});
+    T cu(RAD_I32, {2}); cu.n({0, 3});
+    T modes(RAD_I32, {4}); modes.n({0, 1, 2, 3});
+    T bias(RAD_F32, {1});
+    T out(RAD_F32, {3, 1, 1});
+    A a; a.t(q).t(k).t(v).t(cu).t(out).t(modes).t(bias)
+          .i("M", 3).i("head_dim", 1).i("gqa", 1).i("causal", 0).s("dtype", "f32");
+    bias.f({std::log(4.0f)});
+    CHECK_OK(run("attn_dense_ref", a));
+    CHECK_NEAR(out.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(1), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(2), 4.0f, 1e-6);
+    bias.f({-INFINITY});
+    CHECK_OK(run("attn_dense_ref", a));
+    CHECK_NEAR(out.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(1), 6.0f, 1e-6);
+    CHECK_NEAR(out.at(2), 2.0f, 1e-6);
 }
 
 /* The window is two-sided when the attention is: with window 2 a key one position away on either
@@ -10400,6 +10422,9 @@ std::vector<Geo> geometries() {
                                          .i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
+        /* One sequence with text, reference and target rows, split evenly by mode_cu. */
+        G("attn_dense_ref", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 0)
+                                    .s("dtype", "f32")),
         /* One-row segments, so M is also the segment count (n_seq, the description's hint for
          * cu_seqlens). The real grids are op_sam_attn_*'s. */
         G("sam_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("grid_h", 1)

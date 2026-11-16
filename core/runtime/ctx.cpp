@@ -59,6 +59,13 @@ int Ctx::init(const CtxDesc& d) {
     return RAD_OK;
 }
 
+int Ctx::drain_streams() {
+    if (stream_) RAD_TRY(rad_stream_sync(stream_));
+    if (lane1_) RAD_TRY(rad_stream_sync(lane1_));
+    if (xp_ && xp_->stream) RAD_TRY(rad_stream_sync(xp_->stream));
+    return RAD_OK;
+}
+
 void Ctx::shutdown() {
     oracle_close();
     xp_close();

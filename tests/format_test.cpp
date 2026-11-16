@@ -1971,6 +1971,30 @@ TEST(safetensors_decodes_the_escape_widths_either_side_of_it) {
     st.close();
 }
 
+TEST(safetensors_snapshot_keeps_tensor_bytes_after_source_rewrite) {
+    const std::string header =
+        "{\"t\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const uint64_t header_bytes = header.size();
+    const std::string prefix(reinterpret_cast<const char*>(&header_bytes), 8);
+    const std::string path = write_tmp("snapshot.safetensors", prefix + header + "abcd");
+    REQUIRE(!path.empty());
+    SafeTensorsFile snapshot;
+    CHECK_EQ(snapshot.open_snapshot(path, 8), RAD_E_FULL);
+    CHECK_EQ(snapshot.size_bytes(), 0u);
+    REQUIRE_EQ(snapshot.open_snapshot(path, 1024), RAD_OK);
+    REQUIRE(!write_tmp("snapshot.safetensors", prefix + header + "efgh").empty());
+    const auto* tensor = snapshot.find("t");
+    REQUIRE(tensor != nullptr);
+    CHECK_EQ(std::memcmp(tensor->data, "abcd", 4), 0);
+    SafeTensorsFile current;
+    REQUIRE_EQ(current.open(path), RAD_OK);
+    const auto* new_tensor = current.find("t");
+    REQUIRE(new_tensor != nullptr);
+    CHECK_EQ(std::memcmp(new_tensor->data, "efgh", 4), 0);
+    snapshot.close();
+    CHECK_EQ(snapshot.size_bytes(), 0u);
+}
+
 /* Readers walk a tensor by shape and dtype, so a shape that disagrees with its data_offsets span
  * is refused at open. st_write's data section is one f32. */
 TEST(safetensors_refuses_a_shape_that_is_not_its_span) {

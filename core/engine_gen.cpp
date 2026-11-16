@@ -7,9 +7,13 @@
  * building it. Issuing ahead would need a second staging region and a commit protocol.
  */
 #include "engine_priv.h"
+#include "service.h"
+#include "gen/driver.h"
 #include "gen/pass.h"
 
 #include <chrono>
+#include <cstdlib>
+#include <string_view>
 #include <thread>
 
 namespace rad {
@@ -43,8 +47,12 @@ int Engine::gen_loop() {
     if (rad_dev_set(ranks_[0]->device) < 0)
         RAD_ERR("generator loop: could not bind rank 0's device");
     int step = 0, idle = 0;
+    const char* timing = std::getenv("RADIANCE_IMAGE_PASS_TIMING");
+    const bool trace_image_passes = shared_ && img_gen_ && timing &&
+                                    std::string_view(timing) == "1";
     /* An error ends the driver's requests, then the loop. */
     auto stop = [&](int st) {
+        if (shared_) shared_->image_failure_.store(st, std::memory_order_release);
         gen_->shutdown("the engine stopped on an error and is not serving", st);
         return fail_loop(st);
     };
@@ -52,8 +60,28 @@ int Engine::gen_loop() {
         /* A round of the loop, idle or not: what lets a freed adapter slot cool (lora/slots.h). */
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         quiet_service();
+        std::unique_lock<std::mutex> dispatch;
+        if (shared_ && gen_) {
+            const bool pending = gen_->busy();
+            shared_->image_waiting_.store(pending, std::memory_order_release);
+            if (pending) {
+                dispatch = std::unique_lock<std::mutex>(shared_->dispatch_);
+                bool runnable = false;
+                if (const int st = shared_->enter_image(&runnable); st < 0) return stop(st);
+                if (!runnable) dispatch.unlock();
+            }
+            if (!dispatch.owns_lock()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;
+            }
+        }
+        const uint64_t pass_begin = trace_image_passes ? rad_mono_ns() : 0;
         const RadBatch* b = gen_->next(step);
         if (!b) {
+            if (dispatch.owns_lock()) {
+                if (const int st = shared_->leave_image(); st < 0) return stop(st);
+                dispatch.unlock();
+            }
             step_batch_.store(nullptr, std::memory_order_release);
             if (hold_req_.load(std::memory_order_acquire)) {
                 hold_point();
@@ -96,8 +124,19 @@ int Engine::gen_loop() {
             RAD_ERR("generator pass %d: the device failed: %s", step, rad_strerror(st));
             return stop(st);
         }
+        if (trace_image_passes) {
+            /* n_img is populated by the joint image/text denoiser layout. */
+            const int64_t joint_image_rows = b->gen == RAD_GEN_PASS_DENOISE && b->gen_b
+                                         ? b->gen_b->n_img : 0;
+            RAD_INFO("shared image pass: %s step=%d took %.3f ms (rows=%lld joint_image_rows=%lld entries=%lld)",
+                     pass_name(b->gen), step, double(rad_mono_ns() - pass_begin) / 1e6,
+                     (long long)b->n_tok, (long long)joint_image_rows, (long long)b->n_seq);
+        }
         dump_buffers(ranks_[0]->ctx, step, pass_name(b->gen));
         gen_->done();
+        if (dispatch.owns_lock()) {
+            if (const int st = shared_->leave_image(); st < 0) return stop(st);
+        }
         ++step;
     }
     return RAD_OK;

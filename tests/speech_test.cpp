@@ -15,10 +15,18 @@ namespace {
 
 struct Speech {
     FakeAudioGen gen;
+    struct AudioTokenizer : FakeTokenizer {
+        mutable int calls = 0;
+        std::vector<int32_t> encode(const std::string& text, bool add_special,
+                                    bool parse_special) const override {
+            ++calls;
+            return FakeTokenizer::encode(text, add_special, parse_special);
+        }
+    } audio_tok;
     std::unique_ptr<Fixture> f;
     Speech() {
         f.reset(new Fixture(Fixture::Tweak{ [this](ServerOptions& o, Deps& d) {
-            d.audio = &gen;
+            d.audio = { &gen, &audio_tok, {} };
             o.audio_model = true;
         } }));
     }
@@ -111,6 +119,61 @@ TEST(a_text_model_answers_the_speech_route_with_501) {
 
 /* ================================================================== the request */
 
+TEST(shared_speech_selects_the_model_and_transfers_its_turn_to_the_job) {
+    FakeAudioGen music;
+    music.inf.sample_rate = 44100;
+    FakeTokenizer tokenizer;
+    std::weak_ptr<void> turn;
+    int selections = 0;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
+        o.queue_audio = [&](const std::string& model, size_t bytes, size_t, size_t,
+                            const std::function<bool()>&, Deps::AudioEndpoint* audio,
+                            std::shared_ptr<void>* hold, std::string*) {
+            ++selections;
+            CHECK(bytes > 0);
+            if (model == "unavailable") return RAD_E_DEVICE;
+            if (model != "music") return RAD_E_NOTFOUND;
+            *audio = { &music, &tokenizer, {} };
+            *hold = std::make_shared<int>(0);
+            turn = *hold;
+            return RAD_OK;
+        };
+    }});
+    auto post = [&](json extra) { return f.post("/v1/audio/speech", Speech::body(extra).dump()); };
+
+    CHECK_EQ(post(json::object()).status, 400);
+    CHECK_EQ(selections, 0);
+    CHECK_EQ(post({{"model", "missing"}}).status, 404);
+    CHECK_EQ(post({{"model", "unavailable"}}).status, 503);
+    CHECK_EQ(f.srv->in_flight(), 0);
+    CHECK_EQ(post({{"model", "music"}, {"duration", -1}}).status, 400);
+    CHECK(turn.expired());
+    CHECK_EQ(f.srv->in_flight(), 0);
+
+    const auto result = post({{"model", "music"}});
+    REQUIRE_EQ(result.status, 200);
+    CHECK_EQ(header(result, "X-Audio-Sample-Rate"), "44100");
+    CHECK_EQ(music.prompt_of(0), "<s>pop|la la");
+    CHECK(!turn.expired());
+    CHECK_EQ(f.srv->in_flight(), 0);
+    music.got.clear(); // model turn is released when the driver retires the job
+    CHECK(turn.expired());
+
+    music.hold = true;
+    auto stream = post({{"model", "music"}, {"stream", true}});
+    REQUIRE_EQ(stream.status, 200);
+    REQUIRE(stream.on_close != nullptr);
+    CHECK_EQ(f.srv->in_flight(), 1);
+    CHECK(!turn.expired());
+    const auto ticket = music.ticket_of(0);
+    stream.on_close(false);
+    CHECK(ticket->cancel.load());
+    CHECK_EQ(f.srv->in_flight(), 0);
+    CHECK(!turn.expired());
+    music.got.clear();
+    CHECK(turn.expired());
+}
+
 /* The prompt is the template with each slot's text in it; the length is max_new_tokens frames, or
  * a duration rounded up to whole frames, or the model's longest; an absent or -1 seed is chosen
  * below 2^53 and read back in X-Seed. */
@@ -120,6 +183,7 @@ TEST(the_generator_gets_the_rendered_prompt_the_length_and_a_readable_seed) {
                                            { "num_inference_steps", 12 },
                                            { "guidance_scale", 2.5 } }));
     CHECK_EQ(r.status, 200);
+    CHECK(s.audio_tok.calls > 0);
     const std::string want = "<s>pop|la la";
     REQUIRE(s.last().tokens.size() == want.size());
     for (size_t i = 0; i < want.size(); ++i)
@@ -183,9 +247,9 @@ TEST(a_model_that_asks_has_its_input_read_with_special_tokens_and_one_branch_has
     s.gen.inf.default_steps = 0;
     s.gen.inf.input_special = true;
     s.gen.inf.branches = 1;
-    s.f->tok.last_parse_special = false;
+    s.audio_tok.last_parse_special = false;
     CHECK_EQ(s.post({ { "input", "hi" } }).status, 200);
-    CHECK(s.f->tok.last_parse_special);
+    CHECK(s.audio_tok.last_parse_special);
     CHECK_EQ(s.refused({ { "input", "hi" }, { "guidance_scale", 2.0 } }),
              std::string("guidance_scale"));
     CHECK_EQ(s.post({ { "input", "hi" }, { "guidance_scale", 1.0 } }).status, 200);
@@ -198,7 +262,7 @@ TEST(a_model_that_asks_has_its_input_read_with_special_tokens_and_one_branch_has
     m.gen.inf.tmpl_plain = "<s>{input}";
     m.gen.inf.default_steps = 0;
     CHECK_EQ(m.post({ { "input", "hi" } }).status, 200);
-    CHECK(!m.f->tok.last_parse_special);
+    CHECK(!m.audio_tok.last_parse_special);
 }
 
 /* A 16-bit mono WAV of the given samples at `rate`. */

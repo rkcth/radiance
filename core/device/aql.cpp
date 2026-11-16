@@ -785,6 +785,19 @@ void dump_queues(const char* where) {
  * server hangs. With a limit, the runtime writes a GPU core of every device mapping before
  * aborting, tens of GB for a served model. So the report is followed by fatal(): exit status 70,
  * no destructors (they would wait on that queue), no core; a supervisor restarts the server. */
+/* AQL-internal pinned allocations tracked by the fault reporter, but outside g_pinned. */
+constexpr int kBackendPinned = -2;
+uint64_t g_backend_pinned_bytes = 0;  /* protected by g_alloc_mu */
+uint64_t g_backend_pinned_peak = 0;
+
+bool trace_pinned_peak() {
+    static const bool trace = [] {
+        const char* value = std::getenv("RADIANCE_AQL_PINNED_PEAK");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return trace;
+}
+
 struct AllocRec {
     uintptr_t base = 0;
     int64_t   bytes = 0;
@@ -810,6 +823,7 @@ const char* mem_kind(int kind) {
         case RAD_MEM_HOST:        return "host";
         case RAD_MEM_HOST_PINNED: return "host-pinned";
         case RAD_MEM_HOST_MAPPED: return "host-mapped";
+        case kBackendPinned:      return "backend-pinned";
         default:                  return "backend";
     }
 }
@@ -818,6 +832,15 @@ void note_alloc(const void* p, int64_t bytes, int kind) {
     if (!p) return;
     std::lock_guard<std::mutex> lk(g_alloc_mu);
     g_live[(uintptr_t)p] = AllocRec{(uintptr_t)p, bytes, kind, ++g_alloc_seq, 0};
+    if (kind == kBackendPinned && trace_pinned_peak()) {
+        g_backend_pinned_bytes += (uint64_t)bytes;
+        if (g_backend_pinned_bytes > g_backend_pinned_peak) {
+            g_backend_pinned_peak = g_backend_pinned_bytes;
+            RAD_INFO("device: AQL internal pinned buffer peak: %llu requested bytes (%s)",
+                     (unsigned long long)g_backend_pinned_peak,
+                     humanb((int64_t)g_backend_pinned_peak).c_str());
+        }
+    }
 }
 
 void note_free(const void* p) {
@@ -826,6 +849,7 @@ void note_free(const void* p) {
     auto it = g_live.find((uintptr_t)p);
     if (it == g_live.end()) return;
     AllocRec r = it->second;
+    if (r.kind == kBackendPinned && trace_pinned_peak()) g_backend_pinned_bytes -= (uint64_t)r.bytes;
     g_live.erase(it);
     r.freed_ns = mono_ns();
     g_freed.push_back(r);
@@ -1614,6 +1638,24 @@ struct Pinned {
 std::mutex g_pinned_mu;
 std::map<uintptr_t, Pinned> g_pinned;
 
+void register_pinned(void* address, Pinned range) {
+    std::lock_guard<std::mutex> lk(g_pinned_mu);
+    g_pinned.emplace((uintptr_t)address, range);
+    if (!trace_pinned_peak()) return;
+
+    /* Count usable bytes of fully registered AQL ranges. The shared mapping of a
+     * range on several GPUs counts once. Padding and pin/unpin transients are excluded. A separate
+     * counter covers AQL-internal stream and tape buffers. */
+    uint64_t bytes = 0;
+    for (const auto& entry : g_pinned) bytes += (uint64_t)entry.second.len;
+    static uint64_t peak = 0;  /* protected by g_pinned_mu */
+    if (bytes > peak) {
+        peak = bytes;
+        RAD_INFO("device: AQL registered pinned host peak: %llu bytes (%s)",
+                 (unsigned long long)peak, humanb((int64_t)peak).c_str());
+    }
+}
+
 bool pinned_range(const void* p, uintptr_t* lo, int64_t* len) {
     const uintptr_t a = (uintptr_t)p;
     std::lock_guard<std::mutex> lk(g_pinned_mu);
@@ -1787,14 +1829,15 @@ int a_stream_create(RadStream* out, int high_priority) {
     void* bb = nullptr;
     if (hsa_amd_memory_pool_allocate(G().host_fine, kBounceBytes, 0, &bb) != HSA_STATUS_SUCCESS ||
         hsa_amd_agents_allow_access(1, &d.agent, nullptr, bb) != HSA_STATUS_SUCCESS) {
+        if (bb) hsa_amd_memory_pool_free(bb);  /* allocated, then refused access */
         hsa_amd_memory_pool_free(ka);
         hsa_queue_destroy(s->q);
         device_set_error("rad_stream_create: no pinned bounce buffer");
         return RAD_E_NOMEM;
     }
     s->bounce = static_cast<char*>(bb);
-    note_alloc(ka, (int64_t)(s->mask + 2) * kKargSlot, -1);
-    note_alloc(bb, kBounceBytes, -1);
+    note_alloc(ka, (int64_t)(s->mask + 2) * kKargSlot, d.host_kargs ? kBackendPinned : -1);
+    note_alloc(bb, kBounceBytes, kBackendPinned);
     uint32_t slot = kMaxQueues;
     {
         std::lock_guard<std::mutex> lk(g_queue_slot_mu);
@@ -2265,7 +2308,7 @@ RadTape a_tape_end(int keep) {
         std::memcpy(ka, t->karg_host.data(), t->karg_host.size());
         _mm_sfence();
         t->karg = static_cast<char*>(ka);
-        note_alloc(ka, (int64_t)t->karg_host.size(), -1);
+        note_alloc(ka, (int64_t)t->karg_host.size() + kKargSlot, d.host_kargs ? kBackendPinned : -1);
         for (TapeRec& r : t->rec)
             if (r.kind == kTapeDispatch) r.pkt.kernarg_address = t->karg + r.karg_off;
     }
@@ -4378,8 +4421,7 @@ void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards) {
         return nullptr;
     }
     char* const p = (char*)(((uintptr_t)q + (uintptr_t)align - 1) & ~((uintptr_t)align - 1));
-    std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, q});
+    register_pinned(p, Pinned{len, q});
     return p;
 }
 
@@ -4404,12 +4446,14 @@ bool lock_pieces(char* p, int64_t len, int64_t bytes, std::vector<hsa_agent_t>& 
             break;
         }
         if (on_card != p + off) {
-            ++done;
             device_set_error("%s(%s): piece %d of %d is mapped on the cards at %p, not "
                              "at its host address %p, so the pieces are not one range there, "
                              "although the kernel driver reports the SVM API that maps a lock in "
                              "place",
-                             who, humanb(bytes).c_str(), done, pieces, on_card, (void*)(p + off));
+                             who, humanb(bytes).c_str(), done + 1, pieces, on_card, (void*)(p + off));
+            /* The lock succeeded, but this piece cannot be used. Roll it back here and leave
+             * done counting the earlier, correctly mapped pieces for the common cleanup. */
+            (void)hsa_amd_memory_unlock(p + off);
             break;
         }
     }
@@ -4453,8 +4497,7 @@ void* pin_pieces(int64_t bytes) {
         ::munmap(p, (size_t)len);
         return nullptr;
     }
-    std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    register_pinned(p, Pinned{len, nullptr});
     return p;
 }
 
@@ -4507,8 +4550,7 @@ void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
         ::munmap(p, (size_t)len);
         return nullptr;
     }
-    std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    register_pinned(p, Pinned{len, nullptr});
     return p;
 }
 
