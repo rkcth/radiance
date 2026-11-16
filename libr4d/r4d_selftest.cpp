@@ -70,6 +70,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -10661,6 +10662,67 @@ void umt5_attention_cases(const Plugin& pl) {
         if (rc != RAD_OK) { ok(name.c_str(), false, "rc " + std::to_string(rc)); continue; }
         const int64_t bad = differ(down_bf16(dst, want.size()), want);
         ok(name.c_str(), bad == 0, fmt("%lld values differ", (long long)bad));
+    }
+}
+
+void wan_rotary_cases(const Plugin& pl) {
+    const auto* table = find(pl, "wan_rope_table_f32");
+    const auto* rotate = find(pl, "wan_rope_bf16");
+    if (!table || !rotate) { ok("Wan rotary", false, "row absent"); return; }
+    constexpr int64_t rows = 12, width = 128, pitch = 131;
+    auto pitched = [&](void* ptr, uint32_t dtype) {
+        RadTensor t = T(ptr, dtype, {rows, width});
+        t.stride[0] = pitch;
+        return t;
+    };
+    std::vector<float> pad(rows * pitch, 21.0f);
+    void* dc = up_f32(pad);
+    const auto coeff = pitched(dc, RAD_F32);
+    const int prep = launch(table, {T(up_i32({2, 4, 6}), RAD_I32, {3}), coeff},
+                            {PI("M", rows), PS("dtype", "f32")});
+    if (prep != RAD_OK) { ok("Wan rotary table", false, fmt("rc %d", prep)); return; }
+    const auto cs = down_f32(dc, pad.size());
+    constexpr int64_t row = 11 * pitch;
+    ok("Wan rotary table uses 22/21/21 pairs on time/height/width",
+       cs[row] == static_cast<float>(std::cos(1.0)) &&
+       cs[row + 44] == static_cast<float>(std::cos(1.0)) &&
+       cs[row + 86] == static_cast<float>(std::cos(2.0)) && cs[row + width] == 21.0f);
+
+    std::vector<float> q(pad), k(pad);
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < width; c += 2) {
+            q[r * pitch + c] = 1.0f; q[r * pitch + c + 1] = 0.0f;
+            k[r * pitch + c] = 0.0f; k[r * pitch + c + 1] = 1.0f;
+        }
+    void* dq = up_bf16(q);
+    void* dk = up_bf16(k);
+    const int used = launch(rotate, {pitched(dq, RAD_BF16), pitched(dk, RAD_BF16), coeff},
+                            {PI("M", rows), PI("heads", 1), PS("dtype", "bf16")});
+    if (used != RAD_OK) { ok("Wan apply rotary", false, fmt("rc %d", used)); return; }
+    q = down_bf16(dq, q.size());
+    k = down_bf16(dk, k.size());
+    ok("Wan rotary turns adjacent BF16 pairs and preserves pitched tails",
+       q[0] == 1.0f && q[1] == 0.0f && q[row + 44] == .5390625f && q[row + 45] == .83984375f &&
+       k[row + 86] == -.91015625f && k[row + 87] == -.416015625f &&
+       q[row + width] == 21.0f && k[row + width] == 21.0f);
+}
+
+void wan_unpatch_cases(const Plugin& pl) {
+    const auto* r = find(pl, "wan_unpatch");
+    if (!r) { ok("wan_unpatch", false, "row absent"); return; }
+    std::vector<float> x(4 * 8);
+    std::iota(x.begin(), x.end(), 0.0f);
+    const std::vector<float> wanted = {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+                                      16, 17, 18, 19, 24, 25, 26, 27, 20, 21, 22, 23, 28, 29, 30, 31};
+    void* dst = dalloc(wanted.size() * sizeof(float));
+    const auto dims = T(up_i32({2, 2, 4}), RAD_I32, {3});
+    for (bool bf16 : {true, false}) {
+        auto src = bf16 ? T(up_bf16(x), RAD_BF16, {4, 8}) : T(up_f32(x), RAD_F32, {4, 8});
+        const int rc = launch(r, {src, dims, T(dst, RAD_F32, {16, 2})},
+                              {PI("M", 4), PI("n", 2), PS("dtype", bf16 ? "bf16" : "f32")});
+        const std::string name = fmt("wan_unpatch %s source, two frames", bf16 ? "bf16" : "f32");
+        ok(name.c_str(), rc == RAD_OK && differ(down_f32(dst, wanted.size()), wanted) == 0,
+           fmt("rc %d", rc));
     }
 }
 
@@ -32927,6 +32989,8 @@ static void device_phase(const Plugin& pl) {
     if (sel("flow_unipc_step_f32")) vid::flow_unipc_cases(pl);
     if (sel("attn_umt5_bf16")) vid::umt5_attention_cases(pl);
     if (sel("grid_pos3")) vid::grid_pos3_cases(pl);
+    if (sel("wan_rope_table_f32") || sel("wan_rope_bf16")) vid::wan_rotary_cases(pl);
+    if (sel("wan_unpatch")) vid::wan_unpatch_cases(pl);
     if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
     /* A video latent upscaler's ops, at its source and target sizes. */
     if (sel("conv3d_ndhwc_bf16")) ups::conv3d_cases(pl);

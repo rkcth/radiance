@@ -1,5 +1,6 @@
 #include "arch_fakes.h"
 #include "../arch/wan/wan_conditioning.h"
+#include "../arch/wan/wan_dit_io.h"
 #include "../arch/wan/wan_time.h"
 
 TEST(wan_umt5_declares_each_checkpoint_tensor_and_runs_packed_conditioning) {
@@ -191,6 +192,52 @@ TEST(wan_time_conditioning_uses_zero_only_for_the_reference_frame) {
         CHECK_EQ(run.issues.back().opd.back().rows, 1 + image);
         CHECK_LINT(builder, &run);
     }
+}
+
+TEST(wan_denoiser_io_uses_latent_geometry_and_preserves_weight_shape) {
+    using namespace rad::arch;
+    RadBuilder builder{};
+    Names names("wan");
+    const rad_buf latent = decl_b(&builder, "latent", RAD_F32, {64, 48}, RAD_BUF_PERSIST);
+    const rad_buf head = decl_b(&builder, "head", RAD_F32, {16, 192}, RAD_BUF_PERSIST);
+    const rad_buf velocity = decl_b(&builder, "velocity", RAD_F32, {64, 48}, RAD_BUF_PERSIST);
+    wan::DitPatchIO io;
+    REQUIRE_EQ(io.declare_input(&builder, names, latent, 16), RAD_OK);
+    REQUIRE_EQ(io.declare_output(&builder, head, velocity, RAD_F32), RAD_OK);
+    const auto* weight = find_w(builder, "wan.dit.patch_embedding.weight");
+    REQUIRE(weight);
+    CHECK_EQ(weight->d.rank, 5u);
+    CHECK_EQ(weight->d.shape[1], 48);
+    CHECK_EQ(weight->d.shape[2], 1);
+    CHECK_EQ(weight->d.shape[3], 2);
+    CHECK_EQ(weight->d.shape[4], 2);
+    CHECK_EQ(pint(find_op(builder, "gemm_nt_bias"), "K"), 192);
+
+    int32_t dims[RAD_VGEOM_N]{};
+    dims[RAD_VGEOM_LAT_FRAMES] = 2;
+    dims[RAD_VGEOM_LAT_H] = 4;
+    dims[RAD_VGEOM_LAT_W] = 6;
+    RadVideoGenBatch video{};
+    video.geom.lat_frames = 2;
+    video.geom.lat_h = 4;
+    video.geom.lat_w = 6;
+    video.geom_d = dims;
+    RadCtx run{};
+    run.b = &builder;
+    const int64_t rows = io.step_input(&run, video, RAD_B(latent));
+    REQUIRE_EQ(rows, 12);
+    io.step_output(&run, video, rows, RAD_B(head), RAD_B(velocity));
+    REQUIRE(run.step_fail.empty());
+    REQUIRE_EQ(run.issues.size(), 4u);
+    CHECK_EQ(run.issues[0].opd.at(0).rows, 48);
+    CHECK_EQ(run.issues[1].opd.back().handle, io.hidden);
+    CHECK_EQ(run.issues[2].opd.back().handle, io.rotary);
+    CHECK_EQ(run.issues[3].opd.at(0).rows, 12);
+    CHECK_EQ(run.issues[3].opd.back().rows, 48);
+    for (const auto& issue : run.issues)
+        for (const auto& operand : issue.opd)
+            if (operand.kind == RAD_OPK_RAW) CHECK(operand.raw == dims + RAD_VGEOM_LAT_FRAMES);
+    CHECK_LINT(builder, &run);
 }
 
 RAD_TEST_MAIN()

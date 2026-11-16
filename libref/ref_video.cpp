@@ -13,6 +13,7 @@
 #include "ref_common.h"
 #include "ref_ops.h"
 #include "rad_philox.h"
+#include "rad_wan_dit.h"
 
 #include <algorithm>
 #include <vector>
@@ -153,6 +154,79 @@ int ref_patch_fold(const RadArgs* a, RadStream) {
                     ldt(x, xb + c * xs) * mul[(size_t)c] + add[(size_t)c]);
         }
     }
+    return RAD_OK;
+}
+
+int ref_wan_rope_table(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *grid = &a->t[0], *table = &a->t[1];
+    RAD_REF_TRY(check_grid(grid));
+    const auto* dims = static_cast<const int32_t*>(grid->data);
+    int64_t height, width, rows;
+    if (!latent_grid(dims, height, width, rows)) return RAD_E_SHAPE;
+    RAD_REF_TRY(check_matrix(table, RAD_F32, rows, head_width));
+    auto* out = static_cast<float*>(table->data);
+    double inv[pairs];
+    for (int pair = 0; pair < pairs; ++pair) {
+        const int axis = pair_axis(pair);
+        const int count = axis == 0 ? time_pairs : spatial_pairs;
+        inv[pair] = 1.0 / std::pow(10000.0, (double)pair_in_axis(pair, axis) / count);
+    }
+    REF_PAR_FOR(rows * head_width)
+    for (int64_t row = 0; row < rows; ++row)
+        for (int pair = 0; pair < pairs; ++pair) {
+            const double angle = coordinate(row, pair_axis(pair), height, width) * inv[pair];
+            float* dst = out + row * table->stride[0] + 2 * pair;
+            dst[0] = static_cast<float>(std::cos(angle));
+            dst[1] = static_cast<float>(std::sin(angle));
+        }
+    return RAD_OK;
+}
+
+int ref_wan_rope(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *table = &a->t[2];
+    const int64_t rows = q->shape[0], heads = p_int(a, "heads", 0);
+    if (heads < 1 || heads > 128) return RAD_E_SHAPE;
+    RAD_REF_TRY(check_matrix(q, RAD_BF16, rows, heads * head_width));
+    RAD_REF_TRY(check_matrix(k, RAD_BF16, rows, heads * head_width));
+    RAD_REF_TRY(check_matrix(table, RAD_F32, rows, head_width));
+    REF_PAR_FOR(rows * heads * head_width)
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto* cs = static_cast<const float*>(table->data) + row * table->stride[0];
+        for (const RadTensor* x : {q, k})
+            for (int64_t h = 0; h < heads; ++h)
+                for (int i = 0; i < head_width; i += 2) {
+                    const int64_t off = row * x->stride[0] + h * head_width + i;
+                    const float re = ldt(x, off), im = ldt(x, off + 1);
+                    stt(x, off, re * cs[i] - im * cs[i + 1]);
+                    stt(x, off + 1, im * cs[i] + re * cs[i + 1]);
+                }
+    }
+    return RAD_OK;
+}
+
+int ref_wan_unpatch(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *src = &a->t[0], *grid = &a->t[1], *dst = &a->t[2];
+    const int64_t channels = p_int(a, "n", 0);
+    RAD_REF_TRY(check_grid(grid));
+    if (channels < 1 || channels > 1024) return RAD_E_SHAPE;
+    const auto* dims = static_cast<const int32_t*>(grid->data);
+    int64_t height, width, rows;
+    if (!latent_grid(dims, height, width, rows)) return RAD_E_SHAPE;
+    if (src->dtype != RAD_F32 && src->dtype != RAD_BF16) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(src, src->dtype, rows, 4 * channels));
+    RAD_REF_TRY(check_matrix(dst, RAD_F32, 4 * rows, channels));
+    auto* out = static_cast<float*>(dst->data);
+    REF_PAR_FOR(4 * rows * channels)
+    for (int64_t row = 0; row < 4 * rows; ++row)
+        for (int64_t c = 0; c < channels; ++c)
+            out[row * dst->stride[0] + c] =
+                ldt(src, unpack_offset(row, c, height, width, channels, src->stride[0]));
     return RAD_OK;
 }
 

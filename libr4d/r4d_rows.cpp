@@ -3020,6 +3020,17 @@ static const RadOperandSpec oVtileJoin[] = {
 static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
                                           P_INT("period"), P_F64("scale") };
 static const RadOperandSpec oGridPos3[] = { { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pWanTable[] = { P_INT("M"), P_STR("dtype") };
+static const RadParamSpec pWanRope[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oWanTable[] = {
+    { "geom", RAD_OPD_IN, 0 }, { "table", RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oWanRope[] = {
+    { "q", RAD_OPD_INOUT, 0 }, { "k", RAD_OPD_INOUT, 0 }, { "table", RAD_OPD_IN, 0 },
+};
+static const RadOperandSpec oWanUnpatch[] = {
+    { "patches", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "velocity", RAD_OPD_OUT, 0 },
+};
 
 /* ---- a video latent upscaler (r4d_upscaler.hip); the same specs as libref's. `geom` is the
  * request's volume, i32 on the device; patch_fold takes patch_unfold's specs. */
@@ -4172,6 +4183,9 @@ static const RadOpSchema kSchemas[] = {
            "the tile to the left, both RAW, the products and sums rounding to x's dtype."),
     SCHEMA("grid_pos3", pGridPos3, oGridPos3,
            "a video decoder's rotary positions over tiles of `period` rows, f32 [3, M]."),
+    SCHEMA("wan_rope_table", pWanTable, oWanTable, "Wan's three-axis rotary coefficients."),
+    SCHEMA("wan_rope", pWanRope, oWanRope, "Apply Wan rotary coefficients to BF16 queries and keys."),
+    SCHEMA("wan_unpatch", pGenMn, oWanUnpatch, "Expand Wan head patches into F32 NDHWC velocity rows."),
     SCHEMA("conv3d_ndhwc", pConv3d, oConv3d,
            "a 3D convolution over NDHWC voxel rows of the device volume geom = (T, H, W), "
            "PyTorch's [cout, cin, kt, k, k] weight, f32 accumulation; default stride 1 with "
@@ -10704,6 +10718,21 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   nullptr, 0, NOTUNE,
   nullptr, nullptr, r4d_rad_grid_pos3 },
+
+{ "wan_rope_table_f32", "wan_rope_table", "elem",
+  "Wan rotary coefficients", "[3] grid geometry and [M, 128] coefficients", "i32 and f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_wan_rope_table },
+
+{ "wan_rope_bf16", "wan_rope", "elem",
+  "Wan rotary on queries and keys", "128-wide heads, pitched rows", "bf16 Q/K, f32 coefficients",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_wan_rope },
+
+{ "wan_unpatch", "wan_unpatch", "elem",
+  "Wan patch velocity to voxel velocity", "1 x 2 x 2 patches, pitched rows", "bf16 or f32 to f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_wan_unpatch },
 
 { "snake_aa_f32", "snake_aa", "elem",
   "the alias-free SnakeBeta: a thread an output, its activations recomputed per output",

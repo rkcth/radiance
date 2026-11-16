@@ -2,6 +2,8 @@
  * (1, 2, 2); the video VAE's stride is independent of this one. */
 #pragma once
 
+#include "rad_wan_dit.h"
+
 #include <cstdint>
 
 namespace wan {
@@ -20,9 +22,9 @@ inline bool patch_grid(int64_t latent_frames, int64_t latent_height,
         return false;
     const int64_t height = latent_height / 2;
     const int64_t width = latent_width / 2;
-    // RoPE has 1024 positions on each of the three axes.
-    if (latent_frames > 1024 || height > 1024 || width > 1024) return false;
-    grid = { latent_frames, height, width, latent_frames * height * width };
+    int64_t rows = 0;
+    if (!rad_wan_dit::grid_rows(latent_frames, height, width, rows)) return false;
+    grid = { latent_frames, height, width, rows };
     return true;
 }
 

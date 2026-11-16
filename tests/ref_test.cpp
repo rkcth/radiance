@@ -1332,7 +1332,7 @@ TEST(op_vocabulary) {
          * activation. */
         "rms_mod", "flow_x0_step", "flow_res_multistep", "flow_unipc_step", "patch_unfold",
         "vtile_gather",
-        "vtile_stitch", "grid_pos3", "snake_aa",
+        "vtile_stitch", "grid_pos3", "wan_rope_table", "wan_rope", "wan_unpatch", "snake_aa",
         /* Its step-distilled form's video sparse attention: the tile selection and the
          * block-sparse attention over it. */
         "vsa_select", "attn_vsa",
@@ -7693,6 +7693,45 @@ TEST(vtile_stitch_blends_down_then_across_and_carries_the_overlap) {
     CHECK(s2.prev.mem == before);
 }
 
+TEST(wan_rotary_resets_the_frequency_ladder_on_each_axis) {
+    T geom(RAD_I32, {3}); geom.n({2, 4, 6});
+    T table(RAD_F32, {12, 128});
+    A make; make.t(geom).t(table).i("M", 12).s("dtype", "f32");
+    CHECK_OK(run("wan_rope_table", make));
+    // Row 11 is patch (1, 1, 2). Pair zero of each axis has frequency 1.
+    CHECK_EQ(table.at(11 * 128), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 44), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 86), static_cast<float>(std::cos(2.0)));
+    CHECK_NEAR(table.at(11 * 128 + 2), std::cos(std::pow(10000.0, -1.0 / 22.0)), 1e-7);
+    CHECK_NEAR(table.at(11 * 128 + 46), std::cos(std::pow(10000.0, -1.0 / 21.0)), 1e-7);
+
+    std::vector<float> qv(12 * 128), kv(qv);
+    for (size_t i = 0; i < qv.size(); i += 2) { qv[i] = 1.0f; kv[i + 1] = 1.0f; }
+    T q(RAD_BF16, {12, 128}); q.f(qv);
+    T k(RAD_BF16, {12, 128}); k.f(kv);
+    A rotate; rotate.t(q).t(k).t(table).i("M", 12).i("heads", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_rope", rotate));
+    CHECK_EQ(q.at(0), 1.0f); CHECK_EQ(q.at(1), 0.0f);
+    CHECK_EQ(q.at(11 * 128 + 44), .5390625f);
+    CHECK_EQ(q.at(11 * 128 + 45), .83984375f);
+    CHECK_EQ(k.at(11 * 128 + 86), -.91015625f);
+    CHECK_EQ(k.at(11 * 128 + 87), -.416015625f);
+}
+
+TEST(wan_unpatch_preserves_spatial_order_and_emits_float_velocity) {
+    T geom(RAD_I32, {3}); geom.n({2, 2, 4});
+    T x(RAD_BF16, {4, 8}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                               16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31});
+    T y(RAD_F32, {16, 2});
+    A a; a.t(x).t(geom).t(y).i("M", 4).i("n", 2).s("dtype", "bf16");
+    CHECK_OK(run("wan_unpatch", a));
+    const float expected[] = {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+                              16, 17, 18, 19, 24, 25, 26, 27, 20, 21, 22, 23, 28, 29, 30, 31};
+    for (int i = 0; i < 32; ++i) CHECK_EQ(y.at(i), expected[i]);
+    geom.n({2, 3, 4});
+    CHECK_EQ(run("wan_unpatch", a), RAD_E_SHAPE);
+}
+
 /* grid_pos3: token (t, i, j) of each `period`-row tile at scale (2 (c + 0.5) / n - 1) per axis, in
  * f32 steps, the period's last rows (registers) at 0. Tiles of 2 x 3 x 4 every 26 rows, scale 2,
  * into a [3, 30] view of a [3, 32] plane: rows 30 and 31 of each component are not written.
@@ -10755,6 +10794,9 @@ std::vector<Geo> geometries() {
                                     .s("std", "0.229 0.224 0.225")),
         G("grid_pos3", "M", 40, a.i("M", R).i("T", 2).i("H", 3).i("W", 4).i("period", 27)
                                 .d("scale", 1.0)),
+        G("wan_rope_table", "M", 16, a.i("M", R).s("dtype", "f32")),
+        G("wan_rope", "M", 8, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
+        G("wan_unpatch", "M", 16, a.i("M", R).i("n", 2).s("dtype", "bf16")),
         G("snake_aa", "M", 8, a.i("M", R).i("n", 8).i("ratio", 2).i("k", 12).s("dtype", "f32")),
         /* A 3 x 3 x 3 grid in boxes of 2 and two dense segments of its 27 rows; attn_vsa at
          * k = 1, the one selection its description draws. */

@@ -991,6 +991,11 @@ static const RadOperandSpec oVtileJoin[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
                                           P_INT("period"), P_F64("scale") };
 static const RadOperandSpec oGridPos3[] = { OUT("y") };
+static const RadParamSpec pWanTable[] = { P_INT("M"), P_STR("dtype") };
+static const RadParamSpec pWanRope[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oWanTable[] = { OPD("geom"), OUT("table") };
+static const RadOperandSpec oWanRope[] = { INOUT("q"), INOUT("k"), OPD("table") };
+static const RadOperandSpec oWanUnpatch[] = { OPD("patches"), OPD("geom"), OUT("velocity") };
 /* ---- video sparse attention (ref_vsa.cpp). `segs` cuts the rows into dense segments and the
  * video grid, last; `geom` is the request's RadVideoGeom on the device (RAD_VGEOM_*). The two ops
  * share their parameters: attn_vsa recomputes k from `sparsity`. `v` of vsa_select is read for
@@ -2050,6 +2055,9 @@ static const RadOpSchema kSchemas[] = {
   "a video decoder's rotary positions over tiles of `period` rows: token (t, i, j) of a tile's "
   "T x H x W gets f32(scale) * (2 (c + 0.5) / n - 1) on each axis, in f32 as torch makes it, "
   "the rest of the period 0; y f32 [3, >= M] component-major at its own row pitch." },
+{ "wan_rope_table", ARR(pWanTable), ARR(oWanTable), "Wan's three-axis rotary coefficients." },
+{ "wan_rope", ARR(pWanRope), ARR(oWanRope), "Apply Wan rotary coefficients to BF16 queries and keys." },
+{ "wan_unpatch", ARR(pMnD), ARR(oWanUnpatch), "Expand Wan head patches into F32 NDHWC velocity rows." },
 { "vsa_select", ARR(pVsa), ARR(oVsaSelect),
   "video sparse attention's tile selection. Tiles: each dense segment of `segs` in chunks of "
   "tile_t tile_h tile_w rows (P prefix tiles), then tile_t x tile_h x tile_w boxes over the "
@@ -2824,6 +2832,9 @@ SIMPLE("ref_vtile_join", "vtile_join", "elem",
        "per-tile encoder moments blended into the latent canvas", DT_FLOAT, ref_vtile_join),
 SIMPLE("ref_grid_pos3", "grid_pos3", "elem", "a video decoder's rotary positions over its tiles",
        DT_FLOAT, ref_grid_pos3),
+SIMPLE("ref_wan_rope_table", "wan_rope_table", "elem", "Wan rotary coefficients", "f32", ref_wan_rope_table),
+SIMPLE("ref_wan_rope", "wan_rope", "elem", "Wan rotary on queries and keys", "bf16/f32", ref_wan_rope),
+SIMPLE("ref_wan_unpatch", "wan_unpatch", "elem", "Wan patch velocity to voxel velocity", "bf16/f32", ref_wan_unpatch),
 SIMPLE("ref_vsa_select", "vsa_select", "attn",
        "video sparse attention's top-k tiles by pooled score, and the coarse branch",
        "float q, k, v and coarse; i32 segs, geom and sel", ref_vsa_select),

@@ -87,6 +87,22 @@ modulation had maximum absolute differences of `9.54e-7` and `3.34e-6`
 against the pinned PyTorch reference. The DiT still needs to consume the
 projected prompt and timestep buffers in a video pass.
 
+The denoiser now packs the F32 latent into BF16 patch rows and uses the
+checkpoint's Conv3d weights in a biased GEMM. With the real weights on one
+R9700, the projection had relative RMSE `2.59e-5` against PyTorch BF16 Conv3d.
+The head output uses a different column order and is unpacked as F32
+voxel velocity. The CPU and device fixtures cover that order across frames.
+
+The rotary table splits 128-wide heads into 22 time pairs and 21 pairs
+each for height and width. It uses FP64 angles and trigonometry, with
+FP32 storage and rotation in the BF16 profile. The pinned reference
+instead keeps FP64 through the rotation and narrows to FP32 and then BF16
+at its attention boundary. A dense 24-head comparison used four grids,
+including coordinate 1023 on each axis. The R9700 matched 18,947,937 of
+18,948,096 BF16 outputs exactly, with maximum absolute error `0.0078125`.
+The next DiT step is to wire these paths into the self-attention,
+cross-attention, and residual blocks.
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,

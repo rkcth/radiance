@@ -337,6 +337,9 @@ int     r4d_rad_vtile_plan            (const RadArgs*, RadStream);
 int     r4d_rad_vtile_crop            (const RadArgs*, RadStream);
 int     r4d_rad_vtile_join            (const RadArgs*, RadStream);
 int     r4d_rad_grid_pos3             (const RadArgs*, RadStream);
+int     r4d_rad_wan_rope_table         (const RadArgs*, RadStream);
+int     r4d_rad_wan_rope               (const RadArgs*, RadStream);
+int     r4d_rad_wan_unpatch            (const RadArgs*, RadStream);
 int     r4d_rad_snake_aa              (const RadArgs*, RadStream);
 /* r4d_upscaler.hip: a video latent upscaler's 3D convolution, group norm, temporal depthwise
  * convolution and resize, the patch fold and the re-noise. */

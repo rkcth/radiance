@@ -18,6 +18,7 @@
 #include "r4d_gdn_wmma.h"
 #include "r4d_q8.h"
 #include "rad_unipc_math.h"
+#include "rad_wan_dit.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -644,9 +645,127 @@ int parse_f32_list(const char* s, float* out, int max) {
     return n;
 }
 
+__global__ void wan_rope_table(const int32_t* dims, float* table, int64_t rows, int64_t table_ld) {
+    using namespace rad_wan_dit;
+    int64_t height, width, actual_rows;
+    if (!latent_grid(dims, height, width, actual_rows) || actual_rows != rows) return;
+    const int64_t row = blockIdx.x;
+    const int pair = threadIdx.x;
+    const int axis = pair_axis(pair), count = axis == 0 ? time_pairs : spatial_pairs;
+    const double inverse = 1.0 / pow(10000.0, (double)pair_in_axis(pair, axis) / count);
+    const double angle = coordinate(row, axis, height, width) * inverse;
+    float* dst = table + row * table_ld + 2 * pair;
+    dst[0] = static_cast<float>(cos(angle));
+    dst[1] = static_cast<float>(sin(angle));
+}
+
+__device__ __forceinline__ void wan_turn(uint16_t* x, float co, float si) {
+    const float re = bf2f(x[0]), im = bf2f(x[1]);
+    x[0] = f32_to_bf16(re * co - im * si);
+    x[1] = f32_to_bf16(im * co + re * si);
+}
+
+__global__ __launch_bounds__(kT) void wan_rope(
+    uint16_t* q, uint16_t* k, const float* table, int64_t total, int row_width,
+    int64_t q_ld, int64_t k_ld, int64_t table_ld) {
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / (row_width / 2);
+        const int col = 2 * static_cast<int>(i % (row_width / 2));
+        const float* cs = table + row * table_ld + col % rad_wan_dit::head_width;
+        wan_turn(q + row * q_ld + col, cs[0], cs[1]);
+        wan_turn(k + row * k_ld + col, cs[0], cs[1]);
+    }
+}
+
+template<typename Src>
+__global__ __launch_bounds__(kT) void wan_unpatch(
+    const Src* src, const int* geom, float* dst, int64_t patch_rows, int channels,
+    int64_t src_ld, int64_t dst_ld) {
+    int64_t height, width, rows;
+    if (!rad_wan_dit::latent_grid(geom, height, width, rows) || rows != patch_rows) return;
+    const int64_t total = 4 * rows * channels;
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / channels, channel = i % channels;
+        const int64_t at = rad_wan_dit::unpack_offset(row, channel, height, width, channels, src_ld);
+        dst[row * dst_ld + channel] = ldv(src, at);
+    }
+}
+
+unsigned wan_blocks(int64_t total) {
+    const int64_t blocks = (total + kT - 1) / kT;
+    return static_cast<unsigned>(blocks > 65535 ? 65535 : blocks);
+}
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry points
+
+extern "C" int r4d_rad_wan_rope_table(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *geom = r4d_opt(a, 0), *out = r4d_opt(a, 1);
+    if (!geom || !out) return R4D_NO(RAD_E_INVAL);
+    const int64_t rows = out->shape[0];
+    if (rows > INT32_MAX) return R4D_NO(RAD_E_SHAPE);
+    int rc = check_grid(geom);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(out, RAD_F32, rows, head_width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    hipLaunchKernelGGL(wan_rope_table, dim3(static_cast<unsigned>(rows)), dim3(pairs), 0,
+                       (hipStream_t)s, static_cast<const int32_t*>(geom->data),
+                       static_cast<float*>(out->data), rows, out->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_rope(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *q = r4d_opt(a, 0), *k = r4d_opt(a, 1), *table = r4d_opt(a, 2);
+    if (!q || !k || !table) return R4D_NO(RAD_E_INVAL);
+    const int64_t rows = q->shape[0], heads = r4d_geti_or(a, "heads", 0);
+    if (heads < 1 || heads > 128 || rows > INT32_MAX) return R4D_NO(RAD_E_SHAPE);
+    const int width = static_cast<int>(heads * head_width);
+    int rc = check_matrix(q, RAD_BF16, rows, width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(k, RAD_BF16, rows, width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(table, RAD_F32, rows, head_width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const int64_t total = rows * (width / 2);
+    hipLaunchKernelGGL(wan_rope, dim3(wan_blocks(total)), dim3(kT), 0, (hipStream_t)s,
+                       static_cast<uint16_t*>(q->data), static_cast<uint16_t*>(k->data),
+                       static_cast<const float*>(table->data), total, width, q->stride[0], k->stride[0],
+                       table->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_unpatch(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *src = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *out = r4d_opt(a, 2);
+    if (!src || !geom || !out) return R4D_NO(RAD_E_INVAL);
+    const int64_t channels = r4d_geti_or(a, "n", 0), rows = src->shape[0];
+    if (src->dtype != RAD_F32 && src->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (channels < 1 || channels > 1024 ||
+        rows < 1 || rows > (int64_t)max_axis * max_axis * max_axis) return R4D_NO(RAD_E_SHAPE);
+    int rc = check_grid(geom);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(src, src->dtype, rows, 4 * channels);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(out, RAD_F32, 4 * rows, channels);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const dim3 grid(wan_blocks(4 * rows * channels));
+    const auto* dims = static_cast<const int*>(geom->data);
+    auto* dst = static_cast<float*>(out->data);
+    if (src->dtype == RAD_F32)
+        hipLaunchKernelGGL(wan_unpatch<float>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<const float*>(src->data), dims, dst, rows,
+                           static_cast<int>(channels), src->stride[0], out->stride[0]);
+    else
+        hipLaunchKernelGGL(wan_unpatch<uint16_t>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<const uint16_t*>(src->data), dims, dst, rows,
+                           static_cast<int>(channels), src->stride[0], out->stride[0]);
+    return st_of(hipGetLastError());
+}
 
 // rms_mod (QUANT false: y, g, s, w, cu, x, z) and rms_mod_quant_fp8 (y, g, s, w, cu, x, q, scale,
 // z), one shim. qmode 2 is rms_mod_quant_i8 and 3 rms_mod_had_quant_i8g, whose `group` is 128 or

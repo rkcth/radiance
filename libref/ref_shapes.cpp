@@ -70,6 +70,7 @@
 #include "rad_sample.h"
 #include "rad_unipc_math.h"
 #include "rad_umt5_attention.h"
+#include "rad_wan_dit.h"
 
 #include <algorithm>
 #include <cmath>
@@ -3541,6 +3542,43 @@ static int64_t cube_side(int64_t M) {
     int64_t c = 0;
     while ((c + 1) * (c + 1) * (c + 1) <= M) ++c;
     return c;
+}
+
+int ref_wan_rope_table_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bound = gi(p, n_p, "M", 0);
+    if (bound < 2 || bound > (1ll << 30)) return RAD_E_UNSUPPORTED;
+    const int64_t side = std::min<int64_t>(cube_side(bound / 2), 512);
+    const int64_t rows = 2 * side * side * side;
+    Opd o;
+    o.t_idx({3}, 0, 2 * side, 0);
+    o.t(RAD_F32, {rows, rad_wan_dit::head_width});
+    return o.finish("wan_rope_table", operand, out);
+}
+
+int ref_wan_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), heads = gi(p, n_p, "heads", 0);
+    if (rows < 1 || rows > INT32_MAX || heads < 1 || heads > 128) return RAD_E_SHAPE;
+    const int64_t width = heads * rad_wan_dit::head_width;
+    Opd o;
+    o.t(RAD_BF16, {rows, width});
+    o.t(RAD_BF16, {rows, width});
+    o.t(RAD_F32, {rows, rad_wan_dit::head_width});
+    return o.finish("wan_rope", operand, out);
+}
+
+int ref_wan_unpatch_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bound = gi(p, n_p, "M", 0), channels = gi(p, n_p, "n", 0);
+    if (bound < 2 || bound > (1ll << 30)) return RAD_E_UNSUPPORTED;
+    const int64_t side = std::min<int64_t>(cube_side(bound / 2), 512);
+    const int64_t patches = 2 * side * side * side;
+    if (channels < 1 || channels > 1024) return RAD_E_SHAPE;
+    const uint32_t dtype = act_dt(p, n_p);
+    if (dtype != RAD_F32 && dtype != RAD_BF16) return RAD_E_DTYPE;
+    Opd o;
+    o.t(dtype, {patches, 4 * channels});
+    o.t_idx({3}, 0, 2 * side, 0);
+    o.t(RAD_F32, {4 * patches, channels});
+    return o.finish("wan_unpatch", operand, out);
 }
 
 int ref_conv3d_ndhwc_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

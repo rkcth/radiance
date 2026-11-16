@@ -2046,6 +2046,9 @@ guidance and sampler in f32.
 | `ltx_guide` | `M`(range) `n` `dtype` | `vc`, `vu`?, `vs`?, `vm`?, `scales`, `sched`, `stats`:inout, `x`:inout |
 | `pixel_norm` | `M`(range) `n` `eps`:f64 `form` `act`/opt `ileave`/opt `dtype` `mult`:f64/opt | `x` → `y` |
 | `d2s3d` | `M`(range) `C` `st` `sh` `sw` `drop`/opt `dtype` | `x`, `geom` → `y` |
+| `wan_rope_table` | `M`(range) `dtype` | I32 latent `geom` → F32 `table` |
+| `wan_rope` | `M`(range) `heads` `dtype` | BF16 `q`:inout, BF16 `k`:inout, F32 `table` |
+| `wan_unpatch` | `M`(range) `n` `dtype` | `patches`, I32 latent `geom` → F32 `velocity` |
 | `s2d3d` | `M`(range) `C` `st` `sh` `sw` `tpre`/opt `group`/opt `mode` `add`/opt `dtype` | `x`, `geom`, `y`:inout |
 | `pix_patch` | `M`(range) `p` `C` `order`/opt `dtype` | `x` → `y` |
 | `stft_logmel` | `M`(range) `hop` `nfft` `n_mel` `ch` `dtype` | `x`, `basis`w, `mel`w → `y` |
@@ -2068,6 +2071,13 @@ guidance and sampler in f32.
   4096, `n_dims` 3, `max` `20 2048 2048` (two padded pairs); the soundtrack's and both cross
   attentions' `dim` 2048, `n_dims` 1, `max` `20`; the text connectors' `max` 4096 over the row
   index.
+- Wan's latent `geom` is `[T, H, W]` with even `H` and `W`. `wan_rope_table` builds a row
+  of interleaved cosines and sines for each 1 × 2 × 2 patch. The 128-wide head rotates adjacent
+  pairs, with 22 pairs on time and 21 each on height and width. Each axis starts its own
+  frequency ladder at 1. Angles and trigonometry use FP64, and the table stores FP32.
+  `wan_rope` reuses that table across heads and rotates the BF16 queries and keys in place.
+  `wan_unpatch` expands `[dy, dx, channel]` head columns to F32 voxel rows, with
+  x varying fastest, then y, then time. Its `dtype` is the source patch dtype.
 - `head_gate`: `x = rd(x rd(2 rd(sigmoid(g))))` for each head's `head_dim` values, `g`
   `[M, >= n_head]` the head's logit (the gated attention's `to_gate_logits`), each operand at its
   own row pitch.
