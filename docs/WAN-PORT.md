@@ -45,9 +45,10 @@ and rejects alternate samplers. The Wan graph still needs to bind these
 operands and supply its predicted velocity.
 
 The verified Diffusers files store the text encoder in BF16 and the
-transformer and VAE in FP32. The BF16 conversion recipe is limited to the
-latter two components. `rad-convert` requires the Wan architecture's
-declaration before emitting a runnable container.
+transformer and VAE in FP32. The conversion recipe retains the transformer's
+timestep projections in FP32 and casts the remaining transformer and VAE
+weights to BF16. `rad-convert` requires the Wan architecture's declaration
+before emitting a runnable container.
 
 Wan's UMT5 relative-position attention now runs in libref and on gfx1201.
 A seeded BF16 comparison with pinned Wan's PyTorch expression used 64 heads
@@ -71,8 +72,20 @@ two packed prompts of 13 and 14 tokens including EOS. On one R9700, the
 encoder running each prompt separately on PyTorch's CPU backend. The
 minimum per-token cosine similarity was `0.995916`. Relative RMSE across
 all values was `2.53%` and maximum absolute difference was `0.03125`.
-This probe executes the encoder subgraph. The video API still needs the
-transformer's text projection, denoiser, and VAE.
+The text conditioning then right-pads each encoded prompt to 512 rows
+before the biased projections. The projected padding participates in
+cross-attention. On one R9700, the full 1024 × 3072 output from two prompts
+had `0.028%` relative RMSE against the BF16 PyTorch projections with
+identical encoder input. The projected padding had a maximum absolute
+difference of `4.77e-7`.
+
+The timestep graph computes unscaled integer-timestep sinusoids in FP64
+before the FP32 embedding and six-way modulation. Image-to-video gets a
+separate timestep-zero row for its first temporal patch plane. With the
+real FP32 weights and timesteps 0 and 999, the R9700's time embedding and
+modulation had maximum absolute differences of `9.54e-7` and `3.34e-6`
+against the pinned PyTorch reference. The DiT still needs to consume the
+projected prompt and timestep buffers in a video pass.
 
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata

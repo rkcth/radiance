@@ -270,6 +270,34 @@ int ref_timestep_embed(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+int ref_timestep_embed_f64(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *t = &a->t[0], *y = &a->t[1];
+    if (t->dtype != RAD_F32 || y->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t n = p_int(a, "n", 0);
+    const RadParam* max_period = p_find(a, "max_period");
+    const double period = max_period && max_period->kind == RAD_P_F64 ? max_period->dval : 10000.0;
+    const int64_t rows = y->shape[0], pitch = y->stride[0], half = n / 2;
+    if (n <= 0 || n > INT32_MAX || (n & 1) || !(period > 0.0) || !std::isfinite(period) ||
+        y->rank != 2 || y->shape[1] != n || rows <= 0 || rows > INT32_MAX ||
+        (t->rank != 1 && (t->rank != 2 || t->shape[1] != 1)) || t->shape[0] < rows)
+        return RAD_E_SHAPE;
+    if ((rows > 1 && t->stride[0] != 1) || y->stride[1] != 1 || pitch < n ||
+        pitch > (INT64_MAX / 4 - n) / rows) return RAD_E_STRIDE;
+    const auto* times = static_cast<const float*>(t->data);
+    auto* output = static_cast<float*>(y->data);
+    for (int64_t m = 0; m < rows; ++m) {
+        const double position = times[m];
+        float* out = output + m * pitch;
+        for (int64_t i = 0; i < half; ++i) {
+            const double angle = position * std::pow(period, -static_cast<double>(i) / half);
+            out[i] = static_cast<float>(std::cos(angle));
+            out[half + i] = static_cast<float>(std::sin(angle));
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ gather_rows2 */
 /* y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]] -- a sequence assembled from two sources. */
 int ref_gather_rows2(const RadArgs* a, RadStream) {

@@ -1,8 +1,9 @@
 # Wan-AI/Wan2.2-TI2V-5B-Diffusers: the UMT5 encoder is already BF16.
-# The published transformer and VAE tensors are FP32. Cast them for the
-# BF16 runtime candidate; keep the source tensors for numerical comparisons.
+# The transformer and VAE source tensors are FP32. Retain FP32 timestep
+# projections for Wan's modulation path and cast the remaining weights to BF16.
 #
 # rad-convert <pinned Wan Diffusers directory> --recipe \
 #     data/recipes/wan-2.2-ti2v-5b-bf16.recipe -o wan-2.2-ti2v-5b-bf16.rad
+transformer.condition_embedder.time_* cast dtype=f32
 transformer.* cast dtype=bf16
 vae.*         cast dtype=bf16

@@ -2751,6 +2751,9 @@ static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale")
                                           P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
                                             { "table", RAD_OPD_WEIGHT, 1 } };
+static const RadParamSpec pTimestepF64[] = { P_INT("M"), P_INT("n"), P_F64("max_period"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oTimestepF64[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
 static const RadOperandSpec oGather2[] = {
     { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
 };
@@ -4026,6 +4029,8 @@ static const RadOpSchema kSchemas[] = {
            "With `curve` > 0 and a `table` [curve, n] f32 operand instead: y[m] is `table` sampled at "
            "pos = clamp01(max(t[m], clamp_min)) * (curve - 1), linearly between the two rows around "
            "pos -- an adaln time-embedding curve precomputed at convert."),
+    SCHEMA("timestep_embed_f64", pTimestepF64, oTimestepF64,
+           "sinusoidal embedding of unscaled timesteps, with f64 frequencies and trigonometry, f32 output."),
     SCHEMA("gather_rows2", pGenMn, oGather2,
            "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]."),
     SCHEMA("lane_gather", pLane, oLaneGather, "y[cu[e] + k] = src[lane[e] * stride + k]."),
@@ -10222,6 +10227,13 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenTimestepF32), NOTUNE,
   nullptr, nullptr, r4d_rad_timestep_embed },
+
+{ "timestep_embed_f64", "timestep_embed_f64", "elem",
+  "sinusoidal timestep embedding with f64 frequencies and trigonometry",
+  "any M, row pitches honoured", "f32 t and out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenTimestepF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_timestep_embed_f64 },
 
 { "gather_rows2_bf16", "gather_rows2", "elem",
   "rows from two sources by a signed index",

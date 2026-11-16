@@ -3114,6 +3114,16 @@ int ref_timestep_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     if (G > 0) o.t((uint32_t)RAD_F32, { G, n }); else o.skip();        /* table */
     return o.finish("timestep_embed", operand, out);
 }
+int ref_timestep_embed_f64_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    if (act_dt(p, n_p) != RAD_F32) return RAD_E_DTYPE;
+    if (rows < 1 || rows > INT32_MAX || width < 2 || width > INT32_MAX || (width & 1))
+        return RAD_E_SHAPE;
+    Opd o;
+    o.t(RAD_F32, {rows});
+    o.t(RAD_F32, {rows, width});
+    return o.finish("timestep_embed_f64", operand, out);
+}
 int ref_gather_rows2_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     (void)p; (void)n_p; (void)operand; (void)out;
     return RAD_E_UNSUPPORTED;   /* a signed index: half its draw would have to be negative */

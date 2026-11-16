@@ -913,6 +913,9 @@ static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale")
                                           P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
                                           P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y"), WGT_O("table") };
+static const RadParamSpec pTimestepF64[] = { P_INT("M"), P_INT("n"), P_F64("max_period"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oTimestepF64[] = { OPD("t"), OUT("y") };
 static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
 static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
 static const RadOperandSpec oLaneGather[] = { OPD("src"), OPD("lane"), OPD("cu_seqlens"), OUT("y") };
@@ -1929,6 +1932,8 @@ static const RadOpSchema kSchemas[] = {
   "pipeline hands it to its transformer. With `curve` > 0 and a `table` [curve, n] f32 operand: "
   "y[m] = table sampled at clamp01(max(t[m], clamp_min)) * (curve - 1), lerped between the two "
   "rows around that position -- a precomputed adaln time-embedding curve." },
+{ "timestep_embed_f64", ARR(pTimestepF64), ARR(oTimestepF64),
+  "sinusoidal embedding of unscaled timesteps, with f64 frequencies and trigonometry, f32 output." },
 { "gather_rows2", ARR(pMnD), ARR(oGather2),
   "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]: a sequence assembled from two sources." },
 { "lane_gather", ARR(pLane), ARR(oLaneGather),
@@ -2759,6 +2764,8 @@ SIMPLE("ref_gate_add", "gate_add", "elem", "x += act(gate row) * y, act tanh or 
        ref_gate_add),
 SIMPLE("ref_timestep_embed", "timestep_embed", "elem", "sinusoidal timestep embedding",
        DT_FLOAT, ref_timestep_embed),
+SIMPLE("ref_timestep_embed_f64", "timestep_embed_f64", "elem", "FP64 sinusoidal timestep embedding",
+       "f32", ref_timestep_embed_f64),
 SIMPLE("ref_gather_rows2", "gather_rows2", "elem", "rows from two sources by a signed index",
        DT_ANY, ref_gather_rows2),
 SIMPLE("ref_lane_gather", "lane_gather", "elem", "each entry's rows out of its lane", DT_ANY,

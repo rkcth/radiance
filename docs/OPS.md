@@ -1318,6 +1318,7 @@ says which (`libref/ref_gen.cpp`).
 | `gate_add` | `M`(range) `n` `dtype` `act`/opt | `y`, `g`, `cu_seqlens`, `x`:inout |
 | `ln_mod_had_quant_i8g` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
 | `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `clamp_min`:f64/opt `curve`/opt `dtype` | `t` → `y`, `table`w? |
+| `timestep_embed_f64` | `M`(range) `n` `max_period`:f64 `dtype` | F32 `t` → F32 `y`, with FP64 angles and trigonometry |
 | `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
 | `table_add` | `M`(range) `n` `L` `dtype` | `x`, `t`w → `y` |
 | `mix_rows` | `M`(range) `n` `k` `dtype` | `x`, `w`w → `y` |

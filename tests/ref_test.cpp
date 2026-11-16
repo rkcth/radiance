@@ -1312,7 +1312,7 @@ TEST(op_vocabulary) {
         "sample_argmax", "sample_merge_topk", "sample_logprobs",
         /* The image generator's (arch/qwenimage21): a DiT's modulation and gates, the per-lane
          * sampler state, the VAE's convolutions and shortcuts, attention over a cached prefix. */
-        "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
+        "ln_mod", "gate_add", "timestep_embed", "timestep_embed_f64", "gather_rows2", "lane_gather", "lane_store",
         "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "im2col_nhwc", "l2norm_chan",
         "d2s_add", "s2d_avg_add", "to_rgba8", "gelu_tanh", "gelu_umt5", "scatter_add_rows", "attn_prefix_self",
         /* SDXL's (arch/sdxl): CLIP-L's activation and the k-diffusion sampler over a
@@ -6763,6 +6763,28 @@ TEST(timestep_embed_is_cos_then_sin_of_the_scaled_time) {
     CHECK_NEAR(y3.at(2), std::cos(1.0), 1e-6);   CHECK_NEAR(y3.at(3), std::sin(1.0), 1e-6);
 }
 
+TEST(timestep_embed_f64_matches_pinned_wan_sinusoidal_embedding) {
+    T t(RAD_F32, {2}); t.f({0, 999});
+    T y(RAD_F32, {2, 256});
+    A a; a.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_OK(run("timestep_embed_f64", a));
+    for (int i = 0; i < 128; ++i) {
+        CHECK_EQ(y.at(i), 1.0f);
+        CHECK_EQ(y.at(128 + i), 0.0f);
+    }
+    // Wan's FP64 sinusoidal_embedding_1d, then narrowed to FP32 for the MLP.
+    CHECK_EQ(y.at(256 + 3), 0x1.68de3cp-1f);
+    CHECK_EQ(y.at(256 + 63), -0x1.077d74p-2f);
+    CHECK_EQ(y.at(256 + 131), 0x1.6b349ap-1f);
+    CHECK_EQ(y.at(256 + 191), -0x1.eec282p-1f);
+    y.t.stride[0] = 255;
+    A overlap; overlap.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", overlap), RAD_E_STRIDE);
+    T wrong_rank(RAD_F32, {1, 2, 256});
+    A rank; rank.t(t).t(wrong_rank).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", rank), RAD_E_SHAPE);
+}
+
 /* gather_rows2: idx >= 0 reads a, idx < 0 reads b[-1 - idx], and a row past either source is
  * zeros. */
 TEST(gather_rows2_reads_two_sources_by_the_index_sign) {
@@ -10624,6 +10646,8 @@ std::vector<Geo> geometries() {
         G("gate_add", "M", 4, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).d("scale", 1000.0)
                                     .d("max_period", 10000.0).d("clamp_min", 0.3).s("dtype", "f32")),
+        G("timestep_embed_f64", "M", 3, a.i("M", R).i("n", 8).d("max_period", 10000.0)
+                                        .s("dtype", "f32")),
         /* The curve form: the same op over a precomputed table instead of the sinusoid. */
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).i("curve", 5).d("clamp_min", 0.3)
                                     .s("dtype", "f32")),

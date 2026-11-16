@@ -1,5 +1,6 @@
 #include "arch_fakes.h"
-#include "../arch/wan/wan_umt5.h"
+#include "../arch/wan/wan_conditioning.h"
+#include "../arch/wan/wan_time.h"
 
 TEST(wan_umt5_declares_each_checkpoint_tensor_and_runs_packed_conditioning) {
     RadBuilder builder{};
@@ -84,6 +85,112 @@ TEST(wan_umt5_rejects_geometry_outside_one_or_two_tokenized_prompts) {
     wan::Umt5Encoder{}.step(&run, batch);
     CHECK(!run.step_fail.empty());
     CHECK(run.issues.empty());
+}
+
+TEST(wan_text_conditioning_projects_padded_prompts_into_the_right_video_lane) {
+    RadBuilder builder{};
+    rad::arch::Names names("wan");
+    wan::TextConditioning text;
+    REQUIRE_EQ(text.declare(&builder, names, 2), RAD_OK);
+    const auto* w = find_w(builder, "wan.text.proj1.weight");
+    REQUIRE(w);
+    CHECK_EQ(w->d.shape[0], 3072);
+    CHECK_EQ(w->d.shape[1], 4096);
+    CHECK_EQ(w->d.dtype, (uint32_t)RAD_BF16);
+    const auto* persistent = find_b(builder, "wan.text.projected");
+    REQUIRE(persistent);
+    CHECK_EQ(persistent->d.kind, RAD_BUF_PERSIST);
+    CHECK_EQ(persistent->d.shape[0], 2048);
+    CHECK_EQ(persistent->d.shape[1], 3072);
+
+    const int32_t tokens[] = {20, 21, 1, 57, 1}, boundaries[] = {0, 3, 5};
+    RadVideoGenBatch video{};
+    video.lane = 1;
+    video.n_neg = 2;
+    RadBatch batch{};
+    batch.n_tok = 5;
+    batch.n_seq = 2;
+    batch.token_ids = tokens;
+    batch.cu_seqlens = boundaries;
+    batch.vgen_b = &video;
+    RadCtx run{};
+    run.b = &builder;
+    run.batch = &batch;
+    text.step(&run, batch);
+    REQUIRE(run.step_fail.empty());
+    REQUIRE(run.issues.size() >= 5);
+    const size_t end = run.issues.size();
+    const auto& fill = run.issues[end - 5];
+    const auto& positive = run.issues[end - 4];
+    const auto& negative = run.issues[end - 3];
+    const auto& proj1 = run.issues[end - 2];
+    const auto& proj2 = run.issues[end - 1];
+    CHECK(builder.ops.at(fill.op - 1).op == "fill");
+    CHECK_EQ(fill.n, 1024);
+    CHECK_EQ(positive.n, 3);
+    CHECK_EQ(positive.opd.at(0).offset, 0);
+    CHECK_EQ(positive.opd.at(1).offset, 0);
+    CHECK_EQ(negative.n, 2);
+    CHECK_EQ(negative.opd.at(0).offset, 3 * 4096);
+    CHECK_EQ(negative.opd.at(1).offset, 512 * 4096);
+    CHECK_EQ(pstr(&builder.ops.at(proj1.op - 1), "act"), std::string("gelu_tanh"));
+    CHECK_EQ(proj1.n, 1024);
+    CHECK_EQ(proj2.n, 1024);
+    CHECK_EQ(proj2.opd.back().handle, text.buffer());
+    CHECK_EQ(proj2.opd.back().offset, text.context(1, 0).offset);
+    CHECK_EQ(text.context(1, 1).offset, 1536 * 3072);
+    CHECK_LINT(builder, &run);
+
+    video.n_neg = 0;
+    batch.n_tok = 3;
+    batch.n_seq = 1;
+    RadCtx single{};
+    single.b = &builder;
+    single.batch = &batch;
+    text.step(&single, batch);
+    REQUIRE(single.step_fail.empty());
+    CHECK_EQ(single.issues.size() + 1, run.issues.size());
+    CHECK_EQ(single.issues.back().opd.back().rows, 512);
+    CHECK_LINT(builder, &single);
+
+    video.lane = 2;
+    RadCtx invalid{};
+    invalid.b = &builder;
+    text.step(&invalid, batch);
+    CHECK(!invalid.step_fail.empty());
+    CHECK(invalid.issues.empty());
+}
+
+TEST(wan_time_conditioning_uses_zero_only_for_the_reference_frame) {
+    RadBuilder builder{};
+    rad::arch::Names names("wan");
+    wan::TimeConditioning time;
+    REQUIRE_EQ(time.declare(&builder, names), RAD_OK);
+    REQUIRE_EQ(builder.weights.size(), 6u);
+    for (const auto& w : builder.weights) CHECK_EQ(w.d.dtype, (uint32_t)RAD_F32);
+    CHECK_EQ(pflt(find_op(builder, "timestep_embed_f64"), "max_period"), 10000.0);
+    CHECK_EQ(pint(find_op(builder, "gemm_nt_bias", 2), "N"), 18432);
+    const float schedule[] = {999.0f, 0.999f};
+    RadVideoGenBatch video{};
+    video.sched = schedule;
+    RadBatch batch{};
+    for (int image : {0, 1}) {
+        video.has_image = image;
+        RadCtx run{};
+        run.b = &builder;
+        run.batch = &batch;
+        time.step(&run, video);
+        REQUIRE(run.step_fail.empty());
+        REQUIRE_EQ(run.issues.size(), (size_t)(7 + image));
+        if (image) CHECK(builder.ops.at(run.issues[0].op - 1).op == "fill");
+        const auto& copy = run.issues.at(image);
+        CHECK(copy.opd.at(0).raw == schedule);
+        CHECK_EQ(copy.opd.at(1).offset, image);
+        CHECK_EQ(run.issues.at(image + 1).n, 1 + image);
+        CHECK_EQ(run.issues.back().opd.back().handle, time.modulation);
+        CHECK_EQ(run.issues.back().opd.back().rows, 1 + image);
+        CHECK_LINT(builder, &run);
+    }
 }
 
 RAD_TEST_MAIN()

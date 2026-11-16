@@ -13205,6 +13205,33 @@ void timestep_f32_case(const Plugin& pl) {
     }
 }
 
+void timestep_f64_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "timestep_embed_f64");
+    if (!r) { ok("timestep_embed_f64", false, "row absent"); return; }
+    constexpr int64_t rows = 2, n = 256, pitch = 263;
+    std::vector<float> t = {0.0f, 999.0f}, initial(rows * pitch, 21.0f);
+    void* dy = up_f32(initial);
+    RadTensor out = T(dy, RAD_F32, {rows, n});
+    out.stride[0] = pitch;
+    const int rc = launch(r, {T(up_f32(t), RAD_F32, {rows}), out},
+                          {PI("M", rows), PI("n", n), PF("max_period", 10000.0), PS("dtype", "f32")});
+    if (rc != RAD_OK) { ok("timestep_embed_f64", false, "rc " + std::to_string(rc)); return; }
+    const auto result = down_f32(dy, initial.size());
+    bool exact = result[pitch + 3] == 0x1.68de3cp-1f &&
+                 result[pitch + 63] == -0x1.077d74p-2f &&
+                 result[pitch + 131] == 0x1.6b349ap-1f &&
+                 result[pitch + 191] == -0x1.eec282p-1f;
+    for (int64_t i = 0; i < n / 2; ++i)
+        exact = exact && result[i] == 1.0f && result[n / 2 + i] == 0.0f;
+    for (int64_t row = 0; row < rows; ++row)
+        for (int64_t i = n; i < pitch; ++i) exact = exact && result[row * pitch + i] == 21.0f;
+    ok("timestep_embed_f64 matches pinned Wan values and preserves padding", exact);
+    out.stride[0] = n - 1;
+    const int rejected = launch(r, {T(up_f32(t), RAD_F32, {rows}), out},
+                                {PI("M", rows), PI("n", n), PF("max_period", 10000.0), PS("dtype", "f32")});
+    ok("timestep_embed_f64 rejects overlapping rows", rejected == RAD_E_STRIDE);
+}
+
 /* The curve form: y[m] lerps the [G, n] f32 table at clamp01(max(t[m], clamp_min)) * (G - 1),
  * clamping the lower row index to G - 2 -- the device mirror of comfy's adaln curve sampling. */
 void timestep_curve_case(const Plugin& pl) {
@@ -32953,6 +32980,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_bf16")) vg::norm_f32_rows_cases(pl, false);
     if (sel("layernorm_bf16")) vg::norm_f32_rows_cases(pl, true);
     if (sel("timestep_embed_f32")) { vg::timestep_f32_case(pl); vg::timestep_curve_case(pl); }
+    if (sel("timestep_embed_f64")) vg::timestep_f64_case(pl);
     if (sel("randn_lanes_f32")) vg::randn_f32_case(pl);
     if (sel("gelu_quick_bf16")) vg::gelu_quick_cases(pl);
     if (sel("gelu_umt5_bf16")) vg::gelu_umt5_cases(pl);

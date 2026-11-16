@@ -301,6 +301,18 @@ __global__ __launch_bounds__(kT) void timestep_kernel(
     }
 }
 
+__global__ __launch_bounds__(kT) void timestep_f64_kernel(
+    const float* __restrict__ t, float* __restrict__ y, int half, double max_period, int64_t y_ld) {
+    const int m = blockIdx.x;
+    const double position = t[m];
+    float* out = y + static_cast<int64_t>(m) * y_ld;
+    for (int i = threadIdx.x; i < half; i += kT) {
+        const double angle = position * pow(max_period, -static_cast<double>(i) / half);
+        out[i] = static_cast<float>(cos(angle));
+        out[half + i] = static_cast<float>(sin(angle));
+    }
+}
+
 // The curve form: y[m] is the table [grid, n] f32 at clamp01(max(t[m], clamp_min)) (grid - 1),
 // between the two rows around it.
 template <typename TY>
@@ -1230,6 +1242,25 @@ extern "C" int r4d_rad_timestep_embed(const RadArgs* a, RadStream s) {
         hipLaunchKernelGGL(timestep_kernel<uint16_t>, dim3((unsigned)ry), dim3(kT), 0,
                            (hipStream_t)s, (const float*)t->data, (uint16_t*)y->data, (int)(n / 2),
                            scale, coef, round, clamp, (int)yl);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_timestep_embed_f64(const RadArgs* a, RadStream s) {
+    const RadTensor *t = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!t || !y) return R4D_NO(RAD_E_INVAL);
+    if (t->dtype != RAD_F32 || y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const int64_t n = r4d_geti_or(a, "n", 0);
+    const double period = r4d_getf(a, "max_period", 10000.0);
+    const int64_t rows = y->shape[0], pitch = y->stride[0];
+    if (n <= 0 || n > INT32_MAX || (n & 1) || !(period > 0.0) || !std::isfinite(period) ||
+        y->rank != 2 || y->shape[1] != n || rows <= 0 || rows > INT32_MAX ||
+        (t->rank != 1 && (t->rank != 2 || t->shape[1] != 1)) || t->shape[0] < rows)
+        return R4D_NO(RAD_E_SHAPE);
+    if ((rows > 1 && t->stride[0] != 1) || y->stride[1] != 1 || pitch < n ||
+        pitch > (INT64_MAX / 4 - n) / rows) return R4D_NO(RAD_E_STRIDE);
+    hipLaunchKernelGGL(timestep_f64_kernel, dim3(static_cast<unsigned>(rows)), dim3(kT), 0,
+                       (hipStream_t)s, static_cast<const float*>(t->data), static_cast<float*>(y->data),
+                       static_cast<int>(n / 2), period, pitch);
     return st_of(hipGetLastError());
 }
 

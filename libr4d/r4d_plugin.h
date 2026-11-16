@@ -271,6 +271,7 @@ int     r4d_rad_ln_mod                (const RadArgs*, RadStream);
 int     r4d_rad_ln_mod_had_quant_i8g  (const RadArgs*, RadStream);
 int     r4d_rad_gate_add              (const RadArgs*, RadStream);
 int     r4d_rad_timestep_embed        (const RadArgs*, RadStream);
+int     r4d_rad_timestep_embed_f64    (const RadArgs*, RadStream);
 int     r4d_rad_gather_rows2          (const RadArgs*, RadStream);
 int     r4d_rad_lane_gather           (const RadArgs*, RadStream);
 int     r4d_rad_lane_store            (const RadArgs*, RadStream);
