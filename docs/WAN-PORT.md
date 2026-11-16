@@ -25,6 +25,19 @@ position order, first-frame timestep zeroing, and the different column order
 of the convolution and output head. The native pipeline still needs to use
 these helpers.
 
+The UniPC BH2 helper matched all model timesteps and float32 sigmas from
+the pinned Wan solver in eight CPU comparisons. The 50-step default shift
+of 5 had a maximum scalar latent error of `9e-8`. Across 1 to 1000 steps
+and shifts from 0.02 to 100, the maximum was `2.51e-6`. Both paths started
+at step index zero. This matters when consecutive sigmas truncate to the
+same integer timestep. The test covers solver arithmetic, before it is
+connected to the transformer and device latent state.
+
+The verified Diffusers files store the text encoder in BF16 and the
+transformer and VAE in FP32. The BF16 conversion recipe is limited to the
+latter two components. `rad-convert` requires the Wan architecture's
+declaration before emitting a runnable container.
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,
