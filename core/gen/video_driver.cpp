@@ -148,7 +148,8 @@ VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t vi
                              bool refine, double shift_video, double shift_audio) {
     /* A request's shift replaces the declaration's, form 0 only. */
     const double sv = shift_video > 0.0 ? shift_video : d.shift_video;
-    const double sa = shift_audio > 0.0 ? shift_audio : d.shift_audio;
+    const double sa = d.audio_channels == 0 ? sv
+                    : shift_audio > 0.0 ? shift_audio : d.shift_audio;
     VideoSchedule v;
     if (d.sched_kind == 1) {
         if (d.n_rungs > 0) {
@@ -243,6 +244,7 @@ int64_t frames_bytes_of(const RadVideoGenDecl& d) {
 /* The samples a channel of a soundtrack under `frames` frames: its latents rounded up, which
  * bounds the rounding video_shape does. */
 int64_t samples_of(const RadVideoGenDecl& d, int32_t frames) {
+    if (d.audio_channels == 0) return 0;
     const int64_t num = (int64_t)frames * d.fps_den * d.audio_rate;
     return (num / d.fps_num + 1) * (d.sample_rate / d.audio_rate);
 }
@@ -304,9 +306,10 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
                    decl_.audio_channels * 4;
     host_ = static_cast<char*>(rad_dev_alloc(bytes_, RAD_MEM_HOST_PINNED));
     frames_host_ = static_cast<uint8_t*>(rad_dev_alloc(frames_bytes_, RAD_MEM_HOST_PINNED));
-    audio_host_ = static_cast<float*>(rad_dev_alloc(audio_bytes_, RAD_MEM_HOST_PINNED));
+    if (audio_bytes_ > 0)
+        audio_host_ = static_cast<float*>(rad_dev_alloc(audio_bytes_, RAD_MEM_HOST_PINNED));
     duration_host_ = static_cast<float*>(rad_dev_alloc(64, RAD_MEM_HOST_PINNED));
-    if (!host_ || !frames_host_ || !audio_host_ || !duration_host_) {
+    if (!host_ || !frames_host_ || (audio_bytes_ > 0 && !audio_host_) || !duration_host_) {
         RAD_ERR("video generator: no pinned host memory for the pass staging and outputs (%lld + "
                 "%lld + %lld bytes)", (long long)bytes_, (long long)frames_bytes_,
                 (long long)audio_bytes_);
@@ -651,7 +654,7 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
                       std::to_string(first_h) + " RGB");
     }
     j.n_chunks = chunks;
-    j.n_samples = (int64_t)s.n_audio * (d.sample_rate / d.audio_rate);
+    j.n_samples = d.audio_channels > 0 ? (int64_t)s.n_audio * (d.sample_rate / d.audio_rate) : 0;
     VideoTicket& t = *r.ticket;
     t.frames = s.frames;
     t.steps = j.sched.steps;
@@ -709,10 +712,14 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
                   " (sigma grid points, the last one 0)"));
 
     auto j = std::make_unique<Job>();
+    if (d.audio_channels == 0 && r->shift_audio != 0.0)
+        return no("this model has no soundtrack schedule");
     /* Guidance: the request's terms over the model's defaults; a negative prompt only when a
      * scale asks for the unconditional branch. */
     bool named = r->has_neg;
     for (int i = 0; i < 8; ++i) {
+        if (i >= 4 && d.audio_channels == 0 && !std::isnan(r->guidance[i]))
+            return no("this model has no soundtrack guidance");
         named = named || !std::isnan(r->guidance[i]);
         j->guidance[i] = (float)(std::isnan(r->guidance[i]) ? d.guidance_default[i] : r->guidance[i]);
         if (!(j->guidance[i] >= 0.0f) || !std::isfinite(j->guidance[i]))
@@ -721,7 +728,8 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     if (!d.guidance && named)
         return no("this model takes no guidance or negative prompt");
     j->n_neg = 0;
-    if (d.guidance && (j->guidance[0] != 1.0f || j->guidance[4] != 1.0f)) {
+    if (d.guidance && (j->guidance[0] != 1.0f ||
+                       (d.audio_channels > 0 && j->guidance[4] != 1.0f))) {
         const int64_t N = (int64_t)r->neg_tokens.size();
         if (N < 1 || N > d.max_text)
             return no("the negative prompt is " + std::to_string(N) + " tokens; this model takes "
@@ -959,7 +967,7 @@ const RadBatch* VideoDriver::next(int step) {
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (!j.admitted || j.failed || j.step < j.sched.steps) continue;
-        if (!j.audio_done) return build_audio(j, step);
+        if (decl_.audio_channels > 0 && !j.audio_done) return build_audio(j, step);
         if (j.chunk < j.n_chunks) return build_chunk(j, step);
     }
     /* 2. The encodes of an admitted request's media, before its prompt. */

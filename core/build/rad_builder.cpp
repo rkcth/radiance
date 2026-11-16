@@ -1771,8 +1771,12 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->max_aspect, (long long)d->default_width, (long long)d->default_height);
         return RAD_E_INVAL;
     }
-    if (d->sample_rate <= 0 || d->audio_rate <= 0 || d->sample_rate % d->audio_rate != 0 ||
-        d->audio_channels <= 0 || d->audio_latent_channels <= 0) {
+    const bool has_audio = d->audio_channels > 0;
+    if (has_audio ? (d->sample_rate <= 0 || d->audio_rate <= 0 ||
+                     d->sample_rate % d->audio_rate != 0 || d->audio_latent_channels <= 0)
+                  : (d->sample_rate != 0 || d->audio_rate != 0 || d->audio_channels != 0 ||
+                     d->audio_latent_channels != 0 || d->audio_out != RAD_NULL_HANDLE ||
+                     d->audio_streams != 0)) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the soundtrack is out of range (%lld Hz "
                          "at %lld latents a second, %lld channels of %lld)", nm,
             (long long)d->sample_rate, (long long)d->audio_rate, (long long)d->audio_channels,
@@ -1781,7 +1785,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
     }
     /* Form 1 (LTX-2's FlowMatchEulerDiscrete) steps both modalities the same sigmas and reads
      * no per-modality shift. */
-    const bool shifts = d->sched_kind == 1 || (d->shift_video > 0.0 && d->shift_audio > 0.0);
+    const bool shifts = d->sched_kind == 1 ||
+                        (d->shift_video > 0.0 && (!has_audio || d->shift_audio > 0.0));
     if (d->default_steps <= 0 || d->max_steps < d->default_steps || !shifts || d->max_lanes <= 0) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the sampler is incomplete (%lld steps by "
                          "default, %lld at most, shifts %g and %g, %lld lanes)", nm,
@@ -1892,13 +1897,15 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
     /* frames_out holds the last chunk, the largest, at the largest area; audio_out the longest
      * soundtrack. */
     const int64_t chunk_px = (d->frames_per_chunk + d->frames_tail) * d->max_area * 3;
-    const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;
-    const int64_t max_lat = (max_frames * d->fps_den * d->audio_rate * 2 + d->fps_num) /
-                            (2 * d->fps_num) + 1;
-    const int64_t max_samples = max_lat * (d->sample_rate / d->audio_rate);
-    if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out") ||
-        !buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
-        return RAD_E_INVAL;
+    if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out")) return RAD_E_INVAL;
+    if (has_audio) {
+        const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;
+        const int64_t max_lat = (max_frames * d->fps_den * d->audio_rate * 2 + d->fps_num) /
+                                (2 * d->fps_num) + 1;
+        const int64_t max_samples = max_lat * (d->sample_rate / d->audio_rate);
+        if (!buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
+            return RAD_E_INVAL;
+    }
     if (d->duration_out != RAD_NULL_HANDLE) {
         if (!buf_ok(d->duration_out, RAD_F32, 1, "duration_out")) return RAD_E_INVAL;
         if (!(d->duration_min > 0.0 && d->duration_max > d->duration_min) ||

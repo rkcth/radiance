@@ -65,8 +65,8 @@ struct FakeVideoGen : IVideoGen {
         t.width = r->width;
         t.height = r->height;
         t.steps = 2;
-        t.sample_rate = 32000;
-        t.channels = 2;
+        t.sample_rate = inf.sample_rate;
+        t.channels = inf.channels;
         t.fps = 24.0;
         if (r->upscale > 1.0) {
             t.small_width = (int32_t)(r->width / r->upscale) / 32 * 32;
@@ -87,13 +87,15 @@ struct FakeVideoGen : IVideoGen {
                 e.steps_done = s;
                 t.push(std::move(e));
             }
-            gen::VideoEvent a;
-            a.kind = gen::VideoEvent::AUDIO;
-            for (int i = 0; i < 3200; ++i) {
-                a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
-                a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+            if (t.channels > 0) {
+                gen::VideoEvent a;
+                a.kind = gen::VideoEvent::AUDIO;
+                for (int i = 0; i < 3200; ++i) {
+                    a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
+                    a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+                }
+                t.push(std::move(a));
             }
-            t.push(std::move(a));
             gen::VideoEvent f;
             f.kind = gen::VideoEvent::FRAMES;
             f.first = 0;
@@ -1173,6 +1175,24 @@ TEST(guidance_and_the_negative_prompt_reach_a_guided_model) {
     o = json::parse(r.body, nullptr, false);
     CHECK(!o.contains("negative_prompt"));
     v.wait(str_at(o, "id"));
+}
+
+TEST(a_video_only_model_refuses_soundtrack_options_and_finishes_an_mp4) {
+    Videos v;
+    auto& info = v.gen.inf;
+    info.channels = info.sample_rate = 0;
+    info.guidance = true;
+    info.guidance_default[0] = 1.0;
+    CHECK_EQ(v.refused(Videos::body({ { "audio_shift", 3 } })), std::string("audio_shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "audio_guidance_scale", 1 } })),
+             std::string("audio_guidance_scale"));
+
+    const HttpResponse r = v.create(Videos::body());
+    REQUIRE_EQ(r.status, 200);
+    const json video = json::parse(r.body, nullptr, false);
+    CHECK(!video.contains("audio_guidance_scale"));
+    CHECK(!video.contains("negative_prompt"));
+    CHECK_EQ(str_at(v.wait(str_at(video, "id")), "status"), std::string("completed"));
 }
 
 /* input_reference: refused by a text-only model; on a model that starts from a picture, a data URL

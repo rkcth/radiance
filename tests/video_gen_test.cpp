@@ -362,6 +362,46 @@ TEST(a_request_runs_prompt_steps_soundtrack_and_chunks_in_order) {
     CHECK_EQ(t->status(), (int)RAD_OK);
 }
 
+TEST(a_video_only_request_finishes_without_an_audio_pass) {
+    VideoFixture f;
+    f.build();
+    auto& d = f.prog.video_gen;
+    d.sample_rate = d.audio_rate = d.audio_channels = d.audio_latent_channels = 0;
+    d.audio_out = RAD_NULL_HANDLE;
+    d.shift_audio = 0;
+    d.guidance = 1;
+    d.guidance_default[0] = 1.0;
+    REQUIRE_EQ(f.start(), RAD_OK);
+
+    auto r = f.req();
+    auto ticket = r->ticket;
+    std::string why;
+    REQUIRE_EQ(f.drv.submit(std::move(r), &why), RAD_OK);
+    CHECK_EQ(ticket->channels, 0);
+    CHECK_EQ(ticket->sample_rate, 0);
+
+    std::string passes;
+    for (int i = 0; i < 10; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        passes += kind_of(b->gen);
+        CHECK_EQ(b->vgen_b->geom.n_audio, 0);
+        f.answer(i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(passes, std::string("CSSDD"));
+    CHECK_EQ(ticket->status(), RAD_OK);
+
+    gen::VideoEvent e;
+    bool timeout = false;
+    int frames = 0;
+    while (ticket->next(&e, 0, &timeout)) {
+        CHECK(e.kind != gen::VideoEvent::AUDIO);
+        if (e.kind == gen::VideoEvent::FRAMES) frames += e.n;
+    }
+    CHECK_EQ(frames, 5);
+}
+
 /* A second request is conditioned while the first waits for its first step, and denoised once the
  * first has finished: requests are denoised one after another. */
 TEST(a_second_request_is_conditioned_early_and_denoised_after_the_first) {

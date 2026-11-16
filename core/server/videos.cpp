@@ -104,6 +104,7 @@ struct Server::VideoJob {
     /* A guided model's terms as resolved against its defaults, the negative prompt when a scale
      * used it, and whether the video started from a picture. */
     bool        guided = false;
+    bool        has_soundtrack = false;
     double      guidance[8] = {};
     std::string negative;
     bool        has_negative = false;
@@ -268,7 +269,7 @@ void Server::video_caps(json& caps, const IVideoGen* gen) {
     caps["video_max_ref_audios"] = std::min(kMaxRefAudios, (int32_t)info.max_ref_audios);
     caps["video_samplers"] = json::array({ "euler", "res_multistep" });
     caps["video_shift"]       = info.shift_video;
-    caps["video_audio_shift"] = info.shift_audio;
+    if (info.channels > 0) caps["video_audio_shift"] = info.shift_audio;
 }
 
 HttpResponse Server::handle_video_create(const HttpRequest& req) {
@@ -692,6 +693,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         r->shift_video = v;
     }
     if (has(body, "audio_shift")) {
+        if (info.channels == 0)
+            return error_response(err_unsupported("audio_shift", "this model has no soundtrack"),
+                                  req.peer);
         double v = 0;
         if (!number(body["audio_shift"], &v) || !(v > 0.0) || v > 100.0)
             return bad("audio_shift", "the soundtrack schedule shift: a number in (0, 100], or "
@@ -706,6 +710,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     };
     for (int i = 0; i < 8; ++i) {
         if (!has(body, kGuide[i])) continue;
+        if (i >= 4 && info.channels == 0)
+            return error_response(err_unsupported(kGuide[i], "this model has no soundtrack"),
+                                  req.peer);
         if (!info.guidance)
             return error_response(err_unsupported(kGuide[i], "this model takes no guidance"),
                                   req.peer);
@@ -1041,9 +1048,11 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     const int64_t n_tok = (int64_t)r->tokens.size();
     const int32_t steps = r->steps;
     j->guided = info.guidance;
+    j->has_soundtrack = info.channels > 0;
     for (int i = 0; i < 8; ++i)
         j->guidance[i] = std::isnan(r->guidance[i]) ? info.guidance_default[i] : r->guidance[i];
-    j->has_negative = info.guidance && (j->guidance[0] != 1.0 || j->guidance[4] != 1.0);
+    j->has_negative = info.guidance &&
+                      (j->guidance[0] != 1.0 || (j->has_soundtrack && j->guidance[4] != 1.0));
     if (j->has_negative) j->negative = negative;
     j->from_image = !r->image.empty();
     j->decoder = decoder;
@@ -1288,7 +1297,7 @@ json Server::video_json(const VideoJob& j) {
             "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale",
             "audio_guidance_rescale",
         };
-        for (int i = 0; i < 8; ++i) o[kGuide[i]] = j.guidance[i];
+        for (int i = 0; i < (j.has_soundtrack ? 8 : 4); ++i) o[kGuide[i]] = j.guidance[i];
         if (j.has_negative) o["negative_prompt"] = j.negative;
     }
     if (j.from_image) o["input_reference"] = true;

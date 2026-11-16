@@ -1382,7 +1382,7 @@ typedef struct RadVideoGenDecl {
     /* The size and length a request that names none is made at. */
     int64_t     default_width, default_height, default_chunks;
 
-    /* The soundtrack. */
+    /* The soundtrack. All four fields are zero for a video-only model. */
     int64_t     sample_rate, audio_rate, audio_channels, audio_latent_channels;
 
     /* The sampler (above). */
@@ -1392,7 +1392,7 @@ typedef struct RadVideoGenDecl {
     /* `max_lanes` requests may hold state at once. `frames_out` is [>= the frames of the largest
      * chunk, height, width, 3] u8 on the device, the frames a VDECODE pass made, row-major RGB;
      * `audio_out` is [>= the samples of the longest soundtrack, audio_channels] f32, interleaved,
-     * what an ADECODE pass made. */
+     * what an ADECODE pass made. Set audio_out to RAD_NULL_HANDLE for video-only models. */
     int64_t     max_lanes;
     rad_buf     frames_out;
     rad_buf     audio_out;
