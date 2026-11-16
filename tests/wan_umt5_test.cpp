@@ -80,7 +80,7 @@ TEST(wan_umt5_declares_each_checkpoint_tensor_and_runs_packed_conditioning) {
         CHECK(issue.opd[3].raw == boundaries);
         CHECK_EQ(issue.opd[3].rows, 3);
         const auto& bias = builder.weights.at(issue.opd[4].handle - 1);
-        CHECK_EQ(bias.d.group.layer, layer++);
+        CHECK_EQ(bias.d.group.layer, wan::Umt5Encoder::first_weight_group + layer++);
         CHECK_EQ(bias.d.shape[0], 32);
         CHECK_EQ(bias.d.shape[1], 64);
     }
@@ -533,6 +533,11 @@ TEST(wan_video_passes_use_both_guidance_branches_and_restore_the_first_frame) {
     const auto* velocities = find_b(b, "dit.velocities");
     REQUIRE(velocities);
     CHECK_EQ(velocities->d.kind, RAD_BUF_PERSIST);
+    for (const auto& weight : b.weights) {
+        if (weight.name.rfind("umt5.block.", 0) != 0) continue;
+        CHECK_EQ(weight.d.access, RAD_ACCESS_PER_REQUEST);
+        CHECK(weight.d.group.layer > 31);
+    }
 
     float schedule[16]{}, guidance[8]{5.0f};
     uint32_t seed[4]{};

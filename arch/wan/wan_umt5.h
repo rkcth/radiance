@@ -18,6 +18,8 @@ struct Umt5Encoder {
     static constexpr int64_t vocab = 256384;
     static constexpr int64_t max_rows = 2 * rad_umt5::max_tokens;
     static constexpr int layer_count = 24;
+    // Keep request-only UMT5 units apart from the DiT's per-step layers and the VAE.
+    static constexpr int first_weight_group = 64;
 
     rad_buf encoded = 0;
 
@@ -49,7 +51,7 @@ struct Umt5Encoder {
 
         for (int i = 0; i < layer_count; ++i) {
             Layer& l = layers[i];
-            const auto group = grp_layer(i);
+            const auto group = grp_layer(first_weight_group + i);
             const char* source = names.ckpt("encoder.block.%d", i);
             const char* attn = names.ckpt("%s.layer.0.SelfAttention", source);
             const char* ffn = names.ckpt("%s.layer.1.DenseReluDense", source);
@@ -92,7 +94,7 @@ struct Umt5Encoder {
         }
         final_weight = mapped(b, names.f("umt5.final_norm.weight"),
                               {"encoder.final_layer_norm.weight"}, {width},
-                              grp_layer(layer_count));
+                              grp_layer(first_weight_group + layer_count));
         if (!final_weight) return RAD_E_INVAL;
         final_norm = declare_norm(b, final_weight, encoded);
         return final_norm.valid() ? RAD_OK : RAD_E_NOKERNEL;

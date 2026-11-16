@@ -189,6 +189,28 @@ cases. Its existing H.264 round-trip image fixture still failed at the
 PNG pixel-budget check described above. Wan's image conditioning uses
 the input image without an H.264 round trip.
 
+## Shared serving smoke test
+
+A second run served Qwen Flash Next over TP2 and Wan on rank 0, with
+Wan's UMT5 encoder in RAM. It used a 2,048-token context limit, two text
+slots, BF16 KV, and WHT6 disabled (`tp-wire: exact`). With this placement,
+40 GiB of host expert capacity failed admission and 64 GiB passed. These
+figures apply to the tested checkpoint and placement.
+
+Both MP4 files matched the standalone files byte for byte. The first
+request completed in 27.98 seconds with a cold switch into Wan, of which
+21.98 seconds were activation. The subsequent image-to-video request
+completed in 6.01 seconds with Wan active. Sampled peak VRAM was
+31.48 GiB on the generator rank and 10.02 GiB on the other rank. Minimum
+sampled available host RAM was 80.61 GiB.
+
+Text clients received output before, during, and after the two requests
+with no stream errors. The longest interval between deltas during the
+video requests was 17.66 seconds, compared with 0.12 seconds before and
+0.05 seconds after. These measurements include the cold activation in
+the video interval. The smoke test used short clips and leaves long
+context capacity and host prefix restore to a separate qualification.
+
 ## Reference and qualification checklist
 
 1. Use the existing Diffusers component loader to retain component prefixes.
