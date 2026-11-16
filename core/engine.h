@@ -273,7 +273,7 @@ private:
     /* The first of this engine's instance slots (RadBuildCtx::slot_base), held from load_plugins
      * to the destructor (rad_engine_claim); -1 while none is held. */
     int slot_base_ = -1;
-    bool cards_claimed_ = false;    /* rad_dev_cards_claim, for an engine of more than one rank */
+    bool cards_claimed_ = false;    /* rad_dev_cards_claim, balanced during teardown */
 
     /* RadModelMeta holds bare char*, so the strings behind its key/value table must outlive
      * every declare. */

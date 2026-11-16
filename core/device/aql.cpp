@@ -1319,7 +1319,7 @@ inline bool chain_bare(const Stream* s) {
  * once. Nothing advances from there: Qwen3.8-27B prefilling beside Gemma 4 12B decoding, both on
  * the same two R9700, stopped within 12 s.
  *
- * So on a card that more than one multi-card engine has claimed (a_cards_claim), a chained packet
+ * So on a card that more than one engine has claimed (a_cards_claim), a chained packet
  * keeps its barrier bit while a collective's packet may be running on its queue. Only the
  * collectives' own blocks then wait on the card for another card; everything else waiting there
  * waits for kernels that finish by themselves. An engine alone on its cards pays nothing. */

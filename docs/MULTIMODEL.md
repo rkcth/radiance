@@ -732,12 +732,13 @@ beside A's, because a prefill junction launches more blocks than a card runs at 
 advances from there. Qwen3.8-27B (IQ4R-S-V4) prefilling beside Gemma 4 12B decoding, both TP 2 on
 the same two R9700, stopped within 12 s of load, and the process then ignored its stop signal.
 
-So every engine of more than one rank claims its cards when it starts, and on a card with more than
+So every engine claims its cards when it starts, including a single-rank engine that can occupy
+wave slots beside another engine's collective. On a card with more than
 one claim a chained launch keeps its barrier bit while a collective may still run on its queue.
 Only the collectives' own blocks then wait on a card for another card, and those are few enough at
 decode to leave the other engine its slots. The claim that makes a card shared returns once
 everything issued on that card before it has finished, so nothing launched under the old rule is
-left. A model alone on its cards, or beside single-card models only, launches as before. A claim
+left. A model alone on its cards launches as before. A claim
 lasts as long as the engine does: a parked model still holds its own.
 
 With the rule the same load ran 200 s without a stop (335 requests), as did both models prefilling
