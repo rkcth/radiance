@@ -12,6 +12,7 @@
 #include "ref_ops.h"
 #include "rad_philox.h"
 #include "rad_unipc_math.h"
+#include "rad_umt5_gelu.h"
 
 #include <algorithm>
 #include <vector>
@@ -1025,9 +1026,11 @@ int ref_to_rgba8(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ gelu_tanh, scatter_add_rows */
-int ref_gelu_tanh(const RadArgs* a, RadStream) {
+template<bool Umt5>
+static int gelu_tanh(const RadArgs* a) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
+    if (Umt5 && (x->dtype != RAD_BF16 || y->dtype != RAD_BF16)) return RAD_E_DTYPE;
     const int64_t n = p_int(a, "n", 0);
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(y, n);
@@ -1036,10 +1039,16 @@ int ref_gelu_tanh(const RadArgs* a, RadStream) {
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), xs = laststride(x);
         const int64_t yb = rowoff(y, r, n), ys = laststride(y);
-        for (int64_t c = 0; c < n; ++c) stt(y, yb + c * ys, act_gelu_tanh(ldt(x, xb + c * xs)));
+        for (int64_t c = 0; c < n; ++c) {
+            const float value = ldt(x, xb + c * xs);
+            stt(y, yb + c * ys, Umt5 ? rad_umt5::gelu(value, rbf) : act_gelu_tanh(value));
+        }
     }
     return RAD_OK;
 }
+
+int ref_gelu_tanh(const RadArgs* a, RadStream) { return gelu_tanh<false>(a); }
+int ref_gelu_umt5(const RadArgs* a, RadStream) { return gelu_tanh<true>(a); }
 
 /* ------------------------------------------------------------------ gelu_quick */
 /* CLIP's quick_gelu as torch evaluates it in a reduced dtype, three stored tensors:

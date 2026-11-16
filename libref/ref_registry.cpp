@@ -1979,6 +1979,7 @@ static const RadOpSchema kSchemas[] = {
   "decoded pixels in [-1, 1] to bytes as diffusers' postprocess makes them: "
   "round(clamp(bf16(bf16(clamp(x) / 2) + 0.5), 0, 1) * 255), u8 out." },
 { "gelu_tanh", ARR(pMnD), ARR(oUnary), "the tanh approximation of gelu." },
+{ "gelu_umt5", ARR(pMnD), ARR(oUnary), "Wan UMT5's tanh GELU with BF16 intermediates." },
 { "gelu_quick", ARR(pMnD), ARR(oUnary),
   "CLIP's quick_gelu, three roundings: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)." },
 { "scatter_add_rows", ARR(pMnD), ARR(oScatterRows),
@@ -2786,6 +2787,7 @@ SIMPLE("ref_s2d_avg_add", "s2d_avg_add", "elem", "a downsampling shortcut added 
        ref_s2d_avg_add),
 SIMPLE("ref_to_rgba8", "to_rgba8", "elem", "decoded pixels to bytes", DT_FLOAT, ref_to_rgba8),
 SIMPLE("ref_gelu_tanh", "gelu_tanh", "elem", "tanh gelu", DT_FLOAT, ref_gelu_tanh),
+SIMPLE("ref_gelu_umt5", "gelu_umt5", "elem", "Wan UMT5 tanh GELU", "bf16", ref_gelu_umt5),
 SIMPLE("ref_gelu_quick", "gelu_quick", "elem", "quick gelu", DT_FLOAT, ref_gelu_quick),
 SIMPLE("ref_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", DT_FLOAT,
        ref_scatter_add_rows),

@@ -13866,6 +13866,29 @@ void attn_long_case(const Plugin& pl, const char* name, int64_t hd, int64_t nh,
 
 /* ---- SDXL's: CLIP-L's activation and the k-diffusion sampler, against a host port of libref's
  * arithmetic (libref/ref_gen.cpp). */
+void gelu_umt5_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "gelu_umt5_bf16");
+    if (!r) { ok("gelu_umt5_bf16", false, "row absent"); return; }
+    // Pinned Wan GELU.forward evaluated on PyTorch with BF16 inputs.
+    std::vector<float> input = {-4, -3.125f, -2.5f, -1.75f, -1.25f, -.875f, -.375f, 0,
+                                21, 21, 21, 21, 21, 21, 21, 21,
+                                .125f, .625f, 1.25f, 2.5f, 3.125f, 4, 0, 0};
+    auto want = input;
+    const float first[] = {-0.0f, -0.0f, -.0146484375f, -.07177734375f, -.134765625f,
+                           -.16796875f, -.1328125f, 0};
+    const float second[] = {.06884765625f, .458984375f, 1.109375f, 2.484375f, 3.125f, 4, 0, 0};
+    std::copy_n(first, 8, want.begin());
+    std::copy_n(second, 8, want.begin() + 16);
+    void* dst = up_bf16(input);
+    RadTensor x = T(up_bf16(input), RAD_BF16, {2, 8});
+    RadTensor y = T(dst, RAD_BF16, {2, 8});
+    x.stride[0] = y.stride[0] = 16;
+    const int rc = launch(r, {x, y}, {PI("M", 2), PI("n", 8), PS("dtype", "bf16")});
+    const bool exact = rc == RAD_OK && differ(down_bf16(dst, want.size()), want) == 0;
+    ok("gelu_umt5_bf16 matches the pinned fixture and preserves row padding", exact,
+       fmt("rc=%d", rc));
+}
+
 void gelu_quick_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "gelu_quick_bf16");
     if (!r) { ok("gelu_quick_bf16", false, "row absent"); return; }
@@ -32932,6 +32955,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("timestep_embed_f32")) { vg::timestep_f32_case(pl); vg::timestep_curve_case(pl); }
     if (sel("randn_lanes_f32")) vg::randn_f32_case(pl);
     if (sel("gelu_quick_bf16")) vg::gelu_quick_cases(pl);
+    if (sel("gelu_umt5_bf16")) vg::gelu_umt5_cases(pl);
     if (sel("kd_input_bf16") || sel("kd_step_bf16")) vg::kd_cases(pl);
     if (sel("interleave2_bf16")) vg::interleave2_f32_case(pl);
     if (sel("chan_affine_f32")) vg::chan_affine_cases(pl, "chan_affine_f32");

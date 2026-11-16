@@ -3405,6 +3405,14 @@ int ref_gelu_tanh_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t(D, { M, n });
     return o.finish("gelu_tanh", operand, out);
 }
+int ref_gelu_umt5_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    if (act_dt(p, n_p) != RAD_BF16) return RAD_E_DTYPE;
+    Opd o;
+    o.t(RAD_BF16, {rows, width});
+    o.t(RAD_BF16, {rows, width});
+    return o.finish("gelu_umt5", operand, out);
+}
 int ref_gelu_quick_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const uint32_t D = act_dt(p, n_p);

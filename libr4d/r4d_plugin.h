@@ -286,6 +286,7 @@ int     r4d_rad_d2s_add               (const RadArgs*, RadStream);
 int     r4d_rad_s2d_avg_add           (const RadArgs*, RadStream);
 int     r4d_rad_to_rgba8              (const RadArgs*, RadStream);
 int     r4d_rad_gelu_tanh             (const RadArgs*, RadStream);
+int     r4d_rad_gelu_umt5             (const RadArgs*, RadStream);
 int     r4d_rad_gelu_quick            (const RadArgs*, RadStream);
 int     r4d_rad_scatter_add_rows      (const RadArgs*, RadStream);
 /* r4d_audio.hip */

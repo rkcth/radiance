@@ -4056,6 +4056,7 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("s2d_avg_add", pSpaceDepth, oSpaceDepth, "a downsampling shortcut added in."),
     SCHEMA("to_rgba8", pGenMn, oGenUnary, "decoded pixels in [-1, 1] to bytes."),
     SCHEMA("gelu_tanh", pGenMn, oGenUnary, "the tanh approximation of gelu."),
+    SCHEMA("gelu_umt5", pGenMn, oGenUnary, "Wan UMT5's tanh GELU with BF16 intermediates."),
     SCHEMA("gelu_quick", pGenMn, oGenUnary,
            "CLIP's quick_gelu: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)."),
     SCHEMA("scatter_add_rows", pGenMn, oScatterAdd, "x[idx[i]] += v[i]; a negative index adds nothing."),
@@ -10341,6 +10342,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenRows8), NOTUNE,
   nullptr, nullptr, r4d_rad_gelu_tanh },
+
+{ "gelu_umt5_bf16", "gelu_umt5", "elem",
+  "Wan UMT5 tanh GELU rounded at each BF16 intermediate",
+  "row width and pitches aligned to eight elements",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenRows8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gelu_umt5 },
 
 { "gelu_quick_bf16", "gelu_quick", "elem",
   "CLIP's quick_gelu, libref's three roundings",

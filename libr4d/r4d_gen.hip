@@ -17,6 +17,7 @@
 #include "r4d_gdn_wmma.h"
 #include "r4d_q8.h"
 #include "rad_philox.h"
+#include "rad_umt5_gelu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -677,6 +678,7 @@ __global__ __launch_bounds__(kT) void gelu_quick_kernel(const T* __restrict__ x,
     }
 }
 
+template<bool Umt5>
 __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int n, int x_ld, int y_ld) {
     const int r = blockIdx.x;
@@ -686,7 +688,8 @@ __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const float v = f[j];
-            f[j] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+            if constexpr (Umt5) f[j] = rad_umt5::gelu(v, bfr);
+            else f[j] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
         }
         st8(y + (size_t)r * y_ld + c, f);
     }
@@ -1680,7 +1683,8 @@ extern "C" int r4d_rad_gelu_quick(const RadArgs* a, RadStream s) {
     return st_of(hipGetLastError());
 }
 
-extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) {
+template<bool Umt5>
+static int launch_gelu_tanh(const RadArgs* a, RadStream s) {
     const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1);
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
     if (!is_bf16(x) || !is_bf16(y)) return R4D_NO(RAD_E_DTYPE);
@@ -1688,10 +1692,13 @@ extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) {
     long long rx = 0, xl = 0, ry = 0, yl = 0;
     if (!rows8(x, n, &rx, &xl) || !rows8(y, n, &ry, &yl)) return R4D_NO(RAD_E_STRIDE);
     if (ry <= 0 || rx < ry) return R4D_NO(RAD_E_SHAPE);
-    hipLaunchKernelGGL(gelu_tanh_kernel, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
+    hipLaunchKernelGGL(gelu_tanh_kernel<Umt5>, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
                        (const uint16_t*)x->data, (uint16_t*)y->data, (int)n, (int)xl, (int)yl);
     return st_of(hipGetLastError());
 }
+
+extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) { return launch_gelu_tanh<false>(a, s); }
+extern "C" int r4d_rad_gelu_umt5(const RadArgs* a, RadStream s) { return launch_gelu_tanh<true>(a, s); }
 
 extern "C" int r4d_rad_scatter_add_rows(const RadArgs* a, RadStream s) {
     const RadTensor *v = r4d_opt(a, 0), *idx = r4d_opt(a, 1), *x = r4d_opt(a, 2);

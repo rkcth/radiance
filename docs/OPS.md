@@ -1336,6 +1336,7 @@ says which (`libref/ref_gen.cpp`).
 | `s2d_avg_add` | `M`(range) `cin` `cout` `ft` `dtype` | `x`, `y`:inout |
 | `to_rgba8` | `M`(range) `n` `dtype` | `x` → `y` |
 | `gelu_tanh` | `M`(range) `n` `dtype` | `x` → `y` |
+| `gelu_umt5` | `M`(range) `n` `dtype` | BF16 `x` → BF16 `y` with Wan UMT5's intermediate rounding |
 | `scatter_add_rows` | `M`(range) `n` `dtype` | `v`, `idx`, `x`:inout |
 | `attn_prefix_self` | `q_len` `head_dim` `gqa` `block_size`/der `causal` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `qk`/opt `pv`/opt | `q`, `k`, `v`, `kv_cache`?, `block_table`?, `seqused`?, `cu_seqlens`, `k_descale`?, `v_descale`?, `k_i8`?, `k_scale`? → `out`, `v_scale`? |
 

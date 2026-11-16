@@ -57,6 +57,23 @@ Both paths had a maximum absolute error of `0.001953125`. The GPU regression
 also covers a full 512-token sequence, direction-specific bias, and untouched
 padding in pitched buffers. These checks precede the full encoder graph.
 
+The conditioning graph declares all 24 UMT5 blocks and maps them to the
+242 BF16 source tensors. The names, dimensions, and dtype were checked
+against the three downloaded safetensors headers. The recording test
+checks the per-layer relative bias, QKV slice offsets, and buffer lifetimes
+with a positive and a negative prompt in the same pass. UMT5 rounds the
+normalized rows before applying the learned gain. Its separate GELU op
+also preserves the intermediate BF16 rounding in Wan's eager expression.
+
+A GPU probe ran all 315 recorded operations with real BF16 weights and
+two packed prompts of 13 and 14 tokens including EOS. On one R9700, the
+27 × 4096 final embedding values were compared with the pinned Wan
+encoder running each prompt separately on PyTorch's CPU backend. The
+minimum per-token cosine similarity was `0.995916`. Relative RMSE across
+all values was `2.53%` and maximum absolute difference was `0.03125`.
+This probe executes the encoder subgraph. The video API still needs the
+transformer's text projection, denoiser, and VAE.
+
 1. Use the existing Diffusers component loader to retain component prefixes.
    Verify the transformer, UMT5 encoder, tokenizer, VAE, and sampler metadata
    against the pinned model. The transformer uses 30 blocks, width 3072,

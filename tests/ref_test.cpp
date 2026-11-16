@@ -1314,7 +1314,7 @@ TEST(op_vocabulary) {
          * sampler state, the VAE's convolutions and shortcuts, attention over a cached prefix. */
         "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
         "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "im2col_nhwc", "l2norm_chan",
-        "d2s_add", "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
+        "d2s_add", "s2d_avg_add", "to_rgba8", "gelu_tanh", "gelu_umt5", "scatter_add_rows", "attn_prefix_self",
         /* SDXL's (arch/sdxl): CLIP-L's activation and the k-diffusion sampler over a
          * discrete-time denoiser. */
         "gelu_quick", "kd_input", "kd_step",
@@ -7186,6 +7186,20 @@ TEST(gelu_tanh_is_the_tanh_approximation) {
     }
 }
 
+TEST(gelu_umt5_preserves_wan_bf16_rounding) {
+    const std::vector<float> input = {-4, -3.125f, -2.5f, -1.75f, -1.25f, -.875f, -.375f, 0,
+                                      .125f, .625f, 1.25f, 2.5f, 3.125f, 4};
+    // Official Wan GELU.forward on PyTorch 2.8.0 with BF16 input.
+    const std::vector<float> expected = {-0.0f, -0.0f, -.0146484375f, -.07177734375f, -.134765625f,
+                                         -.16796875f, -.1328125f, 0, .06884765625f, .458984375f,
+                                         1.109375f, 2.484375f, 3.125f, 4};
+    T x(RAD_BF16, {2, 7}); x.f(input);
+    T y(RAD_BF16, {2, 7});
+    A a; a.t(x).t(y).i("M", 2).i("n", 7).s("dtype", "bf16");
+    CHECK_OK(run("gelu_umt5", a));
+    for (size_t i = 0; i < expected.size(); ++i) CHECK_EQ(y.at(i), expected[i]);
+}
+
 /* scatter_add_rows adds into the indexed rows, skips a negative index, and refuses an index past
  * the destination before writing anything. */
 TEST(scatter_add_rows_accumulates_skips_and_refuses) {
@@ -10632,6 +10646,7 @@ std::vector<Geo> geometries() {
         G("s2d_avg_add", "M", 16, a.i("M", R).i("cin", 2).i("cout", 4).i("ft", 1).s("dtype", "bf16")),
         G("to_rgba8", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("gelu_tanh", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("gelu_umt5", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("gelu_quick", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("scatter_add_rows", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("attn_prefix_self", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
