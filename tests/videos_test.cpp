@@ -11,6 +11,9 @@
 
 #include "gen/video.h"
 #include "mm/media.h"
+#include "server/front.h"
+#include "cpp-httplib/httplib.h"
+
 
 #include <chrono>
 #include <thread>
@@ -20,6 +23,8 @@ namespace {
 struct FakeVideoGen : IVideoGen {
     VideoGenInfo inf;
     int         finish_status = RAD_OK;
+    int         submit_status = RAD_OK;
+    bool        hold_completion = false;
     std::string finish_why;
     std::vector<std::unique_ptr<gen::VideoRequest>> got;
     mutable std::mutex got_m;
@@ -54,6 +59,7 @@ struct FakeVideoGen : IVideoGen {
     }
     const VideoGenInfo& info() const override { return inf; }
     int submit(std::unique_ptr<gen::VideoRequest> r, std::string*) override {
+        if (submit_status < 0) return submit_status;
         std::lock_guard<std::mutex> lk(got_m);
         gen::VideoTicket& t = *r->ticket;
         /* Three frames of the request's size and a tenth of a second of sound, whatever it asked:
@@ -99,7 +105,7 @@ struct FakeVideoGen : IVideoGen {
             for (size_t i = 0; i < f.rgb.size(); ++i) f.rgb[i] = (uint8_t)(i * 7);
             t.push(std::move(f));
         }
-        t.finish(finish_status, finish_why);
+        if (!hold_completion) t.finish(finish_status, finish_why);
         got.push_back(std::move(r));
         return RAD_OK;
     }
@@ -1161,6 +1167,112 @@ TEST(input_reference_takes_the_models_h264_round_trip) {
     REQUIRE_EQ(mm::h264_roundtrip(in, 18, &out, &why), (int)RAD_OK);
     CHECK_EQ(out.w, 6);
     CHECK_EQ(out.h, 4);
+}
+
+TEST(a_fleet_video_holds_its_model_until_the_result_is_kept) {
+    if (!mm::decoder_available()) SKIP("this build has no video codec support");
+    Front front(TransportOptions{}, 0);
+    FakeVideoGen gen;
+    gen.hold_completion = true;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& options, Deps& deps) {
+        options.model_id = "fleet-video";
+        options.video_model = true;
+        deps.videos = &gen;
+        deps.front = &front;
+    }});
+    front.attach("fleet-video", {}, f.srv.get());
+    gen.submit_status = RAD_E_DEVICE;
+    CHECK_EQ(f.post("/v1/videos", Videos::body().dump()).status, 503);
+    CHECK_EQ(front.activity("fleet-video").leases, 0);
+    gen.submit_status = RAD_OK;
+    const HttpResponse created = f.post("/v1/videos", Videos::body().dump());
+    REQUIRE_EQ(created.status, 200);
+    HttpRequest poll;
+    poll.path = "/v1/videos/" + str_at(json::parse(created.body), "id");
+    const int64_t active_leases = front.activity("fleet-video").leases;
+    const bool detached_before_completion = front.detach("fleet-video", 0);
+    CHECK_EQ(f.get(poll.path.c_str()).status, 200);
+    gen.last().ticket->finish(RAD_OK, {});
+    REQUIRE(front.detach("fleet-video", 5000));
+    const Handler kept = front.kept_job(poll);
+    REQUIRE(kept);
+    const json result = json::parse(kept(poll).body);
+    if (str_at(result, "status") == "failed" &&
+        has(str_at(result["error"], "message"), "no libavcodec"))
+        SKIP("this build has no libavcodec to write the video");
+    CHECK_EQ(active_leases, 1);
+    CHECK(!detached_before_completion);
+    REQUIRE_EQ(str_at(result, "status"), "completed");
+    poll.path += "/content";
+    CHECK_EQ(kept(poll).status, 200);
+}
+
+
+TEST(video_job_routes_skip_a_cold_default_and_survive_the_owner_draining) {
+    if (!mm::decoder_available()) SKIP("this build has no video codec support");
+    TransportOptions options;
+    options.host = "127.0.0.1";
+    options.port = 0;
+    options.n_threads = 2;
+    Front front(options, 0);
+    std::atomic<int> demands{0};
+    front.add("cold-text", {"default"}, 5, false);
+    front.set_demand([&](const std::string&) { ++demands; });
+    Fixture text;
+    front.attach("resident-text", {}, text.srv.get());
+    FakeVideoGen gen;
+    gen.hold_completion = true;
+    Fixture video(Fixture::Tweak{[&](ServerOptions& o, Deps& deps) {
+        o.model_id = "video-owner";
+        o.video_model = true;
+        deps.videos = &gen;
+        deps.front = &front;
+    }});
+    front.attach("video-owner", {}, video.srv.get());
+    std::thread listener([&] { front.run(); });
+    struct StopListener {
+        Front& front;
+        std::thread& thread;
+        ~StopListener() { front.stop(); thread.join(); }
+    } stop{front, listener};
+    for (int i = 0; i < 200 && front.port() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(front.port() > 0);
+    httplib::Client client("127.0.0.1", front.port());
+    client.set_read_timeout(5, 0);
+    json request = Videos::body({{"model", "video-owner"}});
+    const auto created = client.Post("/v1/videos", request.dump(), "application/json");
+    REQUIRE(created);
+    REQUIRE_EQ(created->status, 200);
+    const std::string path = "/v1/videos/" + str_at(json::parse(created->body), "id");
+    const uint64_t uses = front.activity("video-owner").uses;
+    auto poll = client.Get(path.c_str());
+    REQUIRE(poll);
+    CHECK_EQ(poll->status, 200);
+    CHECK(!front.detach("video-owner", 0));
+    poll = client.Get(path.c_str());
+    REQUIRE(poll);
+    CHECK_EQ(poll->status, 200);
+    CHECK_EQ(front.activity("video-owner").uses, uses);
+    gen.last().ticket->finish(RAD_OK, {});
+    REQUIRE(front.detach("video-owner", 5000));
+    poll = client.Get(path.c_str());
+    REQUIRE(poll);
+    CHECK_EQ(poll->status, 200);
+    const json completed = json::parse(poll->body);
+    if (str_at(completed, "status") == "failed" &&
+        has(str_at(completed["error"], "message"), "no libavcodec"))
+        SKIP("this build has no libavcodec to finish the video");
+    CHECK_EQ(str_at(completed, "status"), "completed");
+    const auto content = client.Get((path + "/content").c_str());
+    REQUIRE(content);
+    CHECK_EQ(content->status, 200);
+    CHECK(!content->body.empty());
+    const auto missing = client.Get("/v1/videos/unknown-job");
+    REQUIRE(missing);
+    CHECK_EQ(missing->status, 404);
+    CHECK_EQ(demands.load(), 0);
+    CHECK(front.activity("cold-text").state == Front::State::Cold);
 }
 
 RAD_TEST_MAIN()

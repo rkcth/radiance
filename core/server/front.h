@@ -135,6 +135,10 @@ public:
     /* Every model's name, in the order added. */
     std::vector<std::string> names() const;
 
+    /* A job accepted on a leased server outlives the create response. Retain the model until
+     * the job finishes and keep_job owns its response. A leased server may be draining. */
+    std::shared_ptr<void> hold_active_job(const Server* server);
+
     /* A finished job of a model (a video, a shape), named by its id in the path (/v1/videos/{id},
      * /status/{id}). The model's memory may go at any moment after it finishes, and with it the
      * server that made the job, so from here on `answer` serves every request naming that id, and
@@ -155,6 +159,7 @@ public:
 
     /* Blocks serving until stop(). */
     int  run();
+    int  port() const { return transport_.port(); }
     void stop();
     bool stopping() const { return stopping_.load(std::memory_order_acquire); }
 
@@ -233,7 +238,7 @@ private:
     HttpResponse metrics(const HttpRequest& q);
     void         install_routes(const Router& model_router);
     /* Leases on every Open entry, for the fleet-wide routes. */
-    std::vector<std::pair<Entry*, std::shared_ptr<void>>> hold_open();
+    std::vector<std::pair<Entry*, std::shared_ptr<void>>> hold_open(bool include_draining_jobs = false);
 
     TransportOptions      topts_;
     int64_t               keepalive_ms_ = 0;
