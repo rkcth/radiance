@@ -211,6 +211,76 @@ video requests was 17.66 seconds, compared with 0.12 seconds before and
 the video interval. The smoke test used short clips and leaves long
 context capacity and host prefix restore to a separate qualification.
 
+## Long-context deployment constraints
+
+The two-card fleet can give Wan its own TP1 model entry while Qwen Flash
+Next stays on TP2. Set `vision-tower-placement: ram` on the Wan entry.
+`video-tower-placement` applies when the text engine owns a shared media
+queue. A fleet video request names the Wan entry in `model`. Polling and
+downloading use the returned job ID, including when a text entry has the
+`default` alias.
+
+The old FP8 KV setting and block-FP8 Qwen Image package were rejected by
+the 2.1 test build. The fleet run used INT8 KV and kept the 200,000-token
+context limit, eight sequence slots, the 16 GiB RAM prefix tier, and the
+same Qwen chat template and speculative depth. Under the shared queue,
+putting both Wan and Qwen Image IQ8R on the same generator rank left room
+for only 112,068 text KV tokens. A configured 200,000-token limit does not
+guarantee that the live KV pool fits a prompt of that length. The separate
+Wan fleet entry and an explicit 13,600 MiB per-card text budget raised
+the measured text pool capacity to 1,071,224 tokens on this pair of cards.
+
+```yaml
+memory:
+  host-headroom-mib: 8192
+  gpu-headroom-mib: 384
+scheduler:
+  warm-up: false
+  load-timeout: 180s
+models:
+  qwen-flash-next:
+    model: /models/qwen-flash-next.rad
+    aliases: [default]
+    tp: 2
+    pin: true
+    priority: 100
+    placement: expert_tiered
+    host-pool-mib: 65536
+    gpu-memory-mib: 13600
+    ngram-placement: disk
+    vision-tower-placement: ram
+    kv-cache-dtype: i8
+    prefix-cache-mib: 16384
+    max-model-len: 200000
+    max-num-seqs: 8
+    max-num-batched-tokens: 2048
+    tp-wire: wht6
+    num-speculative-tokens: 4
+    draft-window: adaptive
+  wan-2.2-ti2v-5b-bf16:
+    model: /models/wan-2.2-ti2v-5b-bf16.rad
+    tp: 1
+    park: {ram: never}
+    max-num-seqs: 1
+    vision-tower-placement: ram
+    image-gen-max-pixels: 1048576
+    image-gen-max-refs: 1
+```
+
+Use the existing chat template override if the Flash Next checkpoint
+requires one. The 64 GiB expert pool is shared by the two text ranks.
+The 13,600 MiB limit applies to each text rank. The rest of each card is
+available to the fleet, subject to its headroom. The example leaves Wan
+cold until a request names it.
+
+In the first run with that budget, eight cold requests processed
+1,001,342 prompt tokens in 229 seconds. The longest prompt had 197,709
+tokens. All eight finished prefixes reached host RAM. On the return
+run, all eight were live together, with 1,007,444 KV tokens in use as
+Wan finished denoising a 512 × 320 clip. Both video and text stopped
+advancing at the VAE decode stage. The watchdog shut down the isolated
+process. This run does not qualify concurrent video for deployment.
+
 ## Reference and qualification checklist
 
 1. Use the existing Diffusers component loader to retain component prefixes.
