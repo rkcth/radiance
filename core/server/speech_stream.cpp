@@ -118,12 +118,12 @@ void Server::handle_speech_stream(const HttpRequest& req, WsConn& ws) {
         ws.close(close_code, reason);
     };
     if (stopping_.load()) return refuse("the server is shutting down", 1001, "shutting down");
-    if (!deps_.audio || !deps_.tok)
+    if (!deps_.audio)
         return refuse("/v1/audio/speech/stream requires an audio generation model; this one "
                       "makes none", 1008, "model not supported");
     /* A session speaks one sentence at a time: more sessions than the generator has lanes would
      * only queue. */
-    const int64_t cap = std::max<int64_t>(1, deps_.audio->info().max_lanes);
+    const int64_t cap = std::max<int64_t>(1, deps_.audio.gen->info().max_lanes);
     if (speech_sessions_.fetch_add(1) >= cap) {
         speech_sessions_.fetch_sub(1);
         return refuse(fmt("this server holds %lld speech sessions at once; try again later",
@@ -195,7 +195,7 @@ void Server::speech_stream_run(SpeechSession& s, WsConn& ws) {
 }
 
 bool Server::speech_stream_loop(SpeechSession& s, WsConn& ws) {
-    const AudioGenInfo& info = deps_.audio->info();
+    const AudioGenInfo& info = deps_.audio.gen->info();
     auto send = [&](const ojson& o) { ws.send(json_dump(o)); };
     auto error = [&](const std::string& why, const std::string& param = std::string()) {
         ojson o = event("error");
@@ -262,7 +262,8 @@ bool Server::speech_stream_loop(SpeechSession& s, WsConn& ws) {
         /* The request fields as every sentence will be made with them, tried on a stand-in. */
         std::unique_ptr<gen::AudioRequest> probe;
         ApiError err;
-        if (speech_request(fields, "a", &probe, &err) < 0) return error(err.message, err.param);
+        if (speech_request(*deps_.audio.gen, *deps_.audio.tok, fields, "a", &probe, &err) < 0)
+            return error(err.message, err.param);
         s.fields = std::move(fields);
         s.split = split;
         s.stream_audio = stream_audio;
@@ -355,14 +356,14 @@ bool Server::speech_stream_loop(SpeechSession& s, WsConn& ws) {
         send(o);
         std::unique_ptr<gen::AudioRequest> r;
         ApiError err;
-        if (speech_request(s.fields, text, &r, &err) < 0) {
+        if (speech_request(*deps_.audio.gen, *deps_.audio.tok, s.fields, text, &r, &err) < 0) {
             error(err.message, err.param);
             return done(true);
         }
         r->ticket = std::make_shared<gen::AudioTicket>();
         std::shared_ptr<gen::AudioTicket> ticket = r->ticket;
         std::string why;
-        const int st = deps_.audio->submit(std::move(r), &why);
+        const int st = deps_.audio.gen->submit(std::move(r), &why);
         if (st < 0) {
             error(why.empty() ? std::string(rad_strerror(st)) : why);
             return done(true);

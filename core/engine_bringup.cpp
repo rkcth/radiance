@@ -5,6 +5,7 @@
  * Separate from engine.cpp (the hot step loop), with which it shares only the Engine's fields.
  */
 #include "engine_priv.h"
+#include "service.h"
 #include "rad_internal.h"
 #include "engine_hostmem.h"
 #include "kld.h"
@@ -156,14 +157,14 @@ static MissReport miss_report(const Program& p, bool host_backend) {
 }
 
 /* ================================================================== 1. devices */
-/* Choose the devices. An integrated GPU appears as its own HIP device with system RAM as VRAM, and
- * a rank placed on one runs slowly and wrongly. So the engine uses the discrete cards if any
- * (integrated only on an APU-only machine), restricted to the first one's arch, and reports only
- * what it skipped. ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES control what the runtime exposes.
+/* Explicit ordinals bind ranks in order to visible devices of the same architecture.
+ * Automatic selection prefers discrete cards and keeps the first selected architecture.
+ * ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES control what the runtime exposes.
  *
  * `names` receives every device's product name by index ("" if unreadable), for
  * Engine::identify_devices, so the properties are read only once. */
-static int usable_devices(std::vector<int>* out, std::string* inventory, std::string* note,
+static int usable_devices(const std::vector<int>& requested, std::vector<int>* out,
+                          std::string* inventory, std::string* note,
                           std::vector<std::string>* names) {
     const int n = rad_dev_count();
     if (n <= 0) return RAD_E_DEVICE;
@@ -183,6 +184,27 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
         any_discrete |= !igpu;
     }
 
+    *inventory = fmt("%s backend, %d device(s) [%s]", device_backend_name(), n, inv.c_str());
+    if (!requested.empty()) {
+        std::string arch;
+        for (int ordinal : requested) {
+            const auto it = std::find_if(all.begin(), all.end(),
+                                         [ordinal](const D& d) { return d.i == ordinal; });
+            if (it == all.end()) {
+                RAD_ERR("--device-ordinal %d is unavailable [%s]", ordinal, inventory->c_str());
+                return RAD_E_DEVICE;
+            }
+            if (!out->empty() && arch != it->arch) {
+                RAD_ERR("--device-ordinal %d has architecture '%s'; rank 0 uses '%s'",
+                        ordinal, it->arch.c_str(), arch.c_str());
+                return RAD_E_DEVICE;
+            }
+            arch = it->arch;
+            out->push_back(it->i);
+        }
+        return RAD_OK;
+    }
+
     std::string want;              /* the first taken device's arch; all ranks must match */
     std::string use, skip;
     for (const D& d : all) {
@@ -192,7 +214,6 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
         into += fmt("%s%d:%s", into.empty() ? "" : " ", d.i, d.arch.c_str());
         if (take) out->push_back(d.i);
     }
-    *inventory = fmt("%s backend, %d device(s) [%s]", device_backend_name(), n, inv.c_str());
 
     /* The backend already printed the inventory (core/device/dispatch.cpp); note only devices
      * skipped by the filter. */
@@ -209,7 +230,7 @@ int Engine::usable_cards(std::vector<int>* out) {
     std::string inventory, note;
     std::vector<std::string> names;
     out->clear();
-    return usable_devices(out, &inventory, &note, &names);
+    return usable_devices({}, out, &inventory, &note, &names);
 }
 
 /* A /proc/meminfo field ("MemTotal", "MemAvailable") in bytes, or -1 when absent. */
@@ -581,22 +602,24 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     for (int64_t b : tower_bytes) tower_max = std::max(tower_max, b);
     const TablePlacement tw = cfg_.tower_placement;
     if (tw == TablePlacement::Ram) {
+        const char* flag = service_role_ == ServiceRole::Generator && ranks_[0]->program.is_video_generator()
+                         ? "--video-tower-placement" : "--vision-tower-placement";
         if (tower_max == 0) {
             if (cfg_.mm_max_patches == 0)
-                RAD_ERR("--vision-tower-placement ram: --mm-max-patches 0 asked for no media, so "
-                        "this server declares no encoder tower to place");
+                RAD_ERR("%s ram: --mm-max-patches 0 asked for no media, so "
+                        "this server declares no encoder tower to place", flag);
             else
-                RAD_ERR("--vision-tower-placement ram: this model has no encoder tower (no weight "
-                        "its architecture reads once per request)");
+                RAD_ERR("%s ram: this model has no encoder tower (no weight "
+                        "its architecture reads once per request)", flag);
             return RAD_E_INVAL;
         }
         std::string why;
         const int64_t pin = (int64_t)cfg_.tp * align_up(tower_max, (int64_t)MiB);
         if (!lockable_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
                            host_margin_bytes(), false, &why)) {
-            RAD_ERR("--vision-tower-placement ram: the encoder towers (%s a rank, pinned on every "
-                    "rank) cannot be held in host memory: %s. Use vram.", humanb(tower_max).c_str(),
-                    why.c_str());
+            RAD_ERR("%s ram: the encoder towers (%s a rank, pinned on every "
+                    "rank) cannot be held in host memory: %s. Use vram.", flag,
+                    humanb(tower_max).c_str(), why.c_str());
             return RAD_E_NOMEM;
         }
     }
@@ -796,9 +819,11 @@ WeightSourceFn Engine::sources() const {
 }
 
 int Engine::read_metadata() {
-    if (!is_container(cfg_.model)) return read_checkpoint_metadata();
-    file_ = std::make_unique<RadFile>();
-    RAD_TRY(file_->open(cfg_.model.c_str()));
+    if (!file_) {
+        if (!is_container(cfg_.model)) return read_checkpoint_metadata();
+        file_ = std::make_shared<RadFile>();
+        RAD_TRY(file_->open(cfg_.model.c_str()));
+    }
 
     const RadFileHeader& h = file_->header();
     meta_ = RadModelMeta{};
@@ -949,10 +974,11 @@ int Engine::apply_rope_scaling() {
 }
 
 /* ================================================================== 3 + 4. plugins, declare */
-int Engine::load_plugins() {
+int Engine::load_plugins(const std::string& tune_machine) {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
                                    meta_.arch_id, meta_.quant ? meta_.quant : "", &plugins_,
-                                   ckpt_ && ckpt_->imports() != Checkpoint::Import::None);
+                                   ckpt_ && ckpt_->imports() != Checkpoint::Import::None,
+                                   reuse_registry_, tune_machine);
     if (s < 0) {
         /* rad_tools_load_plugins already logged why. A checkpoint whose quantisation the import
          * refused keeps the tool's descriptor, which no plugin claims; the refusal is the reason. */
@@ -972,6 +998,13 @@ int Engine::load_plugins() {
         reg_->set_tp_group(base);
     }
     const Plugin* ap = reg_->plugin(plugins_.arch_plugin);
+    /* Shared replacement still reserves the other live roles' architecture identities. Fleet's
+     * independent multi-instance path has no such reservations and uses the slot claim above. */
+    if (ap && occupied_arch_plugins_.count(plugins_.arch_plugin)) {
+        RAD_ERR("shared service requires distinct architecture plugins: '%s' holds per-rank model state",
+                plugins_.arch_plugin.c_str());
+        return RAD_E_UNSUPPORTED;
+    }
     arch_step_ = ap ? ap->arch_step : nullptr;
     arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
     return RAD_OK;
@@ -1444,6 +1477,7 @@ int Engine::declare() {
             LoraDeclare ld;
             ld.cfg = &cfg_.lora;
             ld.targets = lora_targets_;
+            ld.image_only = service_role_ == ServiceRole::Generator;
             ld.sites_out = &r->lora_sites;
             st[(size_t)ri] = rad_tools_declare(plugins_, meta_, bc, &r->program,
                                                [this, ri](RadBuilder* bb, int64_t lw) {
@@ -1662,6 +1696,7 @@ void Engine::probe_arena_levels() {
                     LoraDeclare ld;
                     ld.cfg = &cfg_.lora;
                     ld.targets = lora_targets_;
+                    ld.image_only = service_role_ == ServiceRole::Generator;
                     const int st = rad_tools_declare(plugins_, meta_, bc, &probe,
                                                      [this, &r](RadBuilder* bb, int64_t lw) {
                                                          return declare_sampler(r.index, bb, lw,
@@ -1715,7 +1750,7 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
     return RAD_OK;
 }
 
-int Engine::plan() {
+int Engine::resolve_memory_budget() {
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
      * writes it into Config; per-rank resolution would let rank 1 measure a card rank 0 already
@@ -1762,7 +1797,7 @@ int Engine::plan() {
             /* The expert prefetch's stream, ring and buffers, when it can run: experts in a pinned
              * pool, one rank, not --deterministic, and a spare DMA engine (asked before the free
              * reading below, so its queue is already counted there). */
-            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic && cfg_.tp == 1 &&
+            if (wf.routed && wf.expert_unit_max > 0 && !shared_ && !cfg_.deterministic && cfg_.tp == 1 &&
                 (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
                 /* Routed layers counted as Ctx::bind_routing does, including a head past the trunk. */
                 int64_t nl = r->program.meta.n_layers;
@@ -1775,6 +1810,12 @@ int Engine::plan() {
             rad_dev_props(r->device, &props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            if (service_role_ == ServiceRole::PrimaryText) {
+                const int64_t growth = shared_->image_reserve_bytes(r->index);
+                f.free = std::max<int64_t>(0, f.free - growth);
+                RAD_INFO("shared image memory: rank %d reserves %s for image KV, lazy allocations and alternate checkpoints",
+                         r->index, humanb(growth).c_str());
+            }
             /* Unified memory: the pinned host pool is the same RAM as the card, so the
              * budget charges it against the one ledger. */
             f.unified     = props.unified != 0;
@@ -2152,8 +2193,27 @@ int Engine::plan() {
                          ? fmt(", and %lld MiB stay unclaimed", (long long)rs.unusable_mib).c_str()
                          : "");
         }
+        if (service_role_ == ServiceRole::Generator) {
+            shared_image_footprint_.clear();
+            for (size_t i = 0; i < facts.size(); ++i) {
+                const auto& f = facts[i];
+                const auto& rc = rank_cfg_[i];
+                /* Queue accounting uses the same minimum allowance for startup and replacement.
+                 * Physical free memory is checked independently by the budget resolver. */
+                const int64_t queues = f.n_queues * std::max<int64_t>(f.queue_bytes, 64 * kMiB);
+                const int64_t kv_mib = ranks_[i]->program.kv_groups.size() > 1 ? rc.vram_kv_mib : 0;
+                shared_image_footprint_.push_back((rc.vram_weights_mib + kv_mib) * kMiB +
+                                                  f.arena + f.staging + vb.stage + queues);
+            }
+            RAD_TRY(shared_->check_image_footprint(shared_image_footprint_));
+        }
+
     }
 
+    return RAD_OK;
+}
+
+int Engine::allocate_weight_pools() {
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
         /* This rank's own split: cfg_ field for field unless the block above re-split it. */
@@ -2167,7 +2227,15 @@ int Engine::plan() {
 
         /* Every pool is budgeted explicitly, with no profiling pass or utilisation fraction
          * (spec §6). Pools refuses by name and amount rather than shrinking anything. */
-        int s = r->pools.configure(rc, props.vram_bytes);
+        const bool needs_kv = r->program.kv_groups.size() > 1;
+        Config pool_config;
+        const Config* budget = &rc;
+        if (!needs_kv) {
+            pool_config = rc;
+            pool_config.vram_kv_mib = 0;
+            budget = &pool_config;
+        }
+        int s = r->pools.configure(*budget, props.vram_bytes, nullptr, nullptr, needs_kv);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
         if (s < 0) {
             report_pool_refusal(r->index, r->device, r->pools, rc);
@@ -2604,7 +2672,7 @@ public:
     }
     ~RelayoutPool() {
         finish();
-        for (StagedWeight& s : items_) if (s.own) delete[] s.in;
+        for (StagedWeight& s : items_) if (s.own) ::munmap(s.in, (size_t)s.in_bytes);
         if (region_) ::munmap(region_, (size_t)budget_);
     }
 
@@ -2612,9 +2680,16 @@ public:
      * would page-fault every 4 KiB, which dominates load CPU time. An input with no hole its size
      * (larger than the budget, or fragmentation) gets its own allocation. */
     void start(int threads, int64_t budget) {
-        budget_ = budget;
-        void* p = ::mmap(nullptr, (size_t)budget_, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        for (const auto& weight : items_) {
+            const int64_t remaining = budget - budget_;
+            if (weight.in_bytes >= remaining) {
+                budget_ = budget;
+                break;
+            }
+            budget_ += std::min(remaining, align_up(weight.in_bytes, kHole));
+        }
+        void* p = budget_ ? ::mmap(nullptr, (size_t)budget_, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : MAP_FAILED;
         if (p != MAP_FAILED) {
             region_ = (uint8_t*)p;
             ::madvise(p, (size_t)budget_, MADV_HUGEPAGE);
@@ -2627,7 +2702,8 @@ public:
                 any = true;
                 devs = std::max(devs, w.device + 1);
             }
-        ring_.start(devs, any);
+        ring_devices_ = devs;
+        ring_needed_ = any;
         for (int t = 0; t < threads; ++t) threads_.emplace_back([this] { worker(); });
     }
 
@@ -2816,6 +2892,9 @@ public:
 
     bool failed() const { return failed_; }
     int64_t peak() const { return peak_; }
+    int64_t budget() const { return budget_; }
+    static constexpr int64_t upload_ring_bytes() { return PinRing::kBytes; }
+
 
 private:
     void worker() {
@@ -2838,21 +2917,29 @@ private:
                 }
             }
             if (cp) {
+                int st = RAD_E_STATE;
                 if (!failed_) {
-                    if (c.direct) relay_direct(c);
-                    else take(c);
+                    if (c.direct) { relay_direct(c); st = RAD_OK; }
+                    else st = take(c);
                 }
                 std::lock_guard<std::mutex> lk(mu_);
+                if (st < 0 && !failed_) { failed_ = true; status_ = st; room_.notify_all(); }
                 --out_[(size_t)c.slot];
                 drained_.notify_all();
                 continue;
             }
             StagedWeight& s = items_[(size_t)i];
-            if (!failed_) input(i);
             const uint8_t* src[RAD_ENC_MAX_PLANES] = {};
-            for (int k = 0; k < s.prog->weights[s.wi].n_sel; ++k) src[k] = s.in + s.plane_off[k];
-            const int st = failed_ ? RAD_E_STATE : run(s, src);
-            if (s.own) { delete[] s.in; s.in = nullptr; s.own = false; }
+            const bool ready = !failed_ && input(i);
+            if (ready)
+                for (int k = 0; k < s.prog->weights[s.wi].n_sel; ++k)
+                    src[k] = s.in + s.plane_off[k];
+            const int st = failed_ ? RAD_E_STATE : ready ? run(s, src) : RAD_E_NOMEM;
+            if (s.own) {
+                ::munmap(s.in, (size_t)s.in_bytes);
+                s.in = nullptr;
+                s.own = false;
+            }
             std::lock_guard<std::mutex> lk(mu_);
             if (s.in) give_back(s.in - region_, align_up(s.in_bytes, kHole));
             s.in = nullptr;
@@ -2879,7 +2966,10 @@ private:
                     return;
                 }
             }
-            s.in = new uint8_t[(size_t)s.in_bytes];
+            void* spill = ::mmap(nullptr, (size_t)s.in_bytes, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (spill == MAP_FAILED) return;
+            s.in = static_cast<uint8_t*>(spill);
             s.own = true;
         });
         return s.in;
@@ -2901,11 +2991,20 @@ private:
 
     /* Copy each piece of the run that falls in the copy's file range: dense in the destination,
      * one row of a column share at a time. */
-    void take(const Copy& c) {
+    int take(const Copy& c) {
         const LoadRun& q = c.q;
-        uint8_t* base = q.stage >= 0 ? input(q.stage) + (intptr_t)q.dst : q.dst;
+        int64_t first = c.j0 > q.foff && q.sp > 0 ? (c.j0 - q.foff) / q.sp : 0;
+        if (q.foff + first * q.sp + q.wb <= c.j0) ++first;
+        /* A slice lying wholly in a stride gap does not own any input bytes. */
+        if (first >= q.ny || q.foff + first * q.sp >= c.j1) return RAD_OK;
+        uint8_t* base = q.dst;
+        if (q.stage >= 0) {
+            base = input(q.stage);
+            if (!base) return RAD_E_NOMEM;
+            base += (intptr_t)q.dst;
+        }
         int64_t got = 0;
-        for (int64_t y = c.j0 > q.foff && q.sp > 0 ? (c.j0 - q.foff) / q.sp : 0; y < q.ny; ++y) {
+        for (int64_t y = first; y < q.ny; ++y) {
             const int64_t ps = q.foff + y * q.sp;
             if (ps >= c.j1) break;
             const int64_t lo = ps > c.j0 ? ps : c.j0;
@@ -2915,6 +3014,7 @@ private:
             got += hi - lo;
         }
         if (q.stage >= 0 && got) arrived(q.stage, got);
+        return RAD_OK;
     }
 
     /* A direct weight (plan_direct), relaid from the window its planes were read into; the
@@ -2986,6 +3086,7 @@ private:
     /* Plane k of `s` is read from src[k]: its input, or the sweep window it is in. Relayouts only
      * read their planes, so a window other ranks copy from as well can be one. */
     int run(StagedWeight& s, const uint8_t* const* src) {
+        std::call_once(ring_once_, [&] { ring_.start(ring_devices_, ring_needed_); });
         const WeightInfo& w = s.prog->weights[s.wi];
         if (s.fill) {
             const int fs = s.fill(s.in);
@@ -3062,6 +3163,9 @@ private:
         return st;
     }
 
+    std::once_flag ring_once_;
+    int ring_devices_ = 1;
+    bool ring_needed_ = false;
     std::vector<StagedWeight>& items_;
     std::unique_ptr<std::once_flag[]> once_;   /* per item: its input is made once */
     std::unique_ptr<std::atomic<int64_t>[]> left_;   /* per item: bytes the sweep has yet to deliver */
@@ -3130,7 +3234,11 @@ static SweepGate g_sweep_gate;
  * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
-                           int64_t* read_out, const std::function<int()>& before_writes = {}) {
+                           int64_t* read_out,
+                           const std::function<void(int64_t, int64_t)>& reserve_host,
+                           const std::vector<StagedWeight>& staged,
+                           const std::string& read_path, bool restored_image,
+                           const std::function<int()>& before_writes = {}) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
@@ -3157,7 +3265,13 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     g_sweep_gate.enter(want_bytes);
     struct Leave { int64_t n; ~Leave() { g_sweep_gate.leave(n); } } leave{ want_bytes };
 
-    int64_t window = 64 << 20;
+    const bool host_only = std::none_of(runs.begin(), runs.end(), [&](const LoadRun& run) {
+        return run.stage < 0 ? run.dev != 0 : staged[(size_t)run.stage].dev;
+    });
+    /* After a snapshot restore only host weights remain. Two small windows
+     * overlap disk reads with host copies without reserving the upload pipeline. */
+    const bool compact = restored_image && host_only;
+    int64_t window = (compact ? 8 : 64) << 20;
     /* Widen the window to hold the widest strided piece. Slicing is correct at any width (a cut
      * piece is copied in two halves), but a narrower window doubles the copies. In practice no
      * piece approaches 64 MiB. */
@@ -3178,17 +3292,29 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * are issued or a window waits for its copies: a window goes back to the readers kLag windows
      * after its copies were issued, which leaves the readers up to kWin - kLag windows ahead. Six
      * keep the drive busy on a window of small segments too (scattered experts, ~300 KiB). */
-    constexpr int     kWin   = 8;
-    constexpr int     kReaders = 6;
-    constexpr size_t  kLag   = 3;
+    const int         kWin = compact ? 2 : 8;
+    const int         kReaders = compact ? 1 : 6;
+    const size_t      kLag = compact ? 1 : 3;
     constexpr int64_t kPiece = 8 << 20;
     constexpr int64_t kBlk   = DirectFile::alignment();
+    if (reserve_host) {
+        /* Segmented readers may keep incomplete tensors from several windows alive. Bound all
+         * inputs plus the reusable region rather than reuse the old sequential-window frontier. */
+        int64_t inputs = staged.empty() ? 0 : pool->budget();
+        const int64_t page = ::sysconf(_SC_PAGESIZE);
+        for (const auto& sw : staged) {
+            if (page <= 0 || sw.in_bytes > INT64_MAX - page) { inputs = INT64_MAX; break; }
+            const int64_t bytes = align_up(sw.in_bytes, page);
+            inputs += std::min(bytes, INT64_MAX - inputs);
+        }
+        reserve_host(kWin * (window + 2 * kBlk), inputs);
+    }
     DirectFile dio;
-    const size_t nr = devices.size();
+    const size_t nr = compact ? 0 : devices.size();
     std::vector<RadStream> st(nr, nullptr);
     std::vector<RadEvent>  ev(kWin * nr, nullptr);
     std::vector<char>      live(kWin * nr, 0), touched(nr, 0);
-    void*    buf[kWin] = {};
+    std::vector<void*> buf((size_t)kWin, nullptr);
     pool->windows(kWin);
     std::atomic<int64_t> read_bytes{0};
     double   read_s = 0;     /* the part of the sweep's wall time some read was in flight */
@@ -3206,7 +3332,11 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
          * blocks wider). A filesystem that refuses O_DIRECT is read buffered. Opened here once so
          * a file that cannot be read fails before any window is pinned; the readers open their
          * own. */
-        RAD_TRY(dio.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+        RAD_TRY(dio.open(read_path.c_str(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+        if (!file->matches_open_file(dio.fd())) {
+            RAD_ERR("load: checkpoint identity changed before weight sweep");
+            return RAD_E_FORMAT;
+        }
         /* The first window is pinned here and the others by a helper while the first reads run
          * (below, `pinner`): a window takes ~7 ms to pin (its pages faulted and zeroed, then
          * locked for every card), and all eight ahead of the first read cost every sweep ~60 ms
@@ -3216,7 +3346,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                     humanb(window).c_str(), kWin);
         };
         const auto pin0 = std::chrono::steady_clock::now();
-        buf[0] = sweep_take(window + 2 * kBlk);
+        buf[0] = (reserve_host ? rad_dev_alloc(window + 2 * kBlk, RAD_MEM_HOST_PINNED) : sweep_take(window + 2 * kBlk));
         if (!buf[0]) { no_window(); return RAD_E_NOMEM; }
         if (const double ps = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin0).count(); ps > 1.0)
             RAD_WARN("load: pinning the first %s staging window took %.1f s", humanb(window).c_str(), ps);
@@ -3408,7 +3538,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         auto busy0 = std::chrono::steady_clock::now();
         auto reader = [&] {
             DirectFile f;
-            const int orc = f.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED);
+            int orc = f.open(read_path.c_str(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED);
+            if (orc >= 0 && !file->matches_open_file(f.fd())) orc = RAD_E_FORMAT;
             for (;;) {
                 size_t k;
                 {
@@ -3464,7 +3595,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                     std::lock_guard<std::mutex> lk(rmu);
                     if (rstop || rerr < 0) return;
                 }
-                void* p = sweep_take(window + 2 * kBlk);
+                void* p = (reserve_host ? rad_dev_alloc(window + 2 * kBlk, RAD_MEM_HOST_PINNED) : sweep_take(window + 2 * kBlk));
                 {
                     std::lock_guard<std::mutex> lk(rmu);
                     if (!p) {
@@ -3521,7 +3652,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                 RAD_TRY(acquire((int)(old % kWin)));
                 {
                     std::lock_guard<std::mutex> lk(rmu);
-                    posted = std::max(posted, std::min(reads.size(), old + kWin));
+                    /* The next read for this slot is old + kWin; posted is exclusive. */
+                    posted = std::max(posted, std::min(reads.size(), old + kWin + 1));
                 }
                 rcv.notify_all();
             }
@@ -3546,7 +3678,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
          * difference is copies that did not overlap a read (host memcpys, the issue loop). */
         RAD_INFO("load: one pass over the container, %s read in %.1f s (%.1f GB/s) for %zu "
                  "rank(s); %.1f s of that was the disk (%.1f GB/s)",
-                 humanb(read_bytes).c_str(), s, read_bytes / (s > 0 ? s : 1) / 1e9, nr,
+                 humanb(read_bytes).c_str(), s, read_bytes / (s > 0 ? s : 1) / 1e9, devices.size(),
                  read_s, read_bytes / (read_s > 0 ? read_s : 1) / 1e9);
         return RAD_OK;
     }();
@@ -3557,9 +3689,18 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * prefill after each load or restore faults them back from the drive (a 103 GiB table: 1460
      * against 1998 tok/s on a 24k prompt). */
     file->drop_blob_cache();
+    /* A failed sweep can leave DMA and worker copies reading the pinned windows.
+     * The success path has already synchronized its streams. */
+    if (rc < 0) {
+        for (RadStream stream : st)
+            if (stream) (void)rad_stream_sync(stream);
+    }
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
-    for (int b = 0; b < kWin; ++b) sweep_give(buf[b], window + 2 * kBlk);
+    for (int b = 0; b < kWin; ++b) {
+        if (reserve_host) { if (buf[b]) rad_dev_free(buf[b], RAD_MEM_HOST_PINNED); }
+        else sweep_give(buf[b], window + 2 * kBlk);
+    }
     for (size_t k = 0; k < ev.size(); ++k) if (ev[k]) rad_event_destroy(ev[k]);
     for (size_t k = 0; k < nr; ++k) if (st[k]) rad_stream_destroy(st[k]);
     *read_out = read_bytes;
@@ -3697,17 +3838,22 @@ int Engine::load_weights() {
     std::vector<StagedWeight> staged;
     int64_t n_out = 0;      /* destination overruns reported, capped */
 
+    /* Shared image activation retains the preflight file. Open its inode even if an
+     * operator has since atomically changed the pathname. Keep direct I/O for the sweep. */
+    const std::string read_path = file_ && service_role_ == ServiceRole::Generator
+                                  ? "/proc/self/fd/" + std::to_string(file_->fd()) : cfg_.model;
+
     /* ============================================================== the walk */
     for (auto& r : ranks_) {
         LogRank lr(r->index);
-        /* Bind before allocating for this rank (as in plan()). */
+        /* Bind before allocating for this rank (as in allocate_weight_pools()). */
         RAD_TRY(rad_dev_set(r->device));
 
         /* The container is the file tier (--weights-disk-tier places units on Tier::SSD), so the
          * mover needs its path. It reads the container with O_DIRECT: weights are RAD_ALIGN_UNIT-
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
-        mc.container_path = file_ ? cfg_.model : std::string();
+        mc.container_path = file_ ? read_path : std::string();
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -3960,6 +4106,29 @@ int Engine::load_weights() {
         return RAD_E_NOTFOUND;
     }
 
+    bool restored = false;
+    if (service_role_ == ServiceRole::Generator) {
+        RAD_TRY(shared_->restore_image_weights(*this, &restored));
+        if (restored) {
+            /* The snapshot covers only the VRAM pool. Keep the runs for host-placed
+             * weights (e.g. the conditioning embedding) and renumber their staged inputs. */
+            std::vector<int> host_stage(staged.size(), -1);
+            std::vector<StagedWeight> host_weights;
+            for (size_t i = 0; i < staged.size(); ++i) {
+                if (staged[i].dev) continue;
+                host_stage[i] = (int)host_weights.size();
+                host_weights.push_back(std::move(staged[i]));
+            }
+            std::erase_if(runs, [&](LoadRun& run) {
+                if (run.stage < 0) return run.dev != 0;
+                run.stage = host_stage[(size_t)run.stage];
+                return run.stage < 0;
+            });
+            staged = std::move(host_weights);
+            if (runs.empty()) return RAD_OK;
+        }
+    }
+
     /* ============================================================== the sweep */
     std::vector<int> devices;
     devices.reserve(ranks_.size());
@@ -3971,11 +4140,55 @@ int Engine::load_weights() {
     const unsigned hw = std::thread::hardware_concurrency();
     /* Started even with nothing staged: the same workers fill host pool slots. */
     const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
-    pool.start(workers, 4ll << 30);
+    constexpr int64_t pool_budget = 4ll << 30;
+    pool.start(workers, pool_budget);
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        std::function<void(int64_t, int64_t)> reserve_host;
+        if (service_role_ == ServiceRole::Generator) {
+            reserve_host = [&](int64_t bytes, int64_t input_bytes) {
+                /* The relayout input budget can be exceeded while a tensor is still arriving.
+                 * Bound actual input and output allocations using the declared tensors, the
+                 * shared upload ring, and each worker's gather scratch/relayout output. */
+                const auto add = [](int64_t a, int64_t b) {
+                    return a + std::min(b, INT64_MAX - a);
+                };
+                std::vector<int64_t> outputs, gathers;
+                bool device_weights = false;
+                for (const auto& weight : staged) {
+                    gathers.push_back(weight.in_bytes);
+                    if (!weight.dev) continue;
+                    device_weights = true;
+                    const auto& w = weight.prog->weights[weight.wi];
+                    outputs.push_back(w.stored_bytes);
+                }
+                auto largest_per_worker = [&](std::vector<int64_t>& sizes) {
+                    const auto count = std::min<size_t>(workers, sizes.size());
+                    std::partial_sort(sizes.begin(), sizes.begin() + count, sizes.end(),
+                                      std::greater<int64_t>());
+                    int64_t total = 0;
+                    for (size_t i = 0; i < count; ++i) total = add(total, sizes[i]);
+                    return total;
+                };
+                /* Upstream relayout uses one shared pinned upload ring. Workers may hold a
+                 * gathered input and an oversized pageable output alongside that ring. */
+                const int64_t output_bytes = add(largest_per_worker(outputs),
+                                                 largest_per_worker(gathers));
+                const int64_t bounce_bytes = device_weights ? RelayoutPool::upload_ring_bytes() : 0;
+                const int64_t ring_bytes = bytes;
+                bytes = add(add(add(bytes, input_bytes), output_bytes), bounce_bytes);
+                RAD_INFO("shared image load staging estimate: %s (reader %s, inputs %s, "
+                         "output buffers %s, upload rings %s)", humanb(bytes).c_str(),
+                         humanb(ring_bytes).c_str(), humanb(input_bytes).c_str(),
+                         humanb(output_bytes).c_str(), humanb(bounce_bytes).c_str());
+                shared_->trim_image_cache(0, bytes);
+            };
+        }
+        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, reserve_host,
+                                staged, read_path, restored);
+        if (sw_st < 0)
+            RAD_ERR("load: weight sweep for '%s' failed: %s", file_->path(), rad_strerror(sw_st));
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -4108,7 +4321,8 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
     const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
     pool.start(workers, kRefillStaging);
     int64_t read_bytes = 0;
-    const int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, before_writes);
+    const int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, {},
+                                      staged, file_->path(), false, before_writes);
     const int pool_st = pool.finish();
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
@@ -4298,8 +4512,8 @@ int Engine::configure_kv() {
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
         if (i == 0) drafter_snap_ = r->kv.drafter_window_snapshot();
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
-        /* A rank plan() re-sized for the common token count must page at least that count (same
-         * plan, same bytes); anything less is a broken invariant. */
+        /* A rank budgeted for the common token count must page at least that count
+         * with the same plan and bytes. Anything less is a broken invariant. */
         if (rank_cfg_[i].vram_kv_mib < cfg_.vram_kv_mib && t < kv_planned_tokens_) {
             RAD_ERR("kv: rank %d's KV pool was sized at %lld MiB to page the common %lld tokens "
                     "and pages %lld: the pool and the plan that sized it disagree", r->index,
@@ -4328,7 +4542,7 @@ int Engine::configure_kv() {
     }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
-        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
+        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see allocate_weight_pools() */
         if (ranks_.size() > 1) {
             const int64_t own = r->kv.paged_tokens(r->pools.kv().avail());
             if (own > least && own != KVManager::kUnboundedTokens)
@@ -4628,19 +4842,25 @@ int Engine::configure_kv() {
 static std::mutex g_bringup_mu;
 
 int Engine::start() {
+    startup_begin_ns_ = rad_mono_ns();
+    RAD_TRY(declare_model());
+    /* The graph report also works on machines where the weights cannot fit. */
+    return cfg_.debug_graph ? RAD_OK : load_model();
+}
+
+int Engine::declare_model() {
     EngineScope es(owner_, cfg_.served_model_name.c_str());
     std::unique_lock<std::mutex> bringup(g_bringup_mu);
     bringup_lk_ = &bringup;
     struct Forget { std::unique_lock<std::mutex>*& p; ~Forget() { p = nullptr; } } forget{ bringup_lk_ };
-    startup_begin_ns_ = rad_mono_ns();
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;
-    /* Rank tags on log lines from here on (see LogRank). */
-    log_rank_tags(cfg_.tp > 1);
+    /* The primary engine sets the process-wide rank tag policy before serving. */
+    if (!reuse_registry_) log_rank_tags(cfg_.tp > 1);
 
     std::vector<std::string> dev_names;
-    int s = usable_devices(&devs, &inventory, &devnote, &dev_names);
+    int s = usable_devices(cfg_.device_ordinals, &devs, &inventory, &devnote, &dev_names);
     /* Before any refusal, so a failed startup's report still identifies the cards. */
     identify_devices(dev_names);
     if (!devnote.empty()) RAD_WARN("device: %s", devnote.c_str());
@@ -4699,9 +4919,15 @@ int Engine::start() {
         rad_tools_registry().set_code_device(devs[0]);
         rad_tools_registry().set_no_device_code(device_is_host());
     }
+    std::string tune_machine;
+    if (!cfg_.device_ordinals.empty()) {
+        RadDeviceProps first{};
+        if (rad_dev_props(devs[0], &first) >= 0)
+            tune_machine = rad_machine_key_of(cfg_.tp, &first);
+    }
     int plugins_st = RAD_OK;
     try {
-        plugins_st = load_plugins();
+        plugins_st = load_plugins(tune_machine);
     } catch (...) {
         if (vocab_threaded) vocab_thread.join();
         throw;
@@ -4730,6 +4956,8 @@ int Engine::start() {
         auto r = std::make_unique<Rank>();
         r->index  = i;
         r->device = devs[i];
+        if (!cfg_.device_ordinals.empty())
+            RAD_INFO("device: rank %d uses backend ordinal %d", r->index, r->device);
         ranks_.push_back(std::move(r));
     }
     /* Collectives run on these cards from here on; another engine's on the same cards must not be
@@ -4798,12 +5026,14 @@ int Engine::start() {
         }
     }
 
-    RAD_TRY(declare());
+    return declare();
+}
 
-    /* --debug-graph stops here: everything it prints is known after declare, and it must work on
-     * a machine where the model does not fit. */
-    if (cfg_.debug_graph) return RAD_OK;
-
+int Engine::load_model() {
+    EngineScope es(owner_, cfg_.served_model_name.c_str());
+    std::unique_lock<std::mutex> bringup(g_bringup_mu);
+    bringup_lk_ = &bringup;
+    struct Forget { std::unique_lock<std::mutex>*& p; ~Forget() { p = nullptr; } } forget{ bringup_lk_ };
     /* Before anything is placed or loaded, so serving at reference speed is refused up front. */
     RAD_TRY(rad_gate_reference_kernels(ranks_[0]->program, cfg_.accept_reference_kernels, "serve"));
     {
@@ -4827,14 +5057,15 @@ int Engine::start() {
                rows.empty() ? std::string() : "attention:\n" + rows);
     }
 
-    RAD_TRY(plan());
+    RAD_TRY(resolve_memory_budget());
+    RAD_TRY(allocate_weight_pools());
     bringup.unlock();
     RAD_TRY(load_weights());
     RAD_TRY(configure_kv());
 
     for (auto& r : ranks_) {
         LogRank lr(r->index);
-        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
+        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see allocate_weight_pools() */
         CtxDesc d{};
         d.program     = &r->program;
         d.rank        = r->index;
@@ -4911,7 +5142,8 @@ int Engine::start() {
     }
     /* Runtime LoRA: the startup adapters, copied into their slots now that every rank's pools
      * have an address and before any step can read them. */
-    RAD_TRY(lora_start());
+    if (!(service_role_ == ServiceRole::Generator && !program().is_generator()))
+        RAD_TRY(lora_start());
 
     /* ---- the loan: the cache's idle blocks, lent to the expert slab in place -----------------
      *
@@ -4945,7 +5177,7 @@ int Engine::start() {
      * stream beside it starts every ordered dispatch about 11 us later (Qwen3.8-Flash-Next at
      * --tp 2, one sequence: 724 ordered starts a pass, 20.5 ms a step against 10.1 without it; four
      * and eight sequences 5 % and 1 % slower with it). */
-    if (!cfg_.deterministic && cfg_.tp == 1)
+    if (!shared_ && !cfg_.deterministic && cfg_.tp == 1)
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];

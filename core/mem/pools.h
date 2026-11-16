@@ -140,12 +140,13 @@ public:
      * backend has no meaningful answer).
      *
      * Refuses, by name and size, rather than shrinking anything:
-     *   - if the weight or KV budget is zero (the resolver did not run);
+     *   - if the weight budget is zero or a required KV budget is zero;
      *   - if weights + kv exceeds the card;
      *   - if a pool's backing allocation fails.
      */
     int configure(const Config& cfg, int64_t vram_capacity,
-                  MemAllocator* device = nullptr, MemAllocator* host = nullptr);
+                  MemAllocator* device = nullptr, MemAllocator* host = nullptr,
+                  bool needs_kv = true);
 
     Pool& weights()     { return weights_; }
     Pool& kv()          { return kv_; }

@@ -298,6 +298,12 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
  * token ids mixed as one prompt, as llama-server reads it. */
 int parse_completion_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err, bool native = false);
+/* These take the bounded object from parse_request_object. The caller selects the model
+ * before invoking its tokenizer, template or grammar compiler. Chat may normalize legacy keys. */
+int parse_chat_object(json b, const OaiDeps& d, const OaiLimits& lim,
+                      OaiRequest* out, ApiError* err);
+int parse_completion_object(const json& b, const OaiDeps& d, const OaiLimits& lim,
+                            OaiRequest* out, ApiError* err, bool native = false);
 /* A media part's bytes out of a data: URL; any other URL is refused, never fetched. */
 int decode_media_url(const std::string& url, const std::string& field,
                      std::vector<uint8_t>* out, ApiError* err);

@@ -44,6 +44,21 @@ static const std::string g_draft_window_help =
 static const Flag g_flags[] = {
     { "--model",              "PATH",   "the .rad container, a checkpoint served as it stands, or a\n"
                                         "Hugging Face repo id (owner/name), fetched before startup" },
+    { "--supplemental-text-model", "PATH", "serve a resident local text checkpoint on a separate device" },
+    { "--supplemental-text-device", "N", "device ordinal for the resident supplemental text model" },
+    { "--supplemental-text-host-pool-mib", "N", "pinned expert pool for the supplemental text model (default 0)" },
+    { "--image-model",        "PATH",   "serve this local image checkpoint alongside --model on the same cards" },
+    { "--image-text-rank",    "N",      "run shared images on one card, at zero-based text rank N" },
+    { "--image-model-reserve","PATH",   "also budget for this local image checkpoint (repeatable)" },
+    { "--image-reload-headroom-mib", "N", "extra VRAM per generator rank for shared model reloads (default 0)" },
+    { "--unloaded-image-expert-pool-mib", "N", "temporary expert VRAM per generator rank after unload (default 0)" },
+    { "--image-embedding-placement", "WHERE", "shared image embedding: auto (default), ram or vram" },
+    { "--video-tower-placement", "WHERE", "shared video encoder tower: vram (default) or ram" },
+    { "--image-model-fifo",    "",       "serve queued image requests in strict arrival order" },
+    { "--image-lora-snapshot-mib", "N",  "host budget for shared image LoRA source snapshots (default 2048)" },
+    { "--image-snapshot-memory", "MODE", "shared generator weight snapshots: pageable (default) or pinned" },
+    { "--no-image-weight-loan", nullptr, "keep generator weights in VRAM and lend only transient activation memory" },
+    { "--image-model-cache-mib", "N",   "host budget for active and inactive image weight snapshots (default 0)" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
     { "--model-revision",     "REV",    "the hub revision -- a branch, tag, full commit sha or refs/pr/N --\n"
@@ -52,6 +67,7 @@ static const Flag g_flags[] = {
                                         "homes separated by ':' are searched in order, the first winning" },
     { "--kernels",            "LIST",   "the kernel libraries to use, separated by ',' or ':', first wins; unnamed ones are not loaded. Default: every library found" },
 
+    { "--device-ordinal",     "N",      "backend device ordinal for a rank, repeat once per rank" },
     { "--tp",                 "N",      "tensor-parallel ranks" },
     { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
                                         "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 3\n"
@@ -591,11 +607,66 @@ int config_parse(int argc, char** argv, Config* c) {
 
         if (S("-v"))                           log_set_level(Log::Debug);
         else if (S("-vv"))                     log_set_level(Log::Trace);
+        else if (S("--supplemental-text-model")) {
+            if (!(v = need(i)) || !*v) return RAD_E_INVAL;
+            c->supplemental_text_model = v;
+        }
+        else if (S("--supplemental-text-device")) {
+            if (!num(0, INT32_MAX, &c->supplemental_text_device)) return RAD_E_INVAL;
+        }
+        else if (S("--supplemental-text-host-pool-mib")) {
+            if (!num(0, INT64_MAX >> 23, &c->supplemental_text_host_pool_mib)) return RAD_E_INVAL;
+        }
+        else if (S("--image-model"))           { if (!(v = need(i))) return RAD_E_INVAL; c->image_model = v; }
+        else if (S("--image-text-rank"))       { if (!num(0, INT32_MAX, &c->image_text_rank)) return RAD_E_INVAL; }
+        else if (S("--image-model-reserve"))   { if (!(v = need(i))) return RAD_E_INVAL; c->image_model_reserve.emplace_back(v); }
+        else if (S("--unloaded-image-expert-pool-mib")) { if (!num(0, INT64_MAX >> 20, &c->unloaded_image_expert_pool_mib)) return RAD_E_INVAL; }
+        else if (S("--image-reload-headroom-mib")) { if (!num(0, INT64_MAX >> 20, &c->image_reload_headroom_mib)) return RAD_E_INVAL; }
+        else if (S("--image-embedding-placement")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_table_placement(v, &c->image_embedding_placement) ||
+                c->image_embedding_placement == TablePlacement::Disk) {
+                RAD_ERR("--image-embedding-placement takes auto, ram or vram");
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--video-tower-placement")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_table_placement(v, &c->video_tower_placement) ||
+                (c->video_tower_placement != TablePlacement::Ram &&
+                 c->video_tower_placement != TablePlacement::Vram)) {
+                RAD_ERR("--video-tower-placement takes ram or vram");
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--image-model-fifo"))      c->image_model_fifo = true;
+        else if (S("--no-image-weight-loan")) c->image_weight_loan = false;
+        else if (S("--image-lora-snapshot-mib")) { if (!num(1, INT64_MAX >> 20, &c->image_lora_snapshot_mib)) return RAD_E_INVAL; }
+        else if (S("--image-snapshot-memory")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "pageable") == 0) c->image_snapshot_pageable = true;
+            else if (std::strcmp(v, "pinned") == 0) c->image_snapshot_pageable = false;
+            else {
+                RAD_ERR("--image-snapshot-memory takes pinned or pageable");
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--image-model-cache-mib")) { if (!num(0, INT64_MAX >> 20, &c->image_model_cache_mib)) return RAD_E_INVAL; }
         else if (S("--model"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->model = v; }
         else if (S("--download-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->download_dir = v; }
         else if (S("--model-revision"))        { if (!(v = need(i))) return RAD_E_INVAL; c->model_revision = v; }
         else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
         else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = rad_split_kernel_list(v); }
+        else if (S("--device-ordinal")) {
+            int ordinal;
+            if (!num(0, INT32_MAX, &ordinal)) return RAD_E_INVAL;
+            if (std::find(c->device_ordinals.begin(), c->device_ordinals.end(), ordinal) !=
+                c->device_ordinals.end()) {
+                RAD_ERR("--device-ordinal %d was specified more than once", ordinal);
+                return RAD_E_INVAL;
+            }
+            c->device_ordinals.push_back(ordinal);
+        }
         else if (S("--tp"))                    { if (!num(1, INT32_MAX, &c->tp)) return RAD_E_INVAL; }
         else if (S("--tp-wire")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -674,7 +745,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--gpu-headroom-mib") || S("--gpu-headroom"))
                                                { if (!num(0, INT64_MAX, &c->gpu_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--gpu-memory-mib"))         { if (!num(1, INT64_MAX, &c->gpu_memory_mib)) return RAD_E_INVAL; }
-        else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
+        else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX >> 20, &c->host_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "fp8_v4") || !std::strcmp(v, "k6_v4")) {
@@ -1221,6 +1292,11 @@ int config_parse(int argc, char** argv, Config* c) {
         c->given[S("--gpu-headroom") ? "--gpu-headroom-mib" : a] = "command line";
     }
 
+    if (!c->device_ordinals.empty() && c->device_ordinals.size() != (size_t)c->tp) {
+        RAD_ERR("--device-ordinal must be specified once per rank (--tp %d)", c->tp);
+        return RAD_E_INVAL;
+    }
+
     /* Both variables are read as the tools read them (rad_home() and rad_hierarchy_from_env() in
      * tools/iface.cpp), so a plugin validated with rad-kbench or rad-tune serves the same way. Set
      * but empty is unset, as for RADIANCE_KERNELS: an empty home would load no plugin at all. */
@@ -1243,6 +1319,66 @@ int config_parse(int argc, char** argv, Config* c) {
      * the named libraries, in its order. */
     if (c->model.empty()) {
         RAD_ERR("--model is required");
+        return RAD_E_INVAL;
+    }
+
+    if (!c->supplemental_text_model.empty() || c->supplemental_text_device >= 0) {
+        if (c->supplemental_text_model.empty() || c->supplemental_text_device < 0) {
+            RAD_ERR("--supplemental-text-model and --supplemental-text-device require each other");
+            return RAD_E_INVAL;
+        }
+        if (c->kld() || c->calib() || c->debug_graph) {
+            RAD_ERR("supplemental text requires HTTP serving");
+            return RAD_E_INVAL;
+        }
+    }
+    if (c->given.count("--supplemental-text-host-pool-mib") && c->supplemental_text_model.empty()) {
+        RAD_ERR("--supplemental-text-host-pool-mib requires a supplemental text model and device");
+        return RAD_E_INVAL;
+    }
+    if (c->image_text_rank >= 0 && (c->image_model.empty() || c->image_text_rank >= c->tp)) {
+        RAD_ERR("--image-text-rank requires --image-model and a text rank below --tp (%d)", c->tp);
+        return RAD_E_INVAL;
+    }
+    if (!c->image_model_reserve.empty() && c->image_model.empty()) {
+        RAD_ERR("--image-model-reserve requires --image-model");
+        return RAD_E_INVAL;
+    }
+
+    if (c->given.count("--image-reload-headroom-mib") && c->image_model.empty()) {
+        RAD_ERR("--image-reload-headroom-mib requires --image-model");
+        return RAD_E_INVAL;
+    }
+    if (c->given.count("--image-embedding-placement") && c->image_model.empty()) {
+        RAD_ERR("--image-embedding-placement requires --image-model");
+        return RAD_E_INVAL;
+    }
+    if (c->given.count("--video-tower-placement") && c->image_model.empty()) {
+        RAD_ERR("--video-tower-placement requires --image-model");
+        return RAD_E_INVAL;
+    }
+    if (c->image_model_fifo && c->image_model.empty()) {
+        RAD_ERR("--image-model-fifo requires --image-model");
+        return RAD_E_INVAL;
+    }
+    if (c->given.count("--image-lora-snapshot-mib") && (c->image_model.empty() || !c->lora.enabled())) {
+        RAD_ERR("--image-lora-snapshot-mib requires --image-model and LoRA support");
+        return RAD_E_INVAL;
+    }
+    if (c->given.count("--unloaded-image-expert-pool-mib") && c->image_model.empty()) {
+        RAD_ERR("--unloaded-image-expert-pool-mib requires --image-model");
+        return RAD_E_INVAL;
+    }
+    if (!c->image_weight_loan && c->image_model.empty()) {
+        RAD_ERR("--no-image-weight-loan requires --image-model");
+        return RAD_E_INVAL;
+    }
+    if (c->given.count("--image-snapshot-memory") && c->image_model.empty()) {
+        RAD_ERR("--image-snapshot-memory requires --image-model");
+        return RAD_E_INVAL;
+    }
+    if (c->given.count("--image-model-cache-mib") && c->image_model.empty()) {
+        RAD_ERR("--image-model-cache-mib requires --image-model");
         return RAD_E_INVAL;
     }
 
@@ -1448,6 +1584,30 @@ struct ShowRow { const char* flag; Show show; };
  * at startup" (-1, 0, empty) are shown by meaning; the engine's decisions replace them. */
 const ShowRow kShow[] = {
     { "--model",              [](const Config& c) { return c.model; } },
+    { "--supplemental-text-model", [](const Config& c) { return c.supplemental_text_model; } },
+    { "--supplemental-text-device", [](const Config& c) {
+          return c.supplemental_text_device < 0 ? "none" : num(c.supplemental_text_device); } },
+    { "--supplemental-text-host-pool-mib", [](const Config& c) { return num(c.supplemental_text_host_pool_mib); } },
+    { "--image-model",        [](const Config& c) { return c.image_model; } },
+    { "--image-text-rank", [](const Config& c) {
+          return c.image_text_rank < 0 ? "match text ranks" : num(c.image_text_rank); } },
+    { "--image-reload-headroom-mib", [](const Config& c) { return num(c.image_reload_headroom_mib); } },
+    { "--unloaded-image-expert-pool-mib", [](const Config& c) { return num(c.unloaded_image_expert_pool_mib); } },
+    { "--image-model-reserve", [](const Config& c) {
+          std::string paths;
+          for (const auto& path : c.image_model_reserve)
+              paths += (paths.empty() ? "" : ", ") + path;
+          return paths; } },
+    { "--image-embedding-placement", [](const Config& c) {
+          return std::string(table_placement_name(c.image_embedding_placement)); } },
+    { "--video-tower-placement", [](const Config& c) {
+          return std::string(table_placement_name(c.video_tower_placement)); } },
+    { "--image-model-fifo",    [](const Config& c) { return onoff(c.image_model_fifo); } },
+    { "--no-image-weight-loan", [](const Config& c) { return onoff(!c.image_weight_loan); } },
+    { "--image-lora-snapshot-mib", [](const Config& c) { return num(c.image_lora_snapshot_mib); } },
+    { "--image-snapshot-memory", [](const Config& c) -> std::string {
+          return c.image_snapshot_pageable ? "pageable" : "pinned"; } },
+    { "--image-model-cache-mib", [](const Config& c) { return num(c.image_model_cache_mib); } },
     { "--download-dir",       [](const Config& c) { return or_none(c.download_dir, "the XDG cache (~/.cache/radiance/hf)"); } },
     { "--model-revision",     [](const Config& c) { return or_none(c.model_revision, "the repo's main branch"); } },
     { "--radiance-home",      [](const Config& c) { return c.radiance_home; } },
@@ -1455,6 +1615,10 @@ const ShowRow kShow[] = {
           std::string s;
           for (const std::string& k : c.kernel_hierarchy) s += (s.empty() ? "" : ",") + k;
           return or_none(s, "every library found"); } },
+    { "--device-ordinal",     [](const Config& c) {
+          std::string s;
+          for (int d : c.device_ordinals) s += (s.empty() ? "" : ",") + num(d);
+          return or_none(s, "automatic device selection"); } },
     { "--tp",                 [](const Config& c) { return num(c.tp); } },
     { "--tp-wire",            [](const Config& c) { return std::string(c.tp_wire_exact ? "exact" : "wht6"); } },
     { "--tp-attn-split",      [](const Config& c) { return std::string(c.tp_attn_rows ? "rows" : "heads"); } },

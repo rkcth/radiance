@@ -208,6 +208,19 @@ TEST(pools_refuse_a_split_the_resolver_never_made) {
     CHECK(!p.configured());
 }
 
+TEST(pools_allow_no_kv_for_a_program_without_cache_groups) {
+    Config c;
+    c.vram_weights_mib = 1;
+    c.vram_kv_mib = 0;
+    Pools p;
+    auto* alloc = &rad_malloc_allocator();
+    CHECK_OK(p.configure(c, 0, alloc, alloc, /*needs_kv=*/false));
+    CHECK_EQ(p.kv().bytes(), (int64_t)0);
+    KVManager kv;
+    CHECK_OK(kv.configure(std::vector<KVGroupInfo>(1), c, p.kv()));
+    CHECK_EQ(p.kv().used(), (int64_t)0);
+}
+
 TEST(pool_oversubscription_is_refused_by_name) {
     Config c;
     c.vram_weights_mib  = 24 * 1024;

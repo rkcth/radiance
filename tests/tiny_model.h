@@ -898,7 +898,7 @@ inline const char* kLlamaI8Recipe =
 /* ------------------------------------------------------------------ Qwen-Image 2.1 */
 
 /* Qwen-Image 2.1 (`QwenImage21Pipeline`, served by qwenimage21) as a diffusers pipeline directory:
- * model_index.json, a Qwen3-VL text encoder with no vision tower, the single-stream DiT, the
+ * model_index.json, a Qwen3-VL text encoder with an optional vision tower, the single-stream DiT, the
  * residual 2-D VAE, the scheduler's config and the tokenizer. The latent keeps the model's 64
  * channels (the plugin requires them); every other width is cut. The DiT's 64-wide heads take the
  * bf16 attention path of a host library that has one. */
@@ -909,6 +909,7 @@ struct QwenImage {
     int64_t vae_dim = 8, vae_res = 1;
     float    branch = 0.5f;                     /* see Gains */
     uint64_t seed = 5;
+    bool vision = false;
 };
 
 inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
@@ -962,6 +963,48 @@ inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
         tt.push_back(linear(p + "mlp.down_proj.weight", H, s.te_ffn, r, s.branch));
     }
     tt.push_back(noise(m + "norm.weight", { H }, r, 0.1f, 1.0f));
+    if (s.vision) {
+        constexpr int64_t width = 32, inner = 64, patch = 16, temporal = 2, merge = 2;
+        constexpr int64_t positions = 16, merged_width = merge * merge * width;
+        te["vision_config"] = {{"depth", 1}, {"hidden_size", width}, {"num_heads", 2},
+                              {"intermediate_size", inner}, {"patch_size", patch},
+                              {"temporal_patch_size", temporal}, {"spatial_merge_size", merge},
+                              {"out_hidden_size", H}, {"num_position_embeddings", positions}};
+        te["image_token_id"] = kTokenizerSize;
+        te["video_token_id"] = kTokenizerSize + 1;
+        te["vision_start_token_id"] = kTokenizerSize + 2;
+        te["vision_end_token_id"] = kTokenizerSize + 3;
+        Rng vision_rng(s.seed + 1);
+        const std::string visual = "model.visual.";
+        auto vector = [&](const std::string& key, int64_t size, float mean = 0.0f) {
+            tt.push_back(noise(visual + key, {size}, vision_rng, 0.03f, mean));
+        };
+        auto matrix = [&](const std::string& key, int64_t rows, int64_t cols) {
+            tt.push_back(linear(visual + key, rows, cols, vision_rng));
+        };
+        tt.push_back(noise(visual + "patch_embed.proj.weight",
+                           {width, 3, temporal, patch, patch}, vision_rng, 0.02f));
+        vector("patch_embed.proj.bias", width);
+        matrix("pos_embed.weight", positions, width);
+        vector("blocks.0.norm1.weight", width, 1);
+        vector("blocks.0.norm1.bias", width);
+        matrix("blocks.0.attn.qkv.weight", 3 * width, width);
+        vector("blocks.0.attn.qkv.bias", 3 * width);
+        matrix("blocks.0.attn.proj.weight", width, width);
+        vector("blocks.0.attn.proj.bias", width);
+        vector("blocks.0.norm2.weight", width, 1);
+        vector("blocks.0.norm2.bias", width);
+        matrix("blocks.0.mlp.linear_fc1.weight", inner, width);
+        vector("blocks.0.mlp.linear_fc1.bias", inner);
+        matrix("blocks.0.mlp.linear_fc2.weight", width, inner);
+        vector("blocks.0.mlp.linear_fc2.bias", width);
+        vector("merger.norm.weight", width, 1);
+        vector("merger.norm.bias", width);
+        matrix("merger.linear_fc1.weight", merged_width, merged_width);
+        vector("merger.linear_fc1.bias", merged_width);
+        matrix("merger.linear_fc2.weight", H, merged_width);
+        vector("merger.linear_fc2.bias", H);
+    }
     if (!write_text(dir + "/text_encoder/config.json", te.dump(2)) ||
         !write_safetensors(dir + "/text_encoder/model.safetensors", tt))
         return false;
@@ -1083,7 +1126,10 @@ inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
     sch["shift"] = 1.0;
     sch["use_dynamic_shifting"] = false;
     return write_text(dir + "/scheduler/scheduler_config.json", sch.dump(2)) &&
-           write_text(dir + "/tokenizer/tokenizer.json", tokenizer_json());
+           write_text(dir + "/tokenizer/tokenizer.json", tokenizer_json(s.vision
+               ? std::vector<std::string>{"<|image_pad|>", "<|video_pad|>",
+                                          "<|vision_start|>", "<|vision_end|>"}
+               : std::vector<std::string>{}));
 }
 
 /* The rad-convert recipe that makes the DiT's linears rotated int8 with a bf16 scale per row and

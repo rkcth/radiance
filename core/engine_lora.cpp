@@ -11,7 +11,9 @@
  * combination: the first request that asks for it composes it (lora/adapter.h) into a free slot,
  * or the least recently used one no request holds, and later ones find it there. */
 #include "engine_priv.h"
+#include "service.h"
 #include "lora/lora.h"
+#include "rad_plugin.h"
 
 #include "util/json.h"
 
@@ -20,6 +22,7 @@
 #include <cmath>
 #include <cstring>
 #include <dirent.h>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
@@ -76,14 +79,172 @@ bool is_file(const std::string& p) {
     return stat(p.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
 }
 
-/* The combination's slot name: the adapters sorted by name, each at its strength. */
-std::string combo_key(const std::vector<Engine::LoraUse>& uses) {
+/* Discovered adapters must stay inside the configured local library. */
+std::string discovered_path(const std::string& dir, const std::string& name) {
+    if (dir.empty() || !valid_name(name)) return {};
+    std::error_code ec;
+    const auto root = std::filesystem::canonical(dir, ec);
+    if (ec) return {};
+    const auto file = std::filesystem::canonical(root / (name + ".safetensors"), ec);
+    if (ec || !std::filesystem::is_regular_file(file, ec)) return {};
+    const auto relative = file.lexically_relative(root);
+    if (relative.empty() || *relative.begin() == "..") return {};
+    return file.string();
+}
+
+std::set<std::string> discovered_adapters(const std::string& directory) {
+    std::set<std::string> n;
+    if (!directory.empty()) {
+        /* Two levels: the directory and its subdirectories, as a UI's lora folder is laid out. */
+        std::vector<std::string> dirs{ "" };
+        for (size_t i = 0; i < dirs.size(); ++i) {
+            const std::string rel = dirs[i];
+            DIR* d = opendir((directory + "/" + rel).c_str());
+            if (!d) continue;
+            while (dirent* e = readdir(d)) {
+                const std::string fn = e->d_name;
+                if (fn.empty() || fn[0] == '.') continue;
+                const std::string p = rel + fn;
+                struct stat sb{};
+                if (stat((directory + "/" + p).c_str(), &sb) != 0) continue;
+                if (S_ISDIR(sb.st_mode)) { if (rel.empty()) dirs.push_back(p + "/"); continue; }
+                const size_t k = fn.size();
+                if (k > 12 && fn.compare(k - 12, 12, ".safetensors") == 0) {
+                    const std::string stem = p.substr(0, p.size() - 12);
+                    if (!discovered_path(directory, stem).empty()) n.insert(stem);
+                }
+            }
+            closedir(d);
+        }
+    }
+    return n;
+}
+
+/* '|' is excluded from adapter names and never appears in a printed strength. */
+std::string combo_key(const std::vector<Engine::LoraUse>& uses,
+                      const std::vector<std::string>& versions = {}) {
     std::string k;
-    for (const Engine::LoraUse& u : uses) k += fmt("%s%s*%.6g", k.empty() ? "" : "+", u.name.c_str(), u.weight);
+    for (size_t i = 0; i < uses.size(); ++i) {
+        const auto& u = uses[i];
+        k += fmt("%s%s*%.17g", k.empty() ? "" : "|", u.name.c_str(), u.weight);
+        if (!versions.empty()) k += "@" + versions[i];
+    }
     return k;
 }
 
+std::string adapter_identity(const std::string& path) {
+    struct stat st {};
+    if (path.empty() || stat(path.c_str(), &st) != 0) return {};
+    return fmt("%s:%llu:%llu:%lld:%lld:%ld:%lld:%ld", path.c_str(),
+               (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+               (long long)st.st_size, (long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
+               (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+}
+
 }  /* namespace */
+
+std::vector<std::string> SharedService::image_lora_names() {
+    const std::lock_guard lock(image_lora_mutex_);
+    auto names = discovered_adapters(image_template_.lora.dir);
+    std::set<std::string> startup_names;
+    const auto apply = [&](const std::string& name, const std::string& path) {
+        if (is_file(path)) names.insert(name);
+        else names.erase(name);
+    };
+    for (const auto& [name, path] : image_template_.lora.adapters)
+        if (startup_names.insert(name).second) apply(name, path);
+    for (const auto& [name, path] : image_lora_paths_) apply(name, path);
+    return {names.begin(), names.end()};
+}
+
+int SharedService::pin_image_loras(const std::vector<std::pair<std::string, double>>& in,
+                                   std::vector<lora::PinnedAdapter>* out, std::shared_ptr<void>* lease,
+                                   std::string* why, bool reclaim_cache) {
+    if (!image_template_.lora.enabled()) {
+        *why = "the shared image service was started without adapters";
+        return RAD_E_UNSUPPORTED;
+    }
+    std::map<std::string, double> strengths;
+    for (const auto& [name, weight] : in) {
+        if (!valid_name(name) || !std::isfinite(weight) || std::abs(weight) > 16.0) {
+            *why = "invalid adapter name or strength for '" + name + "'";
+            return RAD_E_INVAL;
+        }
+        strengths[name] += weight;
+    }
+    std::erase_if(strengths, [](const auto& entry) { return entry.second == 0.0; });
+    if (strengths.size() > 16) {
+        *why = "at most 16 adapters may be used in one request";
+        return RAD_E_INVAL;
+    }
+
+    std::vector<lora::PinnedAdapter> resolved;
+    int64_t pressure_bytes = 0;
+    auto pin_sources = [&]() -> int {
+        const std::lock_guard lock(image_lora_mutex_);
+        pressure_bytes = 0;
+        const uint64_t budget = static_cast<uint64_t>(text_.cfg_.image_lora_snapshot_mib) << 20;
+        std::map<std::string, std::string> paths;
+        for (const auto& [name, weight] : strengths) {
+            if (std::abs(weight) > 16.0) {
+                *why = "combined adapter strength exceeds [-16, 16] for '" + name + "'";
+                return RAD_E_INVAL;
+            }
+            std::string path;
+            if (const auto it = image_lora_paths_.find(name); it != image_lora_paths_.end()) {
+                path = it->second;
+            } else {
+                for (const auto& [adapter, configured] : image_template_.lora.adapters)
+                    if (name == adapter) { path = configured; break; }
+                if (path.empty()) path = discovered_path(image_template_.lora.dir, name);
+            }
+            if (path.empty()) {
+                *why = "no available adapter named '" + name + "'";
+                return RAD_E_NOTFOUND;
+            }
+            paths.emplace(name, std::move(path));
+        }
+        for (const auto& [name, weight] : strengths) {
+            std::shared_ptr<const lora::AdapterSnapshots::Source> source;
+            RAD_TRY(image_lora_snapshots_.acquire(paths.at(name), budget, text_.host_headroom_bytes(),
+                                                 &source, why, &pressure_bytes));
+            resolved.push_back({{name, {source, &source->file}, weight}, source->revision});
+        }
+
+        if (!resolved.empty()) {
+            struct RequestLease {
+                std::shared_ptr<ImageAdapterRequests> requests;
+                std::vector<std::string> names;
+                size_t charged = 0;
+                ~RequestLease() {
+                    const std::lock_guard lock(requests->mutex);
+                    for (size_t i = 0; i < charged; ++i) {
+                        const auto it = requests->counts.find(names[i]);
+                        if (--it->second == 0) requests->counts.erase(it);
+                    }
+                }
+            };
+            auto hold = std::make_shared<RequestLease>();
+            hold->requests = image_adapter_requests_;
+            for (const auto& adapter : resolved) hold->names.push_back(adapter.use.name);
+            const std::lock_guard count_lock(hold->requests->mutex);
+            for (const auto& name : hold->names) {
+                ++hold->requests->counts[name];
+                ++hold->charged;
+            }
+            *lease = std::move(hold);
+        }
+        *out = std::move(resolved);
+        return RAD_OK;
+    };
+    const int status = pin_sources();
+    /* Keep already acquired sources charged while checking if the failed source fits.
+     * Re-resolve everything after eviction to respect concurrent adapter updates. */
+    if (!reclaim_cache || !pressure_bytes || !make_room_for_image_adapter(pressure_bytes)) return status;
+    resolved.clear();
+    why->clear();
+    return pin_sources();
+}
 
 int Engine::lora_targets() {
     if (!cfg_.lora.enabled()) return RAD_OK;
@@ -196,19 +357,26 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
             if (!lora_keys_->resolve(m.key, &why).empty()) { ++placed; continue; }
             if (first.empty()) first = m.key + ": " + why;
         }
+        for (const auto& [key, tensor] : f->biases()) {
+            (void)tensor;
+            std::string why;
+            if (!lora_keys_->resolve(key, &why).empty()) ++placed;
+        }
         for (const lora::FileModule& m : f->modules())
             if (m.kind == lora::FileModule::LORA && m.t[0]) rank = std::max(rank, (int)m.t[0]->shape[0]);
         if (placed == 0) {
-            *err = fmt("none of its %zu modules is a module of this model (%s)", f->modules().size(),
+            *err = fmt("none of its %zu modules is a module of this model (%s)",
+                       f->modules().size() + f->biases().size(),
                        first.c_str());
             return RAD_E_NOTFOUND;
         }
         RAD_INFO("lora: '%s' -- %s, %d of %zu modules on this model%s%s%s", name.c_str(),
-                 f->kind_name(), placed, f->modules().size(),
+                 f->kind_name(), placed, f->modules().size() + f->biases().size(),
                  rank ? fmt(", rank %d", rank).c_str() : "", first.empty() ? "" : "; not placed: ",
                  first.c_str());
         std::lock_guard<std::mutex> lk2(lora_lib_mu_);
-        lora_lib_[name] = { dir, f };
+        lora_lib_[name] = { f, {}, next_adapter_version_++ };
+        gen_lora_unloaded_.erase(name);
         return RAD_OK;
     }
     /* A slot that is still cooling (lora/slots.h) is waited for here rather than answered with a
@@ -255,7 +423,8 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
 
 int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
                       std::string* err) {
-    /* Each rank on a stream of its own: the compute stream may be recording a pass. */
+    /* Shared image uploads already hold the dispatch lock. Standalone uploads need
+     * a separate stream because the compute stream may be recording a pass. */
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         Rank& r = *ranks_[ri];
         const Program& P = r.program;
@@ -265,8 +434,8 @@ int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>
             return RAD_E_STATE;
         }
         if (rad_dev_set(r.device) < 0) { *err = fmt("rank %zu: cannot bind its device", ri); return RAD_E_DEVICE; }
-        RadStream st{};
-        if (rad_stream_create(&st, 0) < 0) { *err = fmt("rank %zu: no copy stream", ri); return RAD_E_DEVICE; }
+        RadStream st = shared_ ? r.ctx.stream() : nullptr;
+        if (!st && (shared_ || rad_stream_create(&st, 0) < 0)) { *err = fmt("rank %zu: no copy stream", ri); return RAD_E_DEVICE; }
         int rc = RAD_OK;
         for (size_t p = 0; p < P.lora_pools.size() && rc >= 0; ++p) {
             const LoraPool& lp = P.lora_pools[p];
@@ -303,7 +472,7 @@ int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>
                 rc = RAD_E_DEVICE;
         }
         const int sy = rad_stream_sync(st);
-        rad_stream_destroy(st);
+        if (!shared_) rad_stream_destroy(st);
         if (rc >= 0 && sy < 0) rc = RAD_E_DEVICE;
         if (rc < 0) {
             if (err->empty()) *err = fmt("rank %zu: the copy into slot %d failed", ri, slot);
@@ -318,23 +487,28 @@ int Engine::lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
     return lora_table_.acquire(name, slot, uid, hold);
 }
 
-int Engine::lora_unload(const std::string& name, std::string* err, int* in_flight) {
+int Engine::lora_unload(const std::string& name, std::string* err, int* in_flight,
+                        bool known_to_service) {
     if (!lora_gen_) return lora_table_.unload(name, in_flight, err);
+    std::lock_guard<std::mutex> update(lora_mu_);
     /* A generator's adapter leaves the library, and every combination holding it its slot (at
      * once when idle, after its requests otherwise). */
     {
         std::lock_guard<std::mutex> lk(lora_lib_mu_);
-        if (!lora_lib_.erase(name)) {
+        if (!lora_lib_.erase(name) && !known_to_service &&
+            (!shared_ || gen_lora_unloaded_.count(name) ||
+             discovered_path(cfg_.lora.dir, name).empty())) {
             *err = "no adapter named '" + name + "' is loaded";
             return RAD_E_NOTFOUND;
         }
+        if (shared_) gen_lora_unloaded_.insert(name);
     }
     *in_flight = 0;
     for (const std::string& k : lora_table_.names()) {
         bool uses = false;
         size_t at = 0;
         while (at <= k.size()) {
-            const size_t plus = std::min(k.find('+', at), k.size());
+            const size_t plus = std::min(k.find('|', at), k.size());
             const std::string part = k.substr(at, plus - at);
             if (part.substr(0, part.rfind('*')) == name) uses = true;
             at = plus + 1;
@@ -359,6 +533,15 @@ int Engine::gen_lora_start() {
         Rank& r = *rp;
         const Program& P = r.program;
         if (!P.lora_rows || P.lora_rows_n <= 0) continue;
+        RAD_TRY(rad_dev_set(r.device));
+        for (const auto& [weight, bias] : P.lora_replacements) {
+            auto& base = r.lora_base_weights[weight];
+            base.resize((size_t)bias.rows);
+            const void* src = r.ctx.weight_ptr(weight);
+            if (!src) return RAD_E_STATE;
+            RAD_TRY(rad_memcpy_async(base.data(), src, bias.rows * 2, r.ctx.stream()));
+            RAD_TRY(rad_stream_sync(r.ctx.stream()));
+        }
         const int S = cfg_.lora.slots();
         std::vector<int32_t> v((size_t)(S * P.lora_rows_n));
         for (int s = 0; s < S; ++s)
@@ -368,11 +551,10 @@ int Engine::gen_lora_start() {
             RAD_ERR("lora: rank %d: the slot-row table has no address", r.index);
             return RAD_E_STATE;
         }
-        RadStream st{};
-        if (rad_stream_create(&st, 0) < 0) return RAD_E_DEVICE;
+        const RadStream st = r.ctx.stream();
+        if (!st) return RAD_E_DEVICE;
         const int rc = rad_memcpy_async(d, v.data(), (int64_t)v.size() * 4, st);
         const int sy = rad_stream_sync(st);
-        rad_stream_destroy(st);
         if (rc < 0 || sy < 0) return RAD_E_DEVICE;
     }
     lora_keys_ = std::make_unique<lora::KeyMap>(ranks_[0]->program, ranks_[0]->lora_sites);
@@ -390,65 +572,206 @@ int Engine::gen_lora_start() {
     return RAD_OK;
 }
 
-int Engine::gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
-                          std::string* err) {
-    {
-        std::lock_guard<std::mutex> lk(lora_lib_mu_);
-        auto it = lora_lib_.find(name);
-        if (it != lora_lib_.end()) { *out = it->second.second; return RAD_OK; }
+int Engine::gen_lora_prepare_replacements(
+    const std::map<std::string, lora::Composite>& modules,
+    const std::map<std::string, std::vector<float>>& deltas,
+    LoraReplacements* replacements, std::string* err) const {
+    replacements->resize(ranks_.size());
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        const auto& r = *ranks_[i];
+        std::set<std::string> matched;
+        for (const auto& [weight, bias] : r.program.lora_replacements) {
+            auto data = r.lora_base_weights.at(weight);
+            const auto delta = deltas.find(bias.module);
+            if (bias.row_mixer) {
+                if (const auto it = modules.find(bias.module); it != modules.end()) {
+                    const auto& factors = it->second;
+                    if (factors.rows != 1 || factors.K != bias.rows) {
+                        *err = "adapter shape disagrees with row mixer " + bias.module;
+                        return RAD_E_SHAPE;
+                    }
+                    for (int64_t i = 0; i < bias.rows; ++i) {
+                        float adjustment = 0;
+                        for (int64_t j = 0; j < factors.r; ++j)
+                            adjustment += factors.B[(size_t)j] * factors.A[(size_t)(j * factors.K + i)];
+                        data[(size_t)i] = rad_f32_to_bf16(rad_bf16_to_f32(data[(size_t)i]) + adjustment);
+                    }
+                }
+            } else if (delta != deltas.end()) {
+                const int64_t rows = bias.source_rows.empty() ? bias.rows :
+                    1 + *std::max_element(bias.source_rows.begin(), bias.source_rows.end());
+                if ((int64_t)delta->second.size() != rows) {
+                    *err = "bias shape disagrees with checkpoint module " + bias.module;
+                    return RAD_E_SHAPE;
+                }
+                matched.insert(delta->first);
+                for (int64_t i = 0; i < bias.rows; ++i) {
+                    const auto row = bias.source_rows.empty() ? i : bias.source_rows[(size_t)i];
+                    if (row >= (int64_t)delta->second.size()) {
+                        *err = "bias row mapping exceeds " + bias.module;
+                        return RAD_E_SHAPE;
+                    }
+                    data[(size_t)i] = rad_f32_to_bf16(rad_bf16_to_f32(data[(size_t)i]) +
+                                                     delta->second[(size_t)row]);
+                }
+            }
+            (*replacements)[i].push_back({bias.slots, std::move(data)});
+        }
+        if (matched.size() != deltas.size()) {
+            for (const auto& [module, values] : deltas) {
+                (void)values;
+                if (!matched.count(module)) {
+                    *err = "no supported bias operand for " + module;
+                    return RAD_E_UNSUPPORTED;
+                }
+            }
+        }
     }
-    const std::string path = cfg_.lora.dir + "/" + name + ".safetensors";
-    if (cfg_.lora.dir.empty() || !valid_name(name) || !is_file(path)) {
+    return RAD_OK;
+}
+
+int Engine::gen_lora_copy_replacements(int slot, const LoraReplacements& replacements) {
+    for (size_t rank = 0; rank < ranks_.size(); ++rank) {
+        auto& r = *ranks_[rank];
+        if (replacements[rank].empty()) continue;
+        RAD_TRY(rad_dev_set(r.device));
+        for (const auto& [buffer, data] : replacements[rank]) {
+            auto* dst = static_cast<uint16_t*>(r.ctx.buf_ptr(buffer));
+            if (!dst) return RAD_E_STATE;
+            RadStream stream = r.ctx.stream();
+            if (!shared_) RAD_TRY(rad_stream_create(&stream, 0));
+            const int copy = rad_memcpy_async(dst + slot * data.size(), data.data(),
+                                              data.size() * sizeof(uint16_t), stream);
+            const int sync = rad_stream_sync(stream);
+            if (!shared_) rad_stream_destroy(stream);
+            RAD_TRY(copy);
+            RAD_TRY(sync);
+        }
+    }
+    return RAD_OK;
+}
+
+int Engine::gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
+                          uint64_t* version, std::string* err) {
+    const std::string path = discovered_path(cfg_.lora.dir, name);
+    const std::string identity = shared_ ? adapter_identity(path) : std::string{};
+    {
+        const std::lock_guard lock(lora_lib_mu_);
+        auto it = lora_lib_.find(name);
+        if (it != lora_lib_.end() &&
+            (it->second.identity.empty() || it->second.identity == identity)) {
+            *out = it->second.file;
+            *version = it->second.version;
+            return RAD_OK;
+        }
+        if (gen_lora_unloaded_.count(name)) {
+            *err = "adapter '" + name + "' was unloaded; load it before using it again";
+            return RAD_E_NOTFOUND;
+        }
+        if (it != lora_lib_.end()) lora_lib_.erase(it);
+    }
+    if (path.empty() || (shared_ && identity.empty())) {
         *err = "no adapter named '" + name + "'" +
                (cfg_.lora.dir.empty() ? std::string(" is loaded")
                                       : " is loaded or under --lora-dir (GET /v1/loras lists them)");
         return RAD_E_NOTFOUND;
     }
-    /* lora_load takes lora_mu_, which the caller holds: open here, as lora_load would. */
     auto f = std::make_shared<lora::AdapterFile>();
     RAD_TRY(f->open(path, err));
+    if (shared_ && adapter_identity(path) != identity) {
+        *err = "the adapter changed while it was being opened; retry";
+        return RAD_E_STATE;
+    }
     RAD_INFO("lora: '%s' opened from --lora-dir -- %s, %zu modules", name.c_str(), f->kind_name(),
              f->modules().size());
-    std::lock_guard<std::mutex> lk(lora_lib_mu_);
-    lora_lib_[name] = { path, f };
-    *out = f;
+    const std::lock_guard lock(lora_lib_mu_);
+    *version = next_adapter_version_++;
+    lora_lib_[name] = { f, identity, *version };
+    *out = std::move(f);
     return RAD_OK;
 }
 
 std::vector<std::string> Engine::gen_lora_names() const {
-    std::set<std::string> n;
-    {
-        std::lock_guard<std::mutex> lk(lora_lib_mu_);
-        for (const auto& [k, v] : lora_lib_) n.insert(k);
-    }
-    if (!cfg_.lora.dir.empty()) {
-        /* Two levels: the directory and its subdirectories, as a UI's lora folder is laid out. */
-        std::vector<std::string> dirs{ "" };
-        for (size_t i = 0; i < dirs.size(); ++i) {
-            const std::string rel = dirs[i];
-            DIR* d = opendir((cfg_.lora.dir + "/" + rel).c_str());
-            if (!d) continue;
-            while (dirent* e = readdir(d)) {
-                const std::string fn = e->d_name;
-                if (fn.empty() || fn[0] == '.') continue;
-                const std::string p = rel + fn;
-                struct stat sb{};
-                if (stat((cfg_.lora.dir + "/" + p).c_str(), &sb) != 0) continue;
-                if (S_ISDIR(sb.st_mode)) { if (rel.empty()) dirs.push_back(p + "/"); continue; }
-                const size_t k = fn.size();
-                if (k > 12 && fn.compare(k - 12, 12, ".safetensors") == 0) {
-                    const std::string stem = p.substr(0, p.size() - 12);
-                    if (valid_name(stem)) n.insert(stem);
-                }
-            }
-            closedir(d);
-        }
-    }
+    auto n = discovered_adapters(cfg_.lora.dir);
+    const std::lock_guard lock(lora_lib_mu_);
+    for (const auto& [name, entry] : lora_lib_)
+        if (entry.identity.empty()) n.insert(name);
+    for (const auto& name : gen_lora_unloaded_) n.erase(name);
     return std::vector<std::string>(n.begin(), n.end());
 }
 
 int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
                              std::shared_ptr<void>* hold, std::string* note, std::string* err) {
+    return gen_lora_acquire_impl(uses_in, nullptr, slot, hold, note, err);
+}
+
+int Engine::gen_lora_acquire_pinned(const std::vector<lora::PinnedAdapter>& adapters,
+                                    int32_t* slot, std::shared_ptr<void>* hold,
+                                    std::string* note, std::string* err) {
+    std::vector<LoraUse> uses;
+    for (const auto& adapter : adapters) uses.push_back({adapter.use.name, adapter.use.weight});
+    return gen_lora_acquire_impl(uses, &adapters, slot, hold, note, err);
+}
+
+int Engine::gen_lora_prepare(const std::vector<lora::Strength>& ss,
+                             std::vector<std::vector<lora::PackedSite>>* packed,
+                             LoraReplacements* replacements, lora::ComposeReport* report,
+                             size_t* bias_count, std::string* err) const {
+    const int rank = cfg_.lora.rank(true);
+    std::map<std::string, lora::Composite> comp;
+    auto& rep = *report;
+    RAD_TRY(lora::compose(*lora_keys_, ss, rank, &comp, &rep, err));
+    std::map<std::string, std::vector<float>> biases;
+    RAD_TRY(lora::compose_biases(*lora_keys_, ss, &biases, err));
+    if (rep.modules == 0 && biases.empty()) {
+        *err = "none of the adapters' modules is a module of this model" +
+               (rep.unplaced.empty() ? std::string() : " (" + rep.unplaced[0] + ")");
+        return RAD_E_NOTFOUND;
+    }
+    if (shared_ && (!rep.unplaced.empty() || !rep.skipped.empty() || rep.exact != rep.modules)) {
+        const std::string detail = !rep.unplaced.empty() ? rep.unplaced.front()
+                                 : !rep.skipped.empty() ? rep.skipped.front()
+                                 : fmt("%s exceeds the configured adapter rank %d",
+                                       rep.worst_module.c_str(), rank);
+        *err = "shared image mode requires an exact adapter match: " + detail;
+        return RAD_E_INVAL;
+    }
+    const std::map<std::string, lora::AdModule> mods = lora::as_modules(comp, *lora_keys_);
+    packed->resize(ranks_.size());
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+        lora::AdapterInfo info;
+        const int s = lora::pack_modules(ranks_[ri]->lora_sites, rank, mods, &info, &(*packed)[ri], err,
+                                         /*compact=*/true);
+        if (s < 0) {
+            if (ranks_.size() > 1) *err = fmt("rank %zu: ", ri) + *err;
+            return s;
+        }
+        /* Pools past the last one a site names hold nothing (lora_declare's dropped GEMMs). */
+        (*packed)[ri].resize(ranks_[ri]->program.lora_pools.size());
+    }
+    *bias_count = biases.size();
+    return gen_lora_prepare_replacements(comp, biases, replacements, err);
+}
+
+int Engine::gen_lora_validate(const std::vector<lora::PinnedAdapter>& adapters, std::string* err) {
+    const std::unique_lock lock(lora_mu_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        *err = "adapter composition is already in progress";
+        return RAD_E_FULL;
+    }
+    std::vector<lora::Strength> uses;
+    for (const auto& adapter : adapters) uses.push_back(adapter.use);
+    std::vector<std::vector<lora::PackedSite>> packed;
+    LoraReplacements replacements;
+    lora::ComposeReport report;
+    size_t bias_count = 0;
+    return gen_lora_prepare(uses, &packed, &replacements, &report, &bias_count, err);
+}
+
+int Engine::gen_lora_acquire_impl(const std::vector<LoraUse>& uses_in,
+                                  const std::vector<lora::PinnedAdapter>* pinned,
+                                  int32_t* slot, std::shared_ptr<void>* hold,
+                                  std::string* note, std::string* err) {
     *slot = -1;
     hold->reset();
     if (note) note->clear();
@@ -466,22 +789,46 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
     for (const auto& [n, w] : by) if (w != 0.0) uses.push_back({ n, w });
     if (uses.empty()) return RAD_OK;
     if (uses.size() > 16) { *err = fmt("%zu adapters in one request; at most 16", uses.size()); return RAD_E_INVAL; }
-    const std::string key = combo_key(uses);
+    std::string key;
     uint64_t uid = 0;
-    if (lora_table_.acquire(key, slot, &uid, hold) == RAD_OK) return RAD_OK;
+    if (!shared_) {
+        key = combo_key(uses);
+        if (lora_table_.acquire(key, slot, &uid, hold) == RAD_OK) return RAD_OK;
+    }
 
     std::lock_guard<std::mutex> lk(lora_mu_);
-    if (lora_table_.acquire(key, slot, &uid, hold) == RAD_OK) return RAD_OK;
+    if (!shared_ && lora_table_.acquire(key, slot, &uid, hold) == RAD_OK) return RAD_OK;
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<lora::Strength> ss;
-    for (const LoraUse& u : uses) {
-        lora::Strength s;
-        s.name = u.name;
-        s.weight = u.weight;
-        RAD_TRY(gen_lora_open(u.name, &s.file, err));
-        ss.push_back(std::move(s));
+    std::vector<std::string> versions;
+    if (pinned) {
+        for (const auto& adapter : *pinned) {
+            ss.push_back(adapter.use);
+            versions.push_back(adapter.revision);
+        }
+    } else {
+        for (const LoraUse& u : uses) {
+            lora::Strength s;
+            s.name = u.name;
+            s.weight = u.weight;
+            uint64_t version = 0;
+            RAD_TRY(gen_lora_open(u.name, &s.file, &version, err));
+            versions.push_back(std::to_string(version));
+            ss.push_back(std::move(s));
+        }
     }
-    /* A slot: free, or freed from the least recently used combination no request holds. */
+    if (shared_) {
+        key = combo_key(uses, versions);
+        if (lora_table_.acquire(key, slot, &uid, hold) == RAD_OK) return RAD_OK;
+    }
+    std::vector<std::vector<lora::PackedSite>> packed;
+    LoraReplacements replacements;
+    lora::ComposeReport rep;
+    size_t bias_count = 0;
+    RAD_TRY(gen_lora_prepare(ss, &packed, &replacements, &rep, &bias_count, err));
+    const int rank = cfg_.lora.rank(true);
+    /* Finish validation and packing before evicting an idle combination. A rejected
+     * adapter should leave the current slot available to subsequent requests. */
     const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int sl = -1;
     for (;;) {
@@ -500,29 +847,29 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
             return s;
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    const int rank = cfg_.lora.rank(true);
-    std::map<std::string, lora::Composite> comp;
-    lora::ComposeReport rep;
-    RAD_TRY(lora::compose(*lora_keys_, ss, rank, &comp, &rep, err));
-    if (rep.modules == 0) {
-        *err = "none of the adapters' modules is a module of this model" +
-               (rep.unplaced.empty() ? std::string() : " (" + rep.unplaced[0] + ")");
-        return RAD_E_NOTFOUND;
-    }
-    const std::map<std::string, lora::AdModule> mods = lora::as_modules(comp, *lora_keys_);
-    std::vector<std::vector<lora::PackedSite>> packed(ranks_.size());
-    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
-        lora::AdapterInfo info;
-        const int s = lora::pack_modules(ranks_[ri]->lora_sites, rank, mods, &info, &packed[ri], err,
-                                         /*compact=*/true);
-        if (s < 0) {
-            if (ranks_.size() > 1) *err = fmt("rank %zu: ", ri) + *err;
-            return s;
+    /* The adapter pools are outside the expert loan. Use the image lifecycle
+     * turn so continuously runnable text yields before the adapter upload. */
+    std::unique_lock<std::mutex> dispatch;
+    if (shared_) {
+        dispatch = shared_->lock_image_dispatch();
+        if (shared_->failed()) {
+            *err = "the shared service is shutting down";
+            return RAD_E_STATE;
         }
-        /* Pools past the last one a site names hold nothing (lora_declare's dropped GEMMs). */
-        packed[ri].resize(ranks_[ri]->program.lora_pools.size());
+        if (const int st = shared_->drain(shared_->text_); st < 0) {
+            *err = fmt("could not drain text work before uploading the image adapter: %s",
+                       rad_strerror(st));
+            return st;
+        }
+    }
+    if (const int st = gen_lora_copy_replacements(sl, replacements); st < 0) {
+        *err = fmt("could not upload image adapter replacement weights to slot %d: %s",
+                   sl, rad_strerror(st));
+        return st;
     }
     RAD_TRY(lora_copy(sl, packed, err));
+    if (bias_count)
+        RAD_INFO("lora: slot %d includes %zu bias deltas", sl, bias_count);
     /* The ranks each pool takes in this slot, before a pass can name the slot (the publish). */
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         Program& P = ranks_[ri]->program;

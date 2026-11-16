@@ -69,6 +69,7 @@ struct Site {
     std::string op;                  /* the gemm's op name */
     int32_t     n_modules = 0;       /* targeted sources */
     int32_t     max_rank = 0;
+    bool        fwht128_input = false;          /* shrink reads row-major H128(x) int8 codes */
     bool        parts_resolved = true;   /* false: the fused layout is decided by B rows at load */
     std::vector<SiteSource> sources;
     /* Per row part g of the weight (P = max(1, n_row_parts) entries): the part's rows in the
@@ -140,7 +141,8 @@ bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets
 
 /* Is this op a LoRA-capable GEMM over weight handle `w` (as its `b` operand)? `why` says why not.
  * gemm_nt; gemm_nt_bias without `act`; gemm_nt_q without `pb1`/`pb2`, with K == the weight's K,
- * over a weight whose known encoding has no `transform`; gemm_nt_q_bias (same encoding rule). */
+ * over a weight without a transform; gemm_nt_q_bias (same encoding rule).
+ * A generator's i8a8h GEMM over fwht128 int8 weights can also adapt in the rotated basis. */
 bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::string* why);
 
 /* Every op that reads a targeted weight (any view of it) and is not a capable site over it. */

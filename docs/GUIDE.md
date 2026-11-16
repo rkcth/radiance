@@ -321,7 +321,7 @@ and runs.
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
 | `nemotron35_embed` | Nemotron 3.5 Embed 1B/8B and Rerank 8B, BF16 text/image retrieval at TP1 (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
-| `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
+| `krea2` | Krea 2 Raw and Turbo, text-to-image with optional reference editing (§5.6) |
 | `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
 | `flux3`, `flux3distilled` | FLUX.3 [klein] and its base, an image model that also edits (§5.6); one plugin under the two names the releases give themselves |
 | `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
@@ -2195,7 +2195,8 @@ models:
 - **Kinds:** LoRA and LoCon (`alpha / rank * up @ down`; on SDXL a LoCon's convolutions too, its
   3 x 3 `down` read flattened as the UNet's im2col GEMMs read theirs), LoHa (`hada_w*`, applied exactly as a
   product of rank1 x rank2), LoKr (`lokr_w*`, by its Kronecker structure) and full deltas (`.diff`).
-  DoRA, OFT and Tucker cores are refused by name; bias and norm deltas are reported and left out.
+  DoRA, OFT and Tucker cores are refused by name; ComfyUI bias deltas can replace supported BF16 linear biases in a generator adapter slot.
+  Unsupported bias targets and norm deltas are reported.
 - **Choosing per request:** `/v1/images/generations`, `/v1/images/edits` and `/v1/videos` take
   `"loras": ["film", "ink:0.6", {"name": "style/watercolor", "weight": 0.8}]` (or an object
   `{"film": 1, "ink": 0.6}`), and Stable Diffusion web UI tags in the prompt, `<lora:film:0.8>`,
@@ -2219,6 +2220,419 @@ models:
   such GEMM for is reported and skipped, as UIs do.
 - `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/file.safetensors"}` adds a file
   under a name; unload removes it and frees the slots of every combination using it.
+
+### Bind ranks to visible devices
+
+Set `device-ordinal` under the model to bind its ranks in order. For example,
+`tp: 1` with `device-ordinal: [1]` uses the second visible device.
+`tp: 2` with `device-ordinal: [1, 0]` binds ranks 0 and 1 in that order.
+Ordinals follow the device inventory after the ROCm visibility mask.
+Radiance refuses duplicate or unavailable ordinals and requires the selected
+devices to share an architecture. Omit the key for automatic selection.
+
+The shared text/image profile uses the same binding for both engines.
+Run the ordinary VRAM admission checks for each process when several engines
+share a host.
+
+### Serving text and images together
+
+For Radiance 2.1, set `model` to the LLM checkpoint and `image-model` to the
+initial image checkpoint under one entry in `models`. Use
+`radiance --config FILE` to launch. The shared profile owns the listener and
+GPU memory loans, so it requires a single online text primary and uses
+its own generator reservations in place of fleet scheduling and parking.
+
+For example:
+
+```yaml
+models:
+  swift:
+    model: /models/swift.rad
+    image-model: /models/qwen-image-2.1-iq8r.rad
+    tp: 2
+    image-gen-max-pixels: 1048576
+    image-gen-max-refs: 1
+```
+
+`GET /v1/models` lists both IDs. Use the text ID with completions and the image ID with
+`/v1/images/generations` or `/v1/images/edits` as supported by the image checkpoint. By default
+both models use the same cards. With `--image-text-rank 1` and `--tp 2`, the image runtime and
+its checkpoint reservations use the GPU assigned to text rank 1. The rank is zero-based and
+follows the order of any explicit `--device-ordinal` arguments. The text engine still uses
+both cards, and image passes and text steps still take turns. The selected card must fit the
+whole image runtime in addition to its protected text allocations.
+
+Idle image memory can hold copies of MoE experts whose originals stay in
+host RAM. The service recalls those copies and restores image weights before image work, gives
+text a turn between image passes, and refills the expert slots afterward. Startup checks the
+combined memory plan and runs an image before opening the listener. If the text plan reports
+a full host pool, size the pool for the rank with the largest reported shortfall.
+An error about shared image weight RAM means the host cannot back the snapshot used
+to restore image weights after expert recall. The error reports the requested snapshot
+size and, when available, the memory limit or backend allocation error. Snapshots
+use pageable RAM by default. The active model needs a snapshot when lending generator
+weight memory, even with `image-model-cache-mib: 0`.
+
+Use `no-image-weight-loan` when the active generator's weight snapshot
+would exceed available host memory. Generator weights stay in VRAM, and
+text experts can still borrow unused generator activation memory while it
+is idle. Fewer text experts can stay in VRAM between generator requests.
+`image-model-cache-mib` still controls optional model snapshots.
+
+After explicit unload, `unloaded-image-expert-pool-mib` lets the text
+engine reuse freed VRAM for host-backed experts until the next generator
+activation. The cap is per generator GPU. The engine can use less based on
+free VRAM, headroom, the startup generator reservation and available experts.
+Use 0 to disable it, which is the CLI default.
+
+For a two-R9700 starting profile, build the repository's `Dockerfile` with
+`docker build --build-arg GPU_TARGETS=gfx1201 -t radiance-shared:local .`
+and set `RADIANCE_SHARED_IMAGE=radiance-shared:local`. The Compose file reads
+[the shared YAML example](../deploy/compose/swift-shared.radiance.yaml).
+Place the checkpoints named in that file in `RADIANCE_MODELS` and put local
+adapters in its `loras/` subdirectory. Supply the common Compose environment
+variables, including `RADIANCE_API_KEY`, `RENDER_GID` and `VIDEO_GID`. Run
+these commands from the repository root:
+
+```sh
+docker compose -f deploy/compose/swift-shared.yaml config --quiet
+docker compose -f deploy/compose/swift-shared.yaml up -d
+curl -f http://127.0.0.1:8000/health
+```
+
+The example binds to loopback. It caps text context at 2,048 tokens and
+image area at 1,048,576 pixels (for example, 1024×1024) with one reference.
+It sets a 12 GiB per-generator-GPU cap for post-unload expert slots, uses
+pageable image snapshots and reserves one rank-64 LoRA slot. Edit the
+Radiance YAML to change the example's memory and adapter settings. Check
+the per-rank startup memory plan before raising limits. Startup can take
+several minutes.
+
+Linear speculation is opt-in with `num-speculative-tokens`. Set `lora-dir` to a local image
+adapter directory to list adapters with `GET /v1/loras` and use them per image request. In shared
+mode every adapter target must match the model and the configured slot rank must hold the combined
+deltas. Adding a file makes it discoverable on the next listing. Use an atomic rename to replace
+a discovered adapter file. An explicit unload removes the name from discovery until an operator
+loads it again. Operator-loaded names remain registered until unload. Each admitted request captures the revision at the registered path.
+If every slot is in use, requests for another adapter combination wait in arrival order for a
+slot to free up. Waiting requests count toward the shared HTTP admission limit, which returns
+HTTP 429 with `Retry-After` when full. A client that disconnects gives up its place in the queue.
+
+#### Serving a second text model
+
+A listener can serve one supplemental text checkpoint on a spare GPU.
+With two visible GPUs, bind the primary text model to GPU 0 and the
+supplemental model to GPU 1:
+
+```yaml
+models:
+  primary:
+    model: /models/primary.rad
+    tp: 1
+    device-ordinal: [0]
+    supplemental-text-model: /models/secondary.rad
+    supplemental-text-device: 1
+```
+
+To serve a shared image checkpoint too, add `image-model: /models/image.rad` when
+the primary text and image profiles fit together on GPU 0.
+
+The supplemental GPU must be outside the primary text rank layout and have
+the same GPU architecture. The supplemental model runs on one GPU (TP1) and
+must fit its device and available host RAM without using the image-backed
+expert loan. It must use an architecture plugin distinct from the primary and
+from every image model activated while it runs. It inherits the primary's
+context and sequence limits and memory headroom settings. It uses its own
+tokenizer and chat template, with speculation off. The listener opens after
+the supplemental model generates a readiness token.
+
+If an MoE secondary needs more expert capacity than its GPU has, set
+`supplemental-text-host-pool-mib` to provide a pinned host pool for the
+secondary. It defaults to zero. Radiance checks available host memory and the
+container memory allowance against the pool and the configured host headroom.
+The primary's `--host-pool-mib` and GPU placement are configured independently.
+
+Find the supplemental ID with `GET /v1/models` and pass it in the `model`
+field on `/v1/chat/completions` or `/v1/completions`. Omitting `model`
+keeps the primary as the default. Choose the supplemental checkpoint at
+startup. Changing it requires a restart.
+
+#### Switching image models
+
+List each additional checkpoint under `image-model-reserve`.
+Startup loads these checkpoints in turn to measure their VRAM footprint, then budgets Swift
+against the largest footprint on each card. This increases startup time. The model named
+by `image-model` is the one initially served. A replacement whose planned footprint exceeds
+that reservation is refused so text can still grow to its configured context limit.
+
+Set `--image-reload-headroom-mib N` to hold extra VRAM on each shared generator
+rank for allocation growth between startup measurement and a later model
+reload. When `--image-text-rank` selects one rank, only that card reserves
+it. The default is zero. This reduces the VRAM available to the text
+engine and leaves the measured maximum generator footprint in place.
+On the tested two-R9700 Swift and Krea 2 Raw profile, 384 MiB per rank
+let Krea reload after an operator unload. The run with zero extra
+headroom returned HTTP 503 when the live VRAM budget fell below the
+checkpoint's weight plan.
+
+Reserved checkpoints appear in `GET /v1/models` under their filename stems. Send that ID in
+`model` on a generation or edit request to queue the model switch and the image together. The
+same request carries references, seed and LoRA strengths. LoRA sources are copied into
+immutable host snapshots at admission. Replacing or unloading a source affects new requests.
+Requests already admitted use their captured bytes. Unload returns HTTP 202 with the
+number of queued and running requests using the name while any are still draining.
+New requests naming it get HTTP 404, and reloading that name can proceed once the
+last admitted request retires. Manually loaded adapter names are shared
+across the image catalog, and the selected model checks compatibility when it composes the
+adapter. The live source budget is `--image-lora-snapshot-mib` (default 2048 MiB). Requests
+sharing a revision share its charge. Image cache allocations that can yield
+also account for the unused part of this budget. Set the budget to cover the
+distinct adapter revisions your workload queues together. Actual admission
+still depends on available host memory and returns HTTP 429 with `Retry-After`
+when there is insufficient room.
+
+`GET /v1/loras?model=IMAGE_ID` rescans local adapter names for a registered image
+model, including an inactive one. IDs include the relative subdirectory, so
+`style` and `portraits/style` are distinct candidates. The catalog labels candidates
+`compatibility: "unchecked"`. A file being copied under its final name may appear
+in the listing. Shared image admission rejects incomplete safetensors before
+the request enters the image queue. To make a copy visible only when complete,
+write it under a temporary suffix and rename it to `.safetensors` in the same
+directory. Radiance checks model compatibility during composition. Omitting the
+query parameter uses the active image model, if one is published.
+
+On a shared listener, use `POST /v1/loras/validate` with the active image model ID and
+the adapter choices you intend to send, for example
+`{"model":"krea-2-raw-edit-iq8r","loras":{"turbo":0.6,"textfusion":1.0}}`.
+This operator endpoint checks the combination's current source revisions at the given
+strengths. It runs the same CPU composition and packing as generation, including
+exact rank, target, shape and bias checks. Success leaves GPU slots free for
+generation. Retry a 429 when adapter composition or the admission budget is busy.
+An inactive model returns 409.
+
+On a shared listener, omitting `model` on a generation or edit selects the
+last successfully selected image model when the request enters the model
+queue. Queued requests select the registered checkpoint revision. If a file is
+replaced, use the operator load endpoint to register the new revision before switching to it.
+Keep checkpoint files immutable while they are in use. Cold rollback
+after an atomic replacement relies on the storage preserving the original
+bytes through an already-open file descriptor. This failed on a tested
+Docker Desktop host bind mount and passed on the tested container-native
+Linux overlay filesystem. Each image request gets its own turn, and the engine can switch after the driver retires the request.
+
+By default, requests for the active model can pass earlier requests for other models. Each
+waiting request can be passed at most twice, and after five seconds it cannot be passed again.
+These limits determine dispatch order after the current image finishes. Use
+`image-model-fifo` to dispatch in model queue admission order. Radiance
+validates and pins requested LoRA sources before queue admission. Preparing
+an adapter can therefore affect when its request joins the queue.
+
+Each generation or edit returns its result on the original HTTP request.
+Keep a client-side ID with each in-flight request so it can save the response
+under the right name even if another request finishes first. In the JSON
+response, each `data` item contains `b64_json` and the seed used. If you ask for
+a streamed response, read `image_generation.completed` or
+`image_edit.completed` on that request's SSE connection. The event's `index`
+identifies the image within that request. `GET /v1/images/status` reports
+aggregate queue state.
+
+Successful shared image responses include a `Server-Timing` header.
+`image_queue` measures queue wait in milliseconds, `image_selection` measures
+model selection in milliseconds, and `image_activation` describes the dispatch
+as `active`, `warm` or `cold`. On a keyed listener, including the Compose example
+above, send the key with `Authorization: Bearer $RADIANCE_API_KEY`. The curl
+examples below assume the key is available in your shell.
+
+Use `POST /v1/images/register_model` with the same `model` and `path` fields shown below
+to add a local checkpoint to the catalog without activating it. Registration checks the
+container and records its file identity. Architecture compatibility and the startup memory
+reservation are checked on activation. Re-registering the same ID and revision is
+idempotent. A different revision under the same ID requires an operator load.
+
+An operator can replace an idle image checkpoint without restarting the text runtime:
+
+```sh
+curl http://127.0.0.1:8000/v1/images/load_model \
+  -H "Authorization: Bearer $RADIANCE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"krea-2","path":"/models/krea-2-raw-edit-iq8r.rad"}'
+```
+
+These management routes are Radiance extensions. Use the configured API key on a keyed listener. A keyless
+listener accepts these operations from a local operator. The endpoint returns HTTP 409 if a media generation or adapter
+request holds or is waiting for a turn. A successful operator load also registers its model ID.
+The model is published after a successful generation probe. A startup
+`image-model-reserve` may also name a local audio checkpoint. Use its filename
+stem as the explicit `model` in `POST /v1/audio/speech`. Audio and images share the
+same activation queue. An audio switch preserves the default image model for
+subsequent image requests. Image LoRA options apply to the image runtimes.
+For example, with a reserved `minimax-music3-fp8.rad`, send:
+
+```sh
+curl http://127.0.0.1:8000/v1/audio/speech \
+  -H "Authorization: Bearer $RADIANCE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"minimax-music3-fp8","input":"[verse] Morning light","instructions":"Acoustic pop","duration":10,"seed":7}' \
+  -o song.wav
+```
+
+The same load route can activate an audio or video checkpoint under a new ID if it
+fits the startup reservation. Use startup reservation or direct load for these
+models. The registration-only route is intended for image checkpoints.
+
+For a reserved video checkpoint, send its filename stem as the explicit `model`
+in `POST /v1/videos`. This requires a build with MP4 encoding. The generation
+request joins the shared queue and returns a video job ID after submission. Poll
+`GET /v1/videos/{id}` and download the finished file from
+`GET /v1/videos/{id}/content`. The job remains available after the listener
+switches models, subject to the usual video retention limits. Video switches
+preserve the default image model. For LTX-2.5 on a 32 GiB card, use
+`--video-tower-placement ram` to pin its encoder in host memory. With TP2 text,
+choose the card for both image and video models with `--image-text-rank N`.
+The LTX plugin runs on one rank. The selected card must still accommodate
+text KV and other protected allocations. The tested LTX-2.5 FP8 and TP2
+Swift profile failed startup because the media rank had no room for text KV.
+A one-card test with a Qwen3.5-0.8B text primary and
+`--image-reload-headroom-mib 64` generated and retained an LTX clip.
+That run took about 105 seconds to activate LTX and exceeded the client's
+30-second chat timeout during the switch. The extra allowance helped
+the model fit for reload. Cold-load latency depends on the checkpoint
+and driver.
+
+Both operator loads and request-triggered switches can pause text during
+checkpoint initialization and cold snapshot capture. This can take minutes,
+depending on snapshot size, memory mode, and driver behavior. Warm switches
+reuse the host snapshot and rebuild the image runtime.
+If a checkpoint cannot be loaded, Radiance attempts to bring the previous checkpoint back. For portable rollback, give each revision a
+distinct path and keep the previous file until the new model passes its probe. Keep any
+file that remains registered for later switching. On a Docker Desktop bind mount, an atomic
+replacement can make parts of the old file unreadable through an already-open descriptor.
+
+Operators can use `GET /v1/images/status` to see the published model, the target of a switch,
+and the number of waiting requests by model. The reported states are `registered`,
+`host_cached`, `activating`, `active`, `draining`, and `failed`. Each model entry's
+`revision` is an opaque string scoped to the running server and model ID. It stays
+stable across cache restores, unloads and reloads of the same checkpoint file
+identity, and changes when an operator load publishes a replacement. An unsuccessful
+request-driven activation marks the selected registered revision as `failed`.
+Requests can retry it. A successful activation clears that state. An unsuccessful
+operator replacement preserves the prior registration.
+During a model update, `cache_status_available` can be false. In that case an
+inactive model may show as `registered` even if it has a host snapshot.
+The `inactive_cache_bytes` field measures the weight bytes in retained inactive
+snapshots. It is null while the cache status is unavailable.
+
+Use `POST /v1/images/unload_model` with `{"model":"krea-2"}` to release that model's
+runtime and any cached snapshot. The operation temporarily closes the entire image queue
+to new requests with HTTP 429 and waits for accepted requests to finish. It preserves the
+registration, so a later image request can load the model again. Text serving continues
+while accepted image requests drain. It pauses while the service drains the
+GPU streams and releases snapshot memory. Unload also releases the generator
+regions lent to text experts. The text engine keeps the placement and KV
+budgets computed at shared startup. A text-only startup computes a new
+placement from the VRAM available without the generator reservation.
+
+Use `--image-embedding-placement vram` if changes in available host RAM
+cause image models to switch embedding tiers between activations. This setting
+applies to every registered image model. Include those models in the startup
+reservation because their VRAM footprint and snapshot size can increase.
+`ram` requires a compatible embedding and enough pinned host RAM at activation.
+`auto`, the default, uses the usual placement checks on each activation.
+The text engine has its own `--embedding-placement` setting.
+
+Set `image-model-cache-mib` to keep prepared image weights in host RAM across
+model switches. The budget counts the active checkpoint's expert-loan snapshot and the inactive
+snapshots, summed across GPU ranks. The active snapshot stays available even when it exceeds the
+budget. At the default 0, only the active checkpoint's expert-loan snapshot is retained.
+Radiance evicts the least recently used inactive snapshots to fit the budget or make room for
+new allocations. If a generation request needs more room for its LoRA sources, Radiance can
+evict inactive snapshots and retry once while preserving the configured host reserve. If no expert loan needs a snapshot, Radiance creates one only when the full
+checkpoint fits the cache and host headroom permits. A warm switch restores the device weight pool
+from its host copy and reads any host-placed weights from disk. It rebuilds
+the runtime and runs the generation probe. The cache lasts until eviction or process exit.
+
+Snapshots use pageable memory by default. Transfers use bounded pinned staging
+on the AQL backend. Set `--image-snapshot-memory pinned` to use direct snapshot
+copies. Pinning can reduce recall transfer overhead and increase capture time.
+The host budget and headroom checks apply in both modes. Text expert backing
+uses its own placement and memory settings.
+
+Size host RAM for text expert backing, active and inactive snapshots, adapter
+sources, and transient allocations. The snapshot budget covers snapshot bytes.
+During a cold switch, the old snapshot can stay in RAM while the replacement
+loads and captures its own copy. The host headroom check uses a point-in-time
+memory sample. An inactive snapshot may be evicted even when both checkpoints
+fit within the cache budget. In the model status, an evicted checkpoint
+remains registered. Its next activation can report `cold` in `Server-Timing`.
+
+Pinned snapshots increase the launch's minimum host-memory requirement.
+Account for the temporary overlap between snapshots when sizing pinned profiles.
+
+To stack local adapters on the Krea Raw checkpoint, configure an adapter slot with
+`lora-dir: /loras`, `max-loras: 1`, and `max-lora-rank: 128` and send the chosen strengths with the request:
+
+```sh
+curl http://127.0.0.1:8000/v1/images/generations \
+  -H "Authorization: Bearer $RADIANCE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"krea-2","prompt":"A red ceramic mug on a cream backdrop","size":"1024x1024","seed":7,"num_inference_steps":12,"loras":[{"name":"krea2_turbo_lora_rank_64_bf16","weight":0.6},{"name":"Krea2_TextFusion_Refusal_Reduction","weight":1.0}]}'
+```
+
+The adapter names are the local file stems reported by `GET /v1/loras`.
+
+#### Krea 2 reference edits and outfill
+
+An edit-enabled Krea Raw container serves both `/v1/images/generations` and
+`/v1/images/edits` under the same model name. Convert the full Diffusers pipeline, including the
+Qwen3-VL vision tower and the VAE encoder:
+
+```sh
+rad-convert /models/Krea-2-Raw -o krea-2-raw-edit-iq8r.rad \
+  --set pipeline.krea_reference_encoder=1 --recipe data/recipes/krea-2-iq8r.recipe
+```
+
+Use a matching Radiance executable and plugins. Keep the adapters in the configured
+`lora-dir` and allow rank 128 to stack the rank-64 Turbo LoRA with rank-64 Identity Edit or
+rank-32 Registered Outpaint. An ordinary edit takes an instruction and one reference by default.
+Start Radiance with `image-gen-max-refs: 2` to budget for two references. Send them in order in
+the JSON `images` array and identify their roles in the prompt. Krea fits and centers each
+reference independently. The optional `ref_boost` applies to all reference tokens. A value of 1
+leaves attention unchanged. Use 1024×1024 references for the tested Identity Edit V2 profile.
+Its two-reference ComfyUI workflow uses the first image as the scene and the second as the
+subject. Radiance and ComfyUI both carried the second subject's appearance into the first
+scene in a matched-input two-person fixture that asked for posture alone. Pose-only transfer with
+identity preservation remains unqualified.
+
+For the Registered Outpaint adapter, send a single image to `/v1/images/edits` with
+`size: "1024x1024"`, an `outfill` object, and a scene description. The source's long edge scales
+to 1024. The object accepts `horizontal` as `left`, `center` or `right` and `vertical` as
+`top`, `center` or `bottom`. Default placement is top left. The result blends the source back
+along a 32-pixel seam. The outfill profile uses the ComfyUI simple Euler schedule with eight steps
+by default. `guidance_scale: 0` is ComfyUI CFG 1 for Krea.
+The same numeric seed can produce different starting noise in Radiance and ComfyUI.
+If the adapter generates a solid border in an area that should extend the scene,
+try another explicit seed. Use the returned seed with the same model, adapters,
+request settings and runtime configuration to reproduce a result.
+
+The outfill client accepts a scene description directly. To generate one, set
+`--primary-caption-model` to a text model with a vision tower on the Radiance
+listener. If captioning fails and a separate endpoint is configured, the client
+tries that endpoint. You can use the separate endpoint on its own. Set
+`RADIANCE_API_KEY` for the Radiance listener and `CAPTION_API_KEY` for the separate
+caption endpoint. Use the listener URL and the registered Krea and caption
+model IDs from `GET /v1/models`. These examples use the shared Compose
+profile's default loopback port.
+
+```sh
+python3 scripts/krea2_outfill.py input.png output.png \
+  --url http://127.0.0.1:8000/v1 --model krea-2-raw-edit-iq8r \
+  --prompt "A girl posing in a sunlit studio"
+python3 scripts/krea2_outfill.py input.png output.png \
+  --url http://127.0.0.1:8000/v1 --model krea-2-raw-edit-iq8r \
+  --primary-caption-model "${RADIANCE_CAPTION_MODEL:?set the primary vision model ID}" \
+  --caption-url http://127.0.0.1:8010/v1 \
+  --caption-model "${CAPTION_MODEL:?set the fallback vision model ID}"
+```
 
 ### 4.10 Control vectors
 
@@ -2918,8 +3332,10 @@ length, since its cache then takes what the cards have left. It sizes its buffer
 **Krea 2 and FLUX.3 [klein]** take the same fields with their own defaults. Both make RGB pictures
 (`background: transparent` is a 400), 1024x1024 by default, sides rounded down to multiples of 16,
 up to 2048x2048 (16384 latent tokens). Krea 2 Raw runs 28 steps at guidance 4.5 against an empty
-negative prompt and Turbo 8 steps unguided; Krea 2 reads only text, so `/v1/images/edits` answers
-501. FLUX.3 [klein] runs 16 steps unguided and its base 50 at guidance 3.5; both edit from up to
+negative prompt and Turbo 8 steps unguided. Krea 2 checkpoints with the optional reference
+encoder serve edits. Generation-only checkpoints return HTTP 501 for edits. See
+[Krea 2 reference edits and outfill](#krea-2-reference-edits-and-outfill). FLUX.3 [klein] runs
+16 steps unguided and its base 50 at guidance 3.5. Both FLUX.3 profiles edit from up to
 ten pictures, each shrunk to 1024x1024 of area when larger. The guidance scale is `guidance_scale`
 or `true_cfg_scale` (one of them), in the model card's terms. FLUX.3's pipeline can rewrite a
 prompt with a separate language model first; radiance reads the prompt as given. Krea 2 takes one

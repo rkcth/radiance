@@ -1,0 +1,15 @@
+# Opt-in shared Swift and image serving on two R9700s.
+# Set RADIANCE_SHARED_IMAGE to a local build of this branch.
+name: radiance-swift-shared
+configs:
+  radiance:
+    file: ./swift-shared.radiance.yaml
+services:
+  radiance:
+    extends:
+      file: tp2.yaml
+      service: radiance
+    container_name: radiance-swift-shared
+    image: ${RADIANCE_SHARED_IMAGE:?set RADIANCE_SHARED_IMAGE to your shared Radiance build}
+    environment:
+      ROCR_VISIBLE_DEVICES: "0,1"

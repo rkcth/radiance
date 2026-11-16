@@ -963,6 +963,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `attn_paged_anchor_window` | same parameters as `attn_paged` | same operands as `attn_paged` → `out` |
 | `attn_paged_sink` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`?, `sinks`w → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
+| `attn_dense_ref` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens` → `out`, `mode_cu`, `ref_log_bias` |
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
@@ -1018,6 +1019,12 @@ with `window_right = r + 1` (non-causal only: key `j` visible when `i - j < wind
 `j - i < window_right`). `q`, `k` and `v` may each be `[tokens, heads, head_dim]` or
 `[tokens, heads * head_dim]`, and the second form may be a column slice of a fused projection read
 at its row pitch, so a tower's `[q|k|v]` row needs no copy.
+
+**`attn_dense_ref`** requires `causal = 0`. For `S` sequences, the int32 `mode_cu` array
+contains `3*S+1` offsets: the text, reference and target starts for each sequence, then the
+final row offset. The float32 `ref_log_bias` array has one value per sequence. The kernel adds
+that value to scores from target queries to reference keys. A bias of negative infinity instead
+restricts reference queries to their own reference keys.
 
 **`attn_cross`** is `attn_dense` with each entry's keys a run of their own: entry `s`'s queries
 are rows `[cu_seqlens[s], cu_seqlens[s+1])` of `q`, its keys and values rows `[cu_k[s], cu_k[s+1])`

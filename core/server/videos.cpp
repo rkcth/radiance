@@ -76,6 +76,7 @@ struct Server::VideoJob {
     std::string id, model, prompt, seconds, size;
     int64_t     created_at = 0;
     uint64_t    seed = 0;
+    int64_t     fps_num = 1, fps_den = 1;
     int32_t     sampler = 0;   /* the request's RAD_SAMPLER_* */
     double      shift_video = 0, shift_audio = 0;   /* 0: the model's */
     std::shared_ptr<gen::VideoTicket> ticket;
@@ -271,14 +272,11 @@ void Server::video_caps(json& caps, const IVideoGen* gen) {
 }
 
 HttpResponse Server::handle_video_create(const HttpRequest& req) {
-    if (!deps_.videos || !deps_.tok)
+    if (!deps_.videos && !opt_.queue_video)
         return error_response(err_not_implemented(
             "/v1/videos requires a video generation model; this one does not make video"),
                               req.peer);
-    const VideoGenInfo& info = deps_.videos->info();
 
-    const bool takes_refs = info.max_ref_images > 0 || info.max_ref_videos > 0 ||
-                            info.max_ref_audios > 0;
     /* JSON, or a form whose fields are strings (OpenAI's clients send the create call as a form,
      * since it may carry a file). Reference media and keyframes are file parts, collected here and
      * checked once the task is known. */
@@ -374,14 +372,60 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     std::string prompt = body["prompt"].get<std::string>();
     /* Runtime LoRA adapters: `loras` and <lora:...> tags, which leave the prompt. */
     std::vector<std::pair<std::string, double>> loras;
+    std::string lora_field;
     {
-        std::string field, why;
-        if (parse_loras(body, &prompt, &loras, &field, &why) < 0) return bad(field.c_str(), why);
-        if (!loras.empty() && !opt_.gen_lora_acquire)
-            return error_response(err_unsupported(field.c_str(), "this server was started without "
-                                                                 "adapters (--lora, --lora-dir)"),
-                                  req.peer);
+        std::string why;
+        if (parse_loras(body, &prompt, &loras, &lora_field, &why) < 0)
+            return bad(lora_field.c_str(), why);
     }
+    auto release_admission = [this](Server*) { release(1); };
+    std::unique_ptr<Server, decltype(release_admission)> admission(nullptr, release_admission);
+    std::shared_ptr<void> dispatch_hold;
+    Deps::VideoEndpoint video = deps_.videos;
+    std::string model = opt_.model_id;
+    if (opt_.queue_video) {
+        if (!has(body, "model") || !body["model"].is_string() ||
+            body["model"].get_ref<const std::string&>().empty())
+            return bad("model", "expected a nonempty video model ID");
+        model = body["model"].get<std::string>();
+        if (auto no = admit(1, req.peer)) return *no;
+        admission.reset(this);
+        size_t bytes = req.body.size() + ref_bytes.size();
+        for (const auto& part : req.form) bytes += part.data.size();
+        for (const auto& ref : refs) bytes += ref.data.size();
+        for (const auto& key : keys) bytes += key.data.size();
+        const auto cancelled = [&] { return stopping_.load() || req.peer_gone(); };
+        std::string why;
+        const int status = opt_.queue_video(model, bytes, size_t(queue_depth_),
+                                            2 * opt_.max_body_bytes, cancelled, &video,
+                                            &dispatch_hold, &why);
+        if (status == RAD_E_CANCELLED && !stopping_.load()) {
+            metrics_.observe_http(499);
+            return HttpResponse::text(499, "client closed request\n");
+        }
+        if (status == RAD_E_FULL) {
+            metrics_.observe_rejected();
+            return error_response(err_overloaded(why), req.peer);
+        }
+        if (status < 0 || !video || !dispatch_hold) {
+            ApiError err = err_bad("model", why.empty() ? "could not select the video model" : why);
+            if (status == RAD_E_NOTFOUND) { err.status = 404; err.type = "not_found_error"; }
+            if (status == RAD_E_CANCELLED || status == RAD_E_STATE || status == RAD_E_NOMEM ||
+                status == RAD_E_IO || status == RAD_E_DEVICE || status >= 0) {
+                err.status = 503;
+                err.type = "service_unavailable";
+            }
+            return error_response(err, req.peer);
+        }
+    }
+    const auto& lora_acquire = opt_.queue_video ? video.lora_acquire : opt_.gen_lora_acquire;
+    if (!loras.empty() && !lora_acquire)
+        return error_response(err_unsupported(lora_field.c_str(), "this model has no runtime adapters"),
+                              req.peer);
+    const VideoGenInfo& info = video.gen->info();
+    const bool takes_refs = info.max_ref_images > 0 || info.max_ref_videos > 0 ||
+                            info.max_ref_audios > 0;
+
     if (has(body, "input_reference")) {
         /* JSON: a data URL, as a string or an image_url object. */
         const json& v = body["input_reference"];
@@ -737,7 +781,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
      * at its own size. The first frame is stretched unless first_frame_mode=center, the last is
      * centre-cropped. `canvas` parallels r->refs. */
     std::vector<mm::Frame> canvas;
-    if (has_keys && deps_.mm) {
+    if (has_keys && video.mm) {
         canvas.resize(r->refs.size());
         for (size_t i = 0; i < r->refs.size(); ++i) {
             gen::VideoRefMedia& m = r->refs[i];
@@ -745,7 +789,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 m.kind != gen::VideoRefMedia::LAST_FRAME)
                 continue;
             std::string why;
-            if (deps_.mm->encoder_image_canvas((const uint8_t*)m.data.data(), m.data.size(),
+            if (video.mm->encoder_image_canvas((const uint8_t*)m.data.data(), m.data.size(),
                                                (int32_t)W, (int32_t)H,
                                                m.kind == gen::VideoRefMedia::LAST_FRAME ||
                                                    first_center,
@@ -759,7 +803,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 int32_t sw = 0, sh = 0;
                 gen::video_small_size(geo, r->width, r->height, r->upscale, &sw, &sh);
                 mm::Frame small;
-                if (deps_.mm->encoder_image_canvas((const uint8_t*)m.data.data(), m.data.size(),
+                if (video.mm->encoder_image_canvas((const uint8_t*)m.data.data(), m.data.size(),
                                                    sw, sh,
                                                    m.kind == gen::VideoRefMedia::LAST_FRAME ||
                                                        first_center,
@@ -783,7 +827,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         const size_t p = t.find(kSlot);
         auto put = [&](std::vector<int32_t>* out, const std::string& s, bool special) {
             if (s.empty()) return;
-            const auto ids = deps_.tok->encode(s, false, special);
+            const auto ids = video.tok->encode(s, false, special);
             out->insert(out->end(), ids.begin(), ids.end());
         };
         auto render = [&](const std::string& text, std::vector<int32_t>* out) {
@@ -791,7 +835,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             put(out, text, false);
             put(out, t.substr(p + kSlot.size()), true);
         };
-        if ((ref2va || has_keys) && deps_.mm && deps_.mm->accepts(MediaKind::Image)) {
+        if ((ref2va || has_keys) && video.mm && video.mm->accepts(MediaKind::Image)) {
             /* Every picture is processed before any token is laid down. ComfyUI also shows the text
              * encoder a video's frames at 2 fps, which this does not. */
             std::vector<std::shared_ptr<mm::Item>> pics;
@@ -814,10 +858,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 std::string why;
                 int rc;
                 if (keyframe(m) && !canvas.empty() && canvas[i].w > 0)
-                    rc = deps_.mm->prepare_frame(canvas[i], &it, &why);
+                    rc = video.mm->prepare_frame(canvas[i], &it, &why);
                 else {
                     const std::vector<uint8_t> bytes(m.data.begin(), m.data.end());
-                    rc = deps_.mm->prepare(MediaKind::Image, bytes, mo, &it, &why);
+                    rc = video.mm->prepare(MediaKind::Image, bytes, mo, &it, &why);
                 }
                 if (rc < 0 || !it)
                     return bad(m.name.c_str(), "'" + m.name + "' could not be used: " + why);
@@ -915,7 +959,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     /* ---- every reference as its VAE encoder takes it (the keyframes are done above): pictures and
      * video frames fitted to the encoder's bounds, soundtracks as mono samples at the model's rate,
      * one copy a channel. The driver pads both to the encoders' clips and hops. */
-    if ((ref2va || !keys.empty()) && deps_.mm) {
+    if ((ref2va || !keys.empty()) && video.mm) {
         for (gen::VideoRefMedia& m : r->refs) {
             std::string why;
             const uint8_t* p = (const uint8_t*)m.data.data();
@@ -925,15 +969,15 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             if (m.kind == gen::VideoRefMedia::FIRST_FRAME || m.kind == gen::VideoRefMedia::LAST_FRAME)
                 continue;
             if (m.kind == gen::VideoRefMedia::IMAGE)
-                st = deps_.mm->encoder_image(p, n, (int32_t)info.enc_ratio,
+                st = video.mm->encoder_image(p, n, (int32_t)info.enc_ratio,
                                              (int32_t)info.max_enc_side, &fr[0], &why);
             else if (m.kind == gen::VideoRefMedia::VIDEO)
-                st = deps_.mm->encoder_video(p, n, (int32_t)info.enc_ratio,
+                st = video.mm->encoder_video(p, n, (int32_t)info.enc_ratio,
                                              (int32_t)info.max_enc_side,
                                              (int32_t)info.max_enc_frames, &fr, &why);
             else {
                 std::vector<float> mono;
-                if (deps_.mm->encoder_audio(p, n, (int32_t)info.sample_rate, info.max_enc_samples,
+                if (video.mm->encoder_audio(p, n, (int32_t)info.sample_rate, info.max_enc_samples,
                                             &mono, &why) < 0 || mono.empty())
                     return bad(m.name.c_str(), "'" + m.name + "' could not be decoded: " + why);
                 m.enc_channels = (int32_t)info.channels;
@@ -949,10 +993,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         }
     }
 
-    /* ---- admitted and queued: the job holds its place until its file is written */
+    /* The driver retains the model turn and the job retains HTTP admission through muxing. */
     if (!loras.empty()) {
         std::string why, note;
-        const int s = opt_.gen_lora_acquire(loras, &r->lora_slot, &r->lora_hold, &note, &why);
+        const int s = lora_acquire(loras, &r->lora_slot, &r->lora_hold, &note, &why);
         if (s < 0) {
             ApiError e = err_bad("loras", why);
             if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
@@ -960,10 +1004,25 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             return error_response(e, req.peer);
         }
     }
-    if (auto no = admit(1, req.peer)) return *no;
+    /* Shared requests may disconnect during preprocessing or adapter composition. */
+    if (opt_.queue_video) {
+        if (stopping_.load())
+            return error_response(err_overloaded("the server is shutting down"), req.peer);
+        if (req.peer_gone()) {
+            metrics_.observe_http(499);
+            return HttpResponse::text(499, "client closed request\n");
+        }
+    }
+    if (!admission) {
+        if (auto no = admit(1, req.peer)) return *no;
+        admission.reset(this);
+    }
+    r->dispatch_hold = std::move(dispatch_hold);
     auto j = std::make_shared<VideoJob>();
     j->id = new_video_id();
-    j->model = opt_.model_id;
+    j->model = model;
+    j->fps_num = info.fps_num;
+    j->fps_den = info.fps_den;
     j->prompt = prompt;
     j->seconds = auto_len ? std::string("auto") : rad::fmt("%.2f", (double)frames / fps);
     j->size = std::to_string(W) + "x" + std::to_string(H);
@@ -991,9 +1050,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     const double upscale = r->upscale;
     {
         std::string w;
-        const int s = deps_.videos->submit(std::move(r), &w);
+        const int s = video.gen->submit(std::move(r), &w);
         if (s < 0) {
-            release(1);
             ApiError e = err_bad("", w.empty() ? std::string(rad_strerror(s)) : w);
             if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
             return error_response(e, req.peer);
@@ -1024,16 +1082,16 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         video_work(j);
         if (deps_.background) deps_.background->fetch_sub(1);
     });
+    admission.release();
     return HttpResponse::json_body(200, json_dump(video_json(*j)));
 }
 
 /* The job's thread. Progress is the steps' share of 90, then the frames' of the last 10. */
 void Server::video_work(std::shared_ptr<VideoJob> j) {
     gen::VideoTicket& t = *j->ticket;
-    const VideoGenInfo& info = deps_.videos->info();
     mm::Mp4Writer mp4;
     std::string why;
-    int st = mp4.open(t.width, t.height, info.fps_num, info.fps_den, t.sample_rate, t.channels,
+    int st = mp4.open(t.width, t.height, j->fps_num, j->fps_den, t.sample_rate, t.channels,
                       &why);
     int32_t frames = 0;
     bool aborted = false;
@@ -1070,7 +1128,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
                 RAD_INFO("video %s: step %d/%d", j->id.c_str(), e.steps_done, t.steps);
         } else if (e.kind == gen::VideoEvent::LENGTH) {
             std::lock_guard<std::mutex> lk(videos_m_);
-            j->seconds = rad::fmt("%.2f", (double)e.n * info.fps_den / info.fps_num);
+            j->seconds = rad::fmt("%.2f", (double)e.n * j->fps_den / j->fps_num);
         } else if (e.kind == gen::VideoEvent::AUDIO) {
             if (t.channels > 0)
                 st = mp4.add_audio(e.samples.data(), (int64_t)e.samples.size() / t.channels, &why);
@@ -1248,7 +1306,7 @@ json Server::video_json(const VideoJob& j) {
 }
 
 HttpResponse Server::handle_video_get(const HttpRequest& req) {
-    if (!deps_.videos)
+    if (!deps_.videos && !opt_.queue_video)
         return error_response(err_not_implemented("/v1/videos requires a video generation model"),
                               req.peer);
     const std::string id = req.param("id");
@@ -1263,7 +1321,7 @@ HttpResponse Server::handle_video_get(const HttpRequest& req) {
 }
 
 HttpResponse Server::handle_video_list(const HttpRequest& req) {
-    if (!deps_.videos)
+    if (!deps_.videos && !opt_.queue_video)
         return error_response(err_not_implemented("/v1/videos requires a video generation model"),
                               req.peer);
     int64_t limit = 20;
@@ -1302,7 +1360,7 @@ HttpResponse Server::handle_video_list(const HttpRequest& req) {
 }
 
 HttpResponse Server::handle_video_delete(const HttpRequest& req) {
-    if (!deps_.videos)
+    if (!deps_.videos && !opt_.queue_video)
         return error_response(err_not_implemented("/v1/videos requires a video generation model"),
                               req.peer);
     const std::string id = req.param("id");
@@ -1371,7 +1429,7 @@ bool Server::video_content(const VideoJob& j, const HttpRequest& req, HttpRespon
 }
 
 HttpResponse Server::handle_video_content(const HttpRequest& req) {
-    if (!deps_.videos)
+    if (!deps_.videos && !opt_.queue_video)
         return error_response(err_not_implemented("/v1/videos requires a video generation model"),
                               req.peer);
     const std::string id = req.param("id");

@@ -115,6 +115,23 @@ int rv_barrier(Rendezvous& rv, int world) {
 /* One resolved instance's view of the world: its own buffers and its peers', the latter in
  * ascending global rank with this rank removed (the order libr4d's wide entry points take). */
 struct ArInst {
+    ArInst() = default;
+    ArInst(const ArInst&) = delete;
+    ArInst& operator=(const ArInst&) = delete;
+
+    ~ArInst() {
+        if (host) {
+            r4d_ar_host_free(my_scratch);
+            r4d_ar_host_free(my_flags);
+        } else {
+            r4d_ar_ipc_free(my_scratch);
+            r4d_ar_ipc_free(my_flags);
+        }
+        r4d_ar_ipc_free(my_seq);
+        r4d_ar_ipc_free(locpack);
+        r4d_ar_ipc_free(my_stage);
+    }
+
     int  rank = 0, world = 0;
     long long group = 0;      /* the tensor-parallel group it rendezvoused in (rv_for) */
     long my_scratch = 0, my_flags = 0, my_seq = 0, locpack = 0;
@@ -348,7 +365,6 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
 
     char handle[R4D_AR_HANDLE_BYTES];
     int  hlen = 0;
-    long sc = 0, fl = 0, sq = 0, lp = 0;
     int  dev = 0;
 
     /* Fine-grained: the peer writes the scratch and this rank reads it bypassing L2, so a
@@ -363,26 +379,27 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
      * reads them, and coarse-grained: only this rank's kernels touch them, with device- and
      * agent-scope atomics, which then complete in L2 rather than past it -- the first returning
      * atomic of every launch (r4d_ar_seq_take) is on the push's path. */
+    /* Record each allocation as it succeeds so a partial construction owns
+     * the same cleanup path as an instance that completed rendezvous. */
     R4D_TRY("ar_ipc_alloc",
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
         if (host) {
-            sc = r4d_ar_host_alloc((long)nslots * in->slot_bytes);
-            fl = r4d_ar_host_alloc((flag_words + 2L * maxb) * 4);
+            in->my_scratch = r4d_ar_host_alloc((long)nslots * in->slot_bytes);
+            in->my_flags = r4d_ar_host_alloc((flag_words + 2L * maxb) * 4);
         } else {
-            sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
-            fl = r4d_ar_ipc_alloc((flag_words + 2L * maxb) * 4, 1, handle, &hlen);
+            in->my_scratch = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
+            in->my_flags = r4d_ar_ipc_alloc((flag_words + 2L * maxb) * 4, 1, handle, &hlen);
         }
-        sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
+        in->my_seq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
     /* A host mailbox is read over the link past every cache, so the 2-rank kernels' push check
      * copies what it reads into this VRAM mirror for the reduce, crossing the link once
      * (r4d_ar_seq.h). Coarse-grained: only this rank's kernels touch it, each block its own words.
      * The wide family has no push check and reads its slots once. Host-memory slots free the same
      * VRAM over P2P, so the mirror keeps the footprint where the P2P instance has it. */
-    long stg = 0;
     if (host && world == 2) {
         R4D_TRY("ar_ipc_alloc(stage)",
-            stg = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 0, handle, &hlen));
+            in->my_stage = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 0, handle, &hlen));
     }
 
     /* This rank's own packed copy, for the rotated 6-bit wire only: the reduce must fold exactly
@@ -392,23 +409,18 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
      * (enough for any row of 512 or more) plus a page. ar_rmsnorm_quant checks the fit. */
     if (in->dtype != 2) {
         R4D_TRY("ar_ipc_alloc(locpack)",
-            lp = r4d_ar_ipc_alloc(in->slot_bytes / 2 + in->slot_bytes / 16 + 4096, 0,
+            in->locpack = r4d_ar_ipc_alloc(in->slot_bytes / 2 + in->slot_bytes / 16 + 4096, 0,
                                   handle, &hlen));
     }
 
-    in->my_scratch = sc;
-    in->my_flags   = fl;
-    in->my_seq     = sq;
-    in->locpack    = lp;
-    in->my_stage   = stg;
-    in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
+    in->gate_ctr = in->my_seq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
     Rendezvous& rv = rv_for(group);
     {
         std::lock_guard<std::mutex> lk(rv.m);
-        rv.scratch[rank] = sc;
-        rv.flags[rank]   = fl;
-        rv.seq[rank]     = sq;
+        rv.scratch[rank] = in->my_scratch;
+        rv.flags[rank]   = in->my_flags;
+        rv.seq[rank]     = in->my_seq;
         rv.dev[rank]     = dev;
     }
     int rc = rv_barrier(rv, world);
@@ -480,15 +492,15 @@ int acquire(const CacheKey& k, ArInst** out) {
     /* Built outside the lock: build() rendezvouses with the other ranks, and holding the mutex
      * across that barrier would deadlock with the peer's lookup. Keys include the rank and each
      * rank has one declare thread, so no two builders race for one key. */
-    ArInst* in = new (std::nothrow) ArInst();
+    std::unique_ptr<ArInst> in(new (std::nothrow) ArInst());
     if (!in) return RAD_E_NOMEM;
-    int rc = build(in, k.group, k.rank, k.world, k.numel, k.dtype, k.host);
-    if (rc != RAD_OK) { delete in; return rc; }
+    const int rc = build(in.get(), k.group, k.rank, k.world, k.numel, k.dtype, k.host);
+    if (rc != RAD_OK) return rc;
     {
         std::lock_guard<std::mutex> lk(g_cache_mu);
-        g_cache.push_back(CacheSlot{ k, in, 1 });
+        g_cache.push_back(CacheSlot{ k, in.get(), 1 });
     }
-    *out = in;
+    *out = in.release();
     return RAD_OK;
 }
 
@@ -503,17 +515,6 @@ void release(ArInst* in) {
             break;
         }
     }
-    /* Free only this rank's own allocations; peer pointers belong to the peer. */
-    if (in->host) {
-        r4d_ar_host_free(in->my_scratch);
-        r4d_ar_host_free(in->my_flags);
-    } else {
-        r4d_ar_ipc_free(in->my_scratch);
-        r4d_ar_ipc_free(in->my_flags);
-    }
-    r4d_ar_ipc_free(in->my_seq);
-    r4d_ar_ipc_free(in->locpack);
-    r4d_ar_ipc_free(in->my_stage);
     delete in;
 }
 

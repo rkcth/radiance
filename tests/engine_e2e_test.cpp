@@ -509,11 +509,29 @@ struct Server {
     int stop() {
         if (child.pid <= 0) return exit_status;
         kill(child.pid, SIGTERM);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        int status = 0;
+        pid_t reaped;
+        do {
+            reaped = waitpid(child.pid, &status, WNOHANG);
+            if (reaped != 0 && !(reaped < 0 && errno == EINTR)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        if (reaped == 0 || (reaped < 0 && errno == EINTR)) {
+            fprintf(stderr, "    timed out draining the server after SIGTERM:\n%s\n",
+                    tail(output(), 40).c_str());
+            kill(child.pid, SIGKILL);
+            while (waitpid(child.pid, &status, 0) < 0 && errno == EINTR) {}
+            exit_status = 124;
+        } else if (reaped < 0) {
+            exit_status = -1;
+        } else {
+            exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        }
+        child.pid = -1;
         if (drain.joinable()) drain.join();
         close(child.fd);
         child.fd = -1;
-        std::string rest;
-        exit_status = child.wait(&rest);
         return exit_status;
     }
 
@@ -556,7 +574,7 @@ struct Call {
         return true;
     }
     /* The status and the body; the server closes the connection after it. */
-    int read(std::string* body) {
+    int read(std::string* body, std::string* headers = nullptr) {
         std::string raw;
         char buf[16384];
         int err = 0;
@@ -578,6 +596,7 @@ struct Call {
         }
         std::string head = raw.substr(0, h), rest = raw.substr(h + 4);
         for (char& c : head) c = (char)std::tolower((unsigned char)c);
+        if (headers) *headers = head;
         if (head.find("transfer-encoding: chunked") != std::string::npos) {
             std::string out;
             for (size_t at = 0;;) {
@@ -2379,6 +2398,7 @@ const QwenImageContainers& qwen_image() {
 /* One picture through the images API, and its pixels. */
 struct Picture {
     int status = -1;
+    int exit_status = -1;
     std::string why;
     std::string png;
     std::vector<uint8_t> rgba;
@@ -2389,7 +2409,9 @@ struct Picture {
  * library) unless `reference`, on a host device large enough for the buffers the plugin sizes for
  * its largest picture. */
 Picture generate(const std::string& model, const std::vector<std::string>& kernels,
-                 bool reference, uint64_t seed, int steps, double cfg = 0.0) {
+                 bool reference, uint64_t seed, int steps, double cfg = 0.0,
+                 const std::vector<std::string>& limits = {},
+                 const std::vector<std::string>& env = device_env(2048)) {
     Picture p;
     Server s;
     s.serving = !reference;
@@ -2397,7 +2419,8 @@ Picture generate(const std::string& model, const std::vector<std::string>& kerne
     std::string ks;
     for (const std::string& k : kernels) ks += (ks.empty() ? "" : ",") + k;
     args.push_back(ks);
-    if (!s.start(model, args, device_env(2048))) {
+    args.insert(args.end(), limits.begin(), limits.end());
+    if (!s.start(model, args, env)) {
         p.log = s.output();
         return p;
     }
@@ -2419,7 +2442,7 @@ Picture generate(const std::string& model, const std::vector<std::string>& kerne
                 p.rgba = std::move(f.rgba);
         }
     }
-    s.stop();
+    p.exit_status = s.stop();
     p.log = s.output();
     if (p.status != 200 || p.rgba.empty())
         fprintf(stderr, "    %s: status %d%s%s, %zu pixel bytes:\n%s\n", ks.c_str(), p.status,
@@ -2435,6 +2458,1331 @@ double psnr(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
 }
 
 }  /* namespace */
+
+TEST(qwen_image_with_bounded_buffers_preserves_the_picture_and_exits_cleanly) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const QwenImageContainers& q = qwen_image();
+    REQUIRE(!q.bf16.empty());
+    const Picture baseline = generate(q.bf16, { "libref" }, true, 7, 3);
+    const Picture bounded = generate(q.bf16, { "libref" }, true, 7, 3, 0.0,
+                                     { "--image-gen-max-pixels", "4096",
+                                       "--image-gen-max-refs", "1" });
+    REQUIRE(!baseline.rgba.empty() && !bounded.rgba.empty());
+    CHECK_EQ(baseline.exit_status, 0);
+    CHECK_EQ(bounded.exit_status, 0);
+    CHECK(baseline.rgba == bounded.rgba);
+}
+
+TEST(qwen_image_with_vision_serves_an_edit) {
+    if (std::getenv("RAD_E2E_SKIP_VISION_EDIT")) SKIP("runs as qwen_vision_edit_e2e");
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    tiny::TempDir fixture{"qwen_edit", std::getenv("RAD_E2E_KEEP") != nullptr};
+    REQUIRE(fixture.ok());
+    tiny::QwenImage spec;
+    spec.vision = true;
+    REQUIRE(tiny::write_qwen_image(fixture.path, spec));
+    const std::string model = fixture / "qwen_edit.rad";
+    std::string log;
+    const int converted = tiny::run({RAD_E2E_CONVERT, fixture.path, "-o", model},
+                                    engine_env(), &log);
+    if (converted != 0) fprintf(stderr, "%s\n", tail(log, 30).c_str());
+    REQUIRE_EQ(converted, 0);
+    Server server;
+    REQUIRE(server.start(model, {"--image-gen-max-pixels", "4096", "--image-gen-max-refs", "1",
+                                 "--max-num-seqs", "2"}, device_env(4096)));
+    auto edit = [&](uint8_t red, uint8_t blue, std::vector<uint8_t>* result_pixels) {
+        std::vector<uint8_t> pixels(64 * 64 * 3);
+        for (size_t i = 0; i < pixels.size(); i += 3) {
+            pixels[i] = red;
+            pixels[i + 2] = blue;
+        }
+        std::vector<uint8_t> png;
+        std::string why;
+        REQUIRE_EQ(rad::mm::encode_image(pixels.data(), 64, 64, 3, "png", 0, &png, &why), RAD_OK);
+        const std::string url = "data:image/png;base64," +
+                                rad::server::base64_encode(png.data(), png.size());
+        int status = 0;
+        const auto result = post(server.port, "/v1/images/edits",
+            {{"prompt", "Change the mug to green"}, {"size", "64x64"}, {"seed", 42},
+             {"num_inference_steps", 1}, {"images", {{{"image_url", url}}}}}, &status);
+        if (status != 200) fprintf(stderr, "%s\n%s\n", result.dump().c_str(),
+                                   tail(server.output(), 30).c_str());
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(result["data"][0]["seed"].get<int>(), 42);
+        std::vector<uint8_t> output;
+        REQUIRE(rad::server::base64_decode(result["data"][0]["b64_json"].get<std::string>(),
+                                           &output));
+        rad::mm::FrameRGBA decoded;
+        REQUIRE_EQ(rad::mm::decode_image_rgba(output.data(), output.size(), 4096, &decoded, &why),
+                   RAD_OK);
+        CHECK_EQ(decoded.w, 64);
+        CHECK_EQ(decoded.h, 64);
+        *result_pixels = std::move(decoded.rgba);
+    };
+    std::vector<uint8_t> red, blue, repeat;
+    edit(255, 0, &red);
+    edit(0, 255, &blue);
+    edit(255, 0, &repeat);
+    REQUIRE(!red.empty() && !blue.empty() && !repeat.empty());
+    CHECK(red != blue);
+    CHECK(red == repeat);
+    CHECK_EQ(server.stop(), 0);
+}
+
+TEST(shared_service_rejects_a_text_checkpoint_as_its_image_engine) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const auto& fixture = world();
+    REQUIRE(fixture.ok);
+    const auto failed = radiance(fixture.qwen35_spec,
+        {"--host", "127.0.0.1", "--port", "0", "--image-model", fixture.llama_rad},
+        device_env(3072), 30);
+    if (failed.log.find("shared image checkpoint must declare an image generator") == std::string::npos)
+        fprintf(stderr, "%s\n", tail(failed.log, 40).c_str());
+    REQUIRE_EQ(failed.status, 1);
+    CHECK(failed.log.find("shared image checkpoint must declare an image generator") != std::string::npos);
+    CHECK(failed.log.find("server: listening on") == std::string::npos);
+}
+
+TEST(shared_service_checks_primary_model_role) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const auto& fixture = world();
+    REQUIRE(fixture.ok);
+    const auto& images = qwen_image();
+    REQUIRE(!images.bf16.empty() && !images.i8.empty());
+    const auto env = std::vector<std::string>{"RADIANCE_HOST_DEVICES=1", "RADIANCE_HOST_VRAM_MIB=3072"};
+    const auto rejected = radiance(images.bf16,
+        {"--host", "127.0.0.1", "--port", "0", "--image-model", fixture.llama_rad},
+        env, 30);
+    const bool diagnosed =
+        rejected.log.find("--model must generate text when --image-model is used") != std::string::npos;
+    if (rejected.status != 1 || !diagnosed)
+        fprintf(stderr, "%s\n", tail(rejected.log, 30).c_str());
+    REQUIRE_EQ(rejected.status, 1);
+    CHECK(diagnosed);
+    CHECK(rejected.log.find("server: listening on") == std::string::npos);
+    Server srv;
+    REQUIRE(srv.start(fixture.llama_rad,
+        {"--image-model", images.bf16, "--image-model-reserve", images.i8,
+         "--unloaded-image-expert-pool-mib", "64",
+         "--image-model-cache-mib", "128", "--served-model-name", "dense-fixture",
+         "--max-model-len", "256", "--max-num-seqs", "2",
+         "--image-gen-max-pixels", "4096", "--image-gen-max-refs", "1",
+         "--host-headroom-mib", "128"}, env));
+    int status = 0;
+    const json image_request = {{"prompt", "A red mug"}, {"size", "64x64"}, {"seed", 7},
+                                {"num_inference_steps", 1}};
+    const auto picture = post(srv.port, "/v1/images/generations", image_request, &status);
+    REQUIRE_EQ(status, 200);
+    std::vector<uint8_t> png;
+    REQUIRE(rad::server::base64_decode(
+        picture.at("data").at(0).at("b64_json").get<std::string>(), &png));
+    rad::mm::FrameRGBA decoded;
+    std::string why;
+    REQUIRE_EQ(rad::mm::decode_image_rgba(png.data(), png.size(), 4096, &decoded, &why), RAD_OK);
+    CHECK_EQ(decoded.w, 64);
+    CHECK_EQ(decoded.h, 64);
+    const auto read_image_status = [&](json& out) {
+        out = nullptr;
+        Call call;
+        std::string body;
+        REQUIRE(call.send(srv.port, "GET", "/v1/images/status", ""));
+        REQUIRE_EQ(call.read(&body), 200);
+        out = json::parse(body);
+    };
+    json image_status;
+    read_image_status(image_status);
+    REQUIRE(image_status.is_object());
+    const auto image_id = image_status.at("active_model").get<std::string>();
+    const auto alternate_id = std::filesystem::path(images.i8).stem().string();
+    const auto text_request = json{
+        {"model", "dense-fixture"}, {"prompt", "hello"}, {"temperature", 0},
+        {"max_tokens", 2}, {"ignore_eos", true}};
+    const auto before = post(srv.port, "/v1/completions", text_request, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(before.at("model").get<std::string>(), "dense-fixture");
+    CHECK_EQ(before.at("usage").at("completion_tokens").get<int>(), 2);
+    auto alternate_request = image_request;
+    alternate_request["model"] = alternate_id;
+    const auto alternate = post(srv.port, "/v1/images/generations", alternate_request, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK(!alternate.at("data").at(0).at("b64_json").get<std::string>().empty());
+    read_image_status(image_status);
+    REQUIRE(image_status.is_object());
+    CHECK_EQ(image_status.at("active_model").get<std::string>(), alternate_id);
+    CHECK(image_status.at("inactive_cache_bytes").get<int64_t>() > 0);
+
+    auto return_request = image_request;
+    return_request["model"] = image_id;
+    const auto restored = post(srv.port, "/v1/images/generations", return_request, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK(restored.at("data").at(0).at("b64_json") == picture.at("data").at(0).at("b64_json"));
+    read_image_status(image_status);
+    REQUIRE(image_status.is_object());
+    CHECK_EQ(image_status.at("active_model").get<std::string>(), image_id);
+
+    const auto unload = post(srv.port, "/v1/images/unload_model", {{"model", image_id}}, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(unload.at("status").get<std::string>(), "unloaded");
+    read_image_status(image_status);
+    REQUIRE(image_status.is_object());
+    CHECK(image_status.at("active_model").is_null());
+    const auto after = post(srv.port, "/v1/completions", text_request, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(after.at("usage").at("completion_tokens").get<int>(), 2);
+    CHECK(before.at("choices").at(0).at("text") == after.at("choices").at(0).at("text"));
+    CHECK_EQ(srv.stop(), 0);
+    const auto log = srv.output();
+    CHECK(log.find("expert loan depth 0 B across ranks") != std::string::npos);
+    CHECK(log.find("unloaded image expert pool: text rank") == std::string::npos);
+    CHECK(log.find("shared image cache: restored '" + images.bf16 + "'") != std::string::npos);
+}
+
+static void check_resident_supplemental_text(bool with_images) {
+    const auto& fixture = world();
+    REQUIRE(fixture.ok);
+    const auto env = std::vector<std::string>{"RADIANCE_HOST_DEVICES=2", "RADIANCE_HOST_VRAM_MIB=3072"};
+    auto args = std::vector<std::string>{
+        "--device-ordinal", "0", "--served-model-name", "primary",
+        "--supplemental-text-model", fixture.llama_rad, "--supplemental-text-device", "1",
+        "--max-model-len", "4096", "--max-num-seqs", "2", "--host-headroom-mib", "128"};
+    if (!with_images) args.insert(args.end(), {"--supplemental-text-host-pool-mib", "16"});
+    std::string image;
+    if (with_images) {
+        image = qwen_image().bf16;
+        REQUIRE(!image.empty());
+        args.insert(args.end(), {"--image-model", image, "--image-gen-max-pixels", "4096"});
+    }
+    Server srv;
+    REQUIRE(srv.start(fixture.qwen35_spec, args, env));
+    Call models;
+    std::string body;
+    REQUIRE(models.send(srv.port, "GET", "/v1/models", ""));
+    REQUIRE_EQ(models.read(&body), 200);
+    const auto cards = json::parse(body).at("data");
+    REQUIRE_EQ(cards.size(), with_images ? size_t{3} : size_t{2});
+    CHECK_EQ(cards.at(0).at("id").get<std::string>(), "primary");
+    const auto supplemental = cards.at(1).at("id").get<std::string>();
+    CHECK(supplemental != "primary");
+    if (with_images) CHECK(supplemental != cards.at(2).at("id").get<std::string>());
+    const std::string host_pool = with_images ? "0" : "16";
+    CHECK(srv.output().find("on device 1, host expert pool " + host_pool + " MiB") != std::string::npos);
+    int status = 0;
+    const auto generate = [&](const json& request, const std::string& expected) {
+        const auto answer = post(srv.port, "/v1/completions", request, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(answer.at("model").get<std::string>(), expected);
+        CHECK_EQ(answer.at("usage").at("completion_tokens").get<int>(), 1);
+    };
+    generate({{"prompt", "hello"}, {"max_tokens", 1}, {"ignore_eos", true}}, "primary");
+    generate({{"model", supplemental}, {"prompt", "hello"}, {"max_tokens", 1}, {"ignore_eos", true}},
+             supplemental);
+
+    if (with_images) {
+        for (const char* path : {"/v1/images/register_model", "/v1/images/load_model"}) {
+            post(srv.port, path, {{"path", image}, {"model", supplemental}}, &status);
+            CHECK_EQ(status, 400);
+        }
+    }
+    generate({{"prompt", "hello"}, {"max_tokens", 1}, {"ignore_eos", true}}, "primary");
+    generate({{"model", supplemental}, {"prompt", "hello"}, {"max_tokens", 1}, {"ignore_eos", true}},
+             supplemental);
+    constexpr int stream_tokens = 4000;
+    // Wait for a token to prove the supplemental scheduler has started the stream.
+    Call stream;
+    REQUIRE(stream.send(srv.port, "POST", "/v1/completions",
+        json{{"model", supplemental}, {"prompt", "hello"}, {"stream", true},
+             {"max_tokens", stream_tokens}, {"ignore_eos", true}}.dump()));
+    timeval read_timeout{};
+    read_timeout.tv_sec = 10;
+    REQUIRE_EQ(setsockopt(stream.fd, SOL_SOCKET, SO_RCVTIMEO, &read_timeout, sizeof read_timeout), 0);
+    std::string wire;
+    size_t event_start = std::string::npos, event_end = std::string::npos;
+    do {
+        char chunk[4096];
+        const ssize_t n = recv(stream.fd, chunk, sizeof chunk, 0);
+        REQUIRE(n > 0);
+        wire.append(chunk, static_cast<size_t>(n));
+        const size_t marker = wire.find("data: ");
+        if (marker != std::string::npos) {
+            event_start = marker + 6;
+            event_end = wire.find("\n\n", event_start);
+        }
+    } while (event_end == std::string::npos && wire.size() < 65536);
+    REQUIRE(wire.rfind("HTTP/1.1 200 ", 0) == 0);
+    REQUIRE(event_end != std::string::npos);
+    const auto event = json::parse(wire.substr(event_start, event_end - event_start));
+    CHECK_EQ(event.at("model").get<std::string>(), supplemental);
+    const auto& choice = event.at("choices").at(0);
+    REQUIRE(choice.at("finish_reason").is_null());
+    REQUIRE(!choice.at("text").get<std::string>().empty());
+    const auto request_id = event.at("id").get<std::string>();
+    CHECK_EQ(srv.stop(), 0);
+    const auto shutdown = srv.output();
+    const size_t signal = shutdown.find("stopping: draining in-flight requests");
+    REQUIRE(signal != std::string::npos);
+    const size_t completed = shutdown.find("req " + request_id + " done", signal);
+    REQUIRE(completed != std::string::npos);
+    const auto completion_log = shutdown.substr(completed, shutdown.find('\n', completed) - completed);
+    CHECK(completion_log.find("finish=abort") != std::string::npos);
+    const size_t generated = completion_log.find(" gen=");
+    REQUIRE(generated != std::string::npos);
+    const int tokens = std::stoi(completion_log.substr(generated + 5));
+    if (tokens <= 0 || tokens >= stream_tokens) fprintf(stderr, "%s\n", completion_log.c_str());
+    CHECK(tokens > 0 && tokens < stream_tokens);
+    CHECK(shutdown.find("Leaking their sinks") == std::string::npos);
+
+    auto reject = [&](std::vector<std::string> options, const char* diagnostic) {
+        options.insert(options.end(), {"--host", "127.0.0.1", "--port", "0"});
+        const auto run = radiance(fixture.qwen35_spec, options, env, 30);
+        const bool diagnosed = run.log.find(diagnostic) != std::string::npos;
+        const bool listening = run.log.find("server: listening on") != std::string::npos;
+        if (run.status != 1 || !diagnosed || listening)
+            fprintf(stderr, "%s\n", tail(run.log, 30).c_str());
+        CHECK_EQ(run.status, 1);
+        CHECK(diagnosed);
+        CHECK(!listening);
+    };
+    auto with_option = [&](const char* flag, const std::string& value) {
+        auto options = args;
+        const auto argument = std::find(options.begin(), options.end(), flag);
+        options.at(static_cast<size_t>(argument - options.begin()) + 1) = value;
+        return options;
+    };
+    reject(with_option("--supplemental-text-device", "0"),
+           "--supplemental-text-device must be outside the primary text");
+    reject(with_option("--supplemental-text-device", "2"),
+           "--supplemental-text-device 2 is unavailable");
+    if (!with_images && access("/proc/meminfo", R_OK) == 0) {
+        reject(with_option("--supplemental-text-host-pool-mib", "1099511627775"),
+               "--supplemental-text-host-pool-mib 1099511627775: ");
+    }
+    reject(with_option("--supplemental-text-model", fixture.qwen35_spec),
+           "requires distinct architecture plugins");
+    reject(with_option("--served-model-name", supplemental),
+           "supplemental text model name conflicts with an existing model");
+}
+
+TEST(shared_service_routes_to_a_resident_text_model_on_a_separate_device) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    check_resident_supplemental_text(true);
+}
+
+TEST(text_only_service_routes_to_a_resident_text_model_on_a_separate_device) {
+    check_resident_supplemental_text(false);
+}
+
+TEST(shared_service_rejects_a_live_architecture_plugin_before_declaration) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const auto& fixture = world();
+    REQUIRE(fixture.ok);
+    const auto rejected = radiance(fixture.llama_rad,
+        {"--host", "127.0.0.1", "--port", "0", "--image-model", fixture.llama_rad},
+        device_env(3072), 30);
+    REQUIRE_EQ(rejected.status, 1);
+    CHECK(rejected.log.find("requires distinct architecture plugins") != std::string::npos);
+    CHECK(rejected.log.find("server: listening on") == std::string::npos);
+}
+
+TEST(shared_service_serves_text_and_repeated_images_on_one_listener) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    REQUIRE(world().ok);
+    const QwenImageContainers& q = qwen_image();
+    REQUIRE(!q.bf16.empty());
+    const std::vector<std::string> env = {
+        "RADIANCE_HOST_DEVICES=2", "RADIANCE_HOST_VRAM_MIB=3072"
+    };
+    const bool one_image_rank = std::getenv("RAD_E2E_SINGLE_IMAGE_RANK") != nullptr;
+    const Picture baseline = generate(q.bf16, { "libref" }, true, 7, 48, 0.0,
+        { "--tp", one_image_rank ? "1" : "2", "--image-gen-max-pixels", "4096",
+          "--image-gen-max-refs", "1", "--max-num-seqs", "2" }, env);
+    REQUIRE(!baseline.png.empty());
+
+    tiny::TempDir adapters{"shared_lora"};
+    REQUIRE(adapters.ok());
+    REQUIRE(tiny::write_safetensors(adapters / "unmatched.safetensors", {
+        tiny::Tensor{"unknown.lora_A.weight", "F32", {1, 1}, std::vector<uint8_t>(4, 0)},
+        tiny::Tensor{"unknown.lora_B.weight", "F32", {1, 1}, std::vector<uint8_t>(4, 0)}
+    }));
+
+    tiny::Rng adapter_rng(41);
+    const std::string target = "diffusion_model.proj_out";
+    REQUIRE(tiny::write_safetensors(adapters / "bad-bias.safetensors", {
+        tiny::noise(target + ".diff_b", {64}, adapter_rng, 0.5f)
+    }));
+    REQUIRE(tiny::write_safetensors(adapters / "local+style.safetensors", {
+        tiny::noise(target + ".lora_down.weight", {2, 128}, adapter_rng, 0.5f),
+        tiny::noise(target + ".lora_up.weight", {64, 2}, adapter_rng, 0.5f)
+    }));
+
+    tiny::TempDir alternative{"shared_image_alternative"};
+    REQUIRE(alternative.ok());
+    tiny::QwenImage alternative_spec;
+    alternative_spec.seed = 81;
+    REQUIRE(tiny::write_qwen_image(alternative.path, alternative_spec));
+    const std::string alternative_rad = alternative / "alternative.rad";
+    std::string conversion;
+    REQUIRE_EQ(tiny::run({RAD_E2E_CONVERT, alternative.path, "-o", alternative_rad},
+                         engine_env(), &conversion), 0);
+
+    const std::string initial_rad = alternative / "initial.rad";
+    REQUIRE(std::filesystem::copy_file(q.bf16, initial_rad));
+    const char* cache_mib = std::getenv("RAD_E2E_IMAGE_CACHE_MIB");
+    const bool expect_cached = !cache_mib || std::strtoll(cache_mib, nullptr, 10) >= 128;
+    const bool fifo = std::getenv("RAD_E2E_IMAGE_FIFO") != nullptr;
+    Server plain, srv;
+    REQUIRE(plain.start(world().qwen35_spec,
+        { "--tp", "2", "--max-model-len", "256", "--max-num-seqs", "2",
+          "--num-speculative-tokens", "0", "--no-prefix-cache" }, env));
+    std::vector<std::string> shared_args =
+        { "--image-model", initial_rad, "--image-model-reserve", alternative_rad,
+          "--image-model-cache-mib", cache_mib ? cache_mib : "128",
+          "--served-model-name", "text-fixture",
+          "--image-gen-max-pixels", "4096", "--image-gen-max-refs", "1",
+          "--max-num-seqs", "2", "--max-model-len", "256", "--tp", "2",
+          "--num-speculative-tokens", "4", "--draft-window", "adaptive", "--no-prefix-cache",
+          "--host-headroom-mib", "128", "--image-lora-snapshot-mib", "16",
+          "--lora-dir", adapters.path, "--max-loras", "1", "--max-lora-rank", "4" };
+    if (fifo) shared_args.emplace_back("--image-model-fifo");
+    const bool keep_weights = std::getenv("RAD_E2E_NO_IMAGE_WEIGHT_LOAN") != nullptr;
+    if (keep_weights) shared_args.emplace_back("--no-image-weight-loan");
+    const bool pageable = std::getenv("RAD_E2E_PAGEABLE_IMAGE_SNAPSHOT") != nullptr;
+    shared_args.insert(shared_args.end(),
+                       { "--image-snapshot-memory", pageable ? "pageable" : "pinned" });
+    if (one_image_rank)
+        shared_args.insert(shared_args.end(), { "--device-ordinal", "1", "--device-ordinal", "0",
+                                                "--image-text-rank", "1",
+                                                "--image-reload-headroom-mib", "64" });
+    REQUIRE(srv.start(world().qwen35_spec, shared_args, env));
+    CHECK((srv.output().find("shared image memory: generator weights stay in VRAM") != std::string::npos)
+          == keep_weights);
+    /* This fixture needs the optional cache to capture weights when no expert loan is offered. */
+    if (pageable && expect_cached)
+        CHECK(srv.output().find("shared image snapshot capture: pageable allocation") != std::string::npos);
+    if (one_image_rank) {
+        const std::string log = srv.output();
+        CHECK(log.find("text rank 1 reserves") != std::string::npos);
+        CHECK(log.find("reserving 64.00 MiB per generator rank for reloads") != std::string::npos);
+        CHECK(log.find("text rank 0 reserves") == std::string::npos);
+        CHECK(log.find("device: rank 1 uses backend ordinal 0") != std::string::npos);
+    }
+    Call models;
+    std::string body;
+    REQUIRE(models.send(srv.port, "GET", "/v1/models", ""));
+    REQUIRE_EQ(models.read(&body), 200);
+    const json cards = json::parse(body)["data"];
+    REQUIRE_EQ(cards.size(), (size_t)3);
+    CHECK_EQ(cards[0]["id"].get<std::string>(), "text-fixture");
+    CHECK_EQ(cards[1]["id"].get<std::string>(), "alternative");
+    const std::string image_id = cards[2]["id"].get<std::string>();
+    REQUIRE(!image_id.empty());
+    auto image_status = [&] {
+        Call call;
+        std::string response;
+        if (!call.send(srv.port, "GET", "/v1/images/status", "") || call.read(&response) != 200)
+            return json{};
+        return json::parse(response);
+    };
+    const auto initial_status = image_status();
+    REQUIRE(initial_status.is_object());
+    CHECK_EQ(initial_status["active_model"].get<std::string>(), image_id);
+    CHECK(initial_status["activating_model"].is_null());
+    CHECK_EQ(initial_status["queued"].get<int>(), 0);
+    CHECK(initial_status["cache_status_available"].get<bool>());
+    CHECK_EQ(initial_status["inactive_cache_bytes"].get<int64_t>(), 0);
+    CHECK_EQ(initial_status["adapter_request_holds"].get<uint64_t>(), 0u);
+    CHECK_EQ(initial_status["adapter_snapshot_bytes"].get<uint64_t>(), 0u);
+    REQUIRE_EQ(initial_status["models"].size(), (size_t)2);
+    CHECK_EQ(initial_status["models"][0]["state"].get<std::string>(), "registered");
+    CHECK_EQ(initial_status["models"][1]["state"].get<std::string>(), "active");
+
+    const json img = { {"prompt", "a red cat on a blue mat"}, {"model", image_id},
+                       {"size", "64x64"}, {"seed", 7}, {"num_inference_steps", 48} };
+    {
+        int route_status = 0;
+        const auto completion = post(srv.port, "/v1/completions",
+            {{"model", "text-fixture"}, {"prompt", "hello"}, {"max_tokens", 1}}, &route_status);
+        REQUIRE_EQ(route_status, 200);
+        CHECK_EQ(completion["model"], "text-fixture");
+        const auto wrong_text = post(srv.port, "/v1/completions",
+            {{"model", image_id}, {"prompt", "hello"}, {"max_tokens", 1}}, &route_status);
+        CHECK_EQ(route_status, 400);
+        CHECK_EQ(wrong_text["error"]["param"], "model");
+        json wrong_image = img;
+        wrong_image["model"] = "text-fixture";
+        const auto wrong_generation = post(srv.port, "/v1/images/generations", wrong_image,
+                                           &route_status);
+        CHECK_EQ(route_status, 404);
+        CHECK_EQ(wrong_generation["error"]["param"], "model");
+        const auto wrong_audio = post(srv.port, "/v1/audio/speech",
+            {{"model", image_id}, {"input", "hello"}}, &route_status);
+        CHECK_EQ(route_status, 404);
+        CHECK_EQ(wrong_audio["error"]["param"], "model");
+        const auto wrong_video = post(srv.port, "/v1/videos",
+            {{"model", image_id}, {"prompt", "hello"}}, &route_status);
+        CHECK_EQ(route_status, 404);
+        CHECK_EQ(wrong_video["error"]["param"], "model");
+        CHECK(image_status() == initial_status);
+    }
+    Call catalog;
+    REQUIRE(catalog.send(srv.port, "GET", "/v1/loras", ""));
+    REQUIRE_EQ(catalog.read(&body), 200);
+    const auto listed = json::parse(body)["data"];
+    REQUIRE_EQ(listed.size(), (size_t)3);
+    CHECK_EQ(listed[0]["id"].get<std::string>(), "bad-bias");
+    CHECK_EQ(listed[1]["id"].get<std::string>(), "local+style");
+    CHECK_EQ(listed[2]["id"].get<std::string>(), "unmatched");
+    CHECK_EQ(listed[2]["compatibility"].get<std::string>(), "unchecked");
+    {
+        const size_t before = srv.output().size();
+        Call inactive, unknown;
+        REQUIRE(inactive.send(srv.port, "GET", "/v1/loras?model=alternative", ""));
+        REQUIRE_EQ(inactive.read(&body), 200);
+        const auto candidates = json::parse(body)["data"];
+        REQUIRE_EQ(candidates.size(), listed.size());
+        CHECK_EQ(candidates[0]["model"].get<std::string>(), "alternative");
+        CHECK_EQ(candidates[0]["compatibility"].get<std::string>(), "unchecked");
+        REQUIRE(unknown.send(srv.port, "GET", "/v1/loras?model=missing-model", ""));
+        CHECK_EQ(unknown.read(&body), 404);
+        CHECK_EQ(image_status()["active_model"].get<std::string>(), image_id);
+        CHECK(srv.output().find("'alternative' ready in ", before) == std::string::npos);
+    }
+    {
+        // The directory is part of the discovered ID, even for a repeated leaf name.
+        const auto nested = adapters / "other";
+        const auto same_leaf = nested + "/local+style.safetensors";
+        const auto incomplete = adapters / "copying.safetensors";
+        REQUIRE(std::filesystem::create_directory(nested));
+        REQUIRE(std::filesystem::copy_file(adapters / "unmatched.safetensors", same_leaf));
+        REQUIRE(std::filesystem::copy_file(adapters / "local+style.safetensors", incomplete));
+        const auto full_size = std::filesystem::file_size(incomplete);
+        REQUIRE(full_size > 8);
+        std::filesystem::resize_file(incomplete, full_size - 1);
+
+        Call refreshed;
+        REQUIRE(refreshed.send(srv.port, "GET", "/v1/loras?model=alternative", ""));
+        REQUIRE_EQ(refreshed.read(&body), 200);
+        const auto candidates = json::parse(body)["data"];
+        REQUIRE_EQ(candidates.size(), listed.size() + 2);
+        CHECK_EQ(candidates[1]["id"].get<std::string>(), "copying");
+        CHECK_EQ(candidates[1]["compatibility"].get<std::string>(), "unchecked");
+        CHECK_EQ(candidates[2]["id"].get<std::string>(), "local+style");
+        CHECK_EQ(candidates[3]["id"].get<std::string>(), "other/local+style");
+        CHECK_EQ(image_status()["active_model"].get<std::string>(), image_id);
+
+        json request = {{"model", image_id}, {"loras", {"local+style"}}};
+        int adapter_status = 0;
+        post(srv.port, "/v1/loras/validate", request, &adapter_status);
+        CHECK_EQ(adapter_status, 200);
+        request["loras"] = {"other/local+style"};
+        const auto wrong_target = post(srv.port, "/v1/loras/validate", request, &adapter_status);
+        CHECK_EQ(adapter_status, 404);
+        CHECK_EQ(wrong_target["error"]["param"].get<std::string>(), "loras");
+
+        const auto before_invalid = image_status();
+        json invalid = img;
+        invalid["model"] = "alternative";
+        invalid["loras"] = {"copying"};
+        const auto truncated = post(srv.port, "/v1/images/generations", invalid, &adapter_status);
+        CHECK_EQ(adapter_status, 400);
+        CHECK_EQ(truncated["error"]["param"].get<std::string>(), "loras");
+        CHECK(image_status() == before_invalid);
+
+        REQUIRE(std::filesystem::remove(incomplete));
+        REQUIRE(std::filesystem::copy_file(adapters / "local+style.safetensors", incomplete));
+        request["loras"] = {"copying"};
+        post(srv.port, "/v1/loras/validate", request, &adapter_status);
+        CHECK_EQ(adapter_status, 200);
+        REQUIRE(std::filesystem::remove(incomplete));
+        REQUIRE(std::filesystem::remove(same_leaf));
+        REQUIRE(std::filesystem::remove(nested));
+
+        Call cleaned;
+        REQUIRE(cleaned.send(srv.port, "GET", "/v1/loras", ""));
+        CHECK_EQ(cleaned.read(&body), 200);
+        CHECK(json::parse(body)["data"] == listed);
+    }
+    json bad = img;
+    bad["loras"] = {{{"name", "unmatched"}, {"weight", 1.0}}};
+    int rejected = 0;
+    const json error = post(srv.port, "/v1/images/generations", bad, &rejected);
+    CHECK(rejected == 400 || rejected == 404);
+    CHECK_EQ(error["error"]["param"].get<std::string>(), "loras");
+    bad["loras"] = {{{"name", "bad-bias"}, {"weight", 1.0}}};
+    const json bad_bias = post(srv.port, "/v1/images/generations", bad, &rejected);
+    CHECK_EQ(rejected, 400);
+    CHECK_EQ(bad_bias["error"]["param"].get<std::string>(), "loras");
+    CHECK(bad_bias["error"]["message"].get<std::string>().find("no supported bias operand")
+          != std::string::npos);
+
+    {
+        int validation_status = 0;
+        const size_t before = srv.output().size();
+        const char* validate = "/v1/loras/validate";
+        json request = {{"model", image_id}, {"loras", {"local+style"}}};
+        const auto result = post(srv.port, validate, request, &validation_status);
+        REQUIRE_EQ(validation_status, 200);
+        CHECK_EQ(result["compatibility"].get<std::string>(), "compatible");
+        request["loras"] = {"bad-bias"};
+        const auto incompatible = post(srv.port, validate, request, &validation_status);
+        REQUIRE_EQ(validation_status, 400);
+        CHECK(incompatible["error"]["message"].get<std::string>().find("no supported bias operand")
+              != std::string::npos);
+        request["model"] = "alternative";
+        post(srv.port, validate, request, &validation_status);
+        CHECK_EQ(validation_status, 409);
+        const auto log = srv.output().substr(before);
+        CHECK(log.find("lora: slot 0 <- ") == std::string::npos);
+        CHECK(log.find("'alternative' ready in ") == std::string::npos);
+    }
+
+    const json text = completion(repetitive_prompt(), 100);
+    int status = 0;
+    const auto expected = tokens_of(post(plain.port, "/completion", text, &status));
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(expected.size(), (size_t)100);
+    const std::string marker = "expert refill enabled (";
+    const std::string startup = srv.output();
+    CHECK(startup.find("for startup budget") != std::string::npos);
+    CHECK(startup.find("beyond the initial image profile") != std::string::npos);
+    REQUIRE(startup.find("shared image startup check passed") != std::string::npos);
+    size_t log_offset = startup.size();
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        Call image_call, text_call;
+        REQUIRE(image_call.send(srv.port, "POST", "/v1/images/generations", img.dump()));
+        REQUIRE(text_call.send(srv.port, "POST", "/completion", text.dump()));
+        REQUIRE_EQ(text_call.read(&body), 200);
+        const json reply = json::parse(body);
+        CHECK(tokens_of(reply) == expected);
+        CHECK(timing(reply, "draft_n") > 0);
+        CHECK(timing(reply, "draft_n_accepted") > 0);
+        const int image_status = image_call.read(&body);
+        if (image_status != 200)
+            fprintf(stderr, "    shared image status %d: %s\n%s\n", image_status, body.c_str(),
+                    tail(srv.output(), 25).c_str());
+        REQUIRE_EQ(image_status, 200);
+        const json response = json::parse(body);
+        std::vector<uint8_t> bytes;
+        REQUIRE(rad::server::base64_decode(response["data"][0]["b64_json"].get<std::string>(),
+                                           &bytes));
+        CHECK(std::string(bytes.begin(), bytes.end()) == baseline.png);
+        std::string log;
+        size_t parked = std::string::npos;
+        for (int attempt = 0; attempt < 200 && parked == std::string::npos; ++attempt) {
+            log = srv.output();
+            parked = log.find(marker, log_offset);
+            if (parked == std::string::npos)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (parked == std::string::npos) fprintf(stderr, "%s\n", tail(log, 30).c_str());
+        REQUIRE(parked != std::string::npos);
+        CHECK(std::strtoll(log.c_str() + parked + marker.size(), nullptr, 10) > 0);
+        log_offset = parked + marker.size();
+    }
+    json adapted = img;
+    adapted["loras"] = {{{"name", "local+style"}, {"weight", 0.75}}};
+    const auto adapted_image = post(srv.port, "/v1/images/generations", adapted, &status);
+    if (status != 200) fprintf(stderr, "%s\n", adapted_image.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    std::vector<uint8_t> adapted_bytes;
+    REQUIRE(rad::server::base64_decode(adapted_image["data"][0]["b64_json"].get<std::string>(),
+                                       &adapted_bytes));
+    CHECK(std::string(adapted_bytes.begin(), adapted_bytes.end()) != baseline.png);
+    {
+        const size_t before = srv.output().size();
+        post(srv.port, "/v1/images/generations", bad, &status);
+        REQUIRE_EQ(status, 400);
+        const auto same_adapter = post(srv.port, "/v1/images/generations", adapted, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(same_adapter["data"][0]["b64_json"], adapted_image["data"][0]["b64_json"]);
+        CHECK(srv.output().find("lora: slot 0 <- ", before) == std::string::npos);
+    }
+    {
+        json first = adapted, second = adapted, third = adapted;
+        first["num_inference_steps"] = 200;
+        second["loras"][0]["weight"] = 0.25;
+        third["loras"][0]["weight"] = 0.5;
+        Call a, b, c;
+        const size_t before = srv.output().size();
+        REQUIRE(a.send(srv.port, "POST", "/v1/images/generations", first.dump()));
+        bool running = false;
+        for (int attempt = 0; attempt < 200 && !running; ++attempt) {
+            running = srv.output().find("shared image memory: recalled and restored", before) !=
+                      std::string::npos;
+            if (!running) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        REQUIRE(running);
+        REQUIRE(b.send(srv.port, "POST", "/v1/images/generations", second.dump()));
+        bool waiting = false;
+        for (int attempt = 0; attempt < 200 && !waiting; ++attempt) {
+            waiting = srv.output().find("shared image queue: waiting for", before) !=
+                      std::string::npos;
+            if (!waiting) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        REQUIRE(waiting);
+        REQUIRE(c.send(srv.port, "POST", "/v1/images/generations", third.dump()));
+        REQUIRE_EQ(a.read(&body), 200);
+        REQUIRE_EQ(b.read(&body), 200);
+        const auto second_png = json::parse(body)["data"][0]["b64_json"];
+        REQUIRE_EQ(c.read(&body), 200);
+        const auto third_png = json::parse(body)["data"][0]["b64_json"];
+        CHECK(second_png != third_png);
+        CHECK_EQ(post(srv.port, "/v1/images/generations", second, &status)["data"][0]["b64_json"],
+                 second_png);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(post(srv.port, "/v1/images/generations", third, &status)["data"][0]["b64_json"],
+                 third_png);
+        REQUIRE_EQ(status, 200);
+    }
+    {
+        const std::string adapter_path = adapters / "local+style.safetensors";
+        const std::string original_path = adapters / "original.bin";
+        const std::string updated_path = adapters / "updated.bin";
+        REQUIRE(std::filesystem::copy_file(adapter_path, original_path));
+        tiny::Rng new_rng(97);
+        REQUIRE(tiny::write_safetensors(updated_path, {
+            tiny::noise(target + ".lora_down.weight", {2, 128}, new_rng, 0.5f),
+            tiny::noise(target + ".lora_up.weight", {64, 2}, new_rng, 0.5f)
+        }));
+        json long_request = img;
+        long_request["num_inference_steps"] = 200;
+        Call first, queued;
+        const auto start = srv.output().size();
+        REQUIRE(first.send(srv.port, "POST", "/v1/images/generations", long_request.dump()));
+        auto saw = [&](const char* marker) {
+            for (int attempt = 0; attempt < 500; ++attempt) {
+                if (srv.output().find(marker, start) != std::string::npos) return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            return false;
+        };
+        REQUIRE(saw("shared image memory: recalled and restored"));
+        REQUIRE(queued.send(srv.port, "POST", "/v1/images/generations", adapted.dump()));
+        REQUIRE(saw("shared image queue: waiting for"));
+        REQUIRE_EQ(std::rename(updated_path.c_str(), adapter_path.c_str()), 0);
+        REQUIRE_EQ(first.read(&body), 200);
+        REQUIRE_EQ(queued.read(&body), 200);
+        CHECK_EQ(json::parse(body)["data"][0]["b64_json"], adapted_image["data"][0]["b64_json"]);
+        const auto newer = post(srv.port, "/v1/images/generations", adapted, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK(newer["data"][0]["b64_json"] != adapted_image["data"][0]["b64_json"]);
+        REQUIRE_EQ(std::rename(original_path.c_str(), adapter_path.c_str()), 0);
+    }
+    {
+        json active = adapted;
+        active["num_inference_steps"] = 200;
+        Call first, queued;
+        const auto start = srv.output().size();
+        auto saw = [&](const char* marker) {
+            for (int attempt = 0; attempt < 500; ++attempt) {
+                if (srv.output().find(marker, start) != std::string::npos) return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            return false;
+        };
+        REQUIRE(first.send(srv.port, "POST", "/v1/images/generations", active.dump()));
+        REQUIRE(saw("shared image memory: recalled and restored"));
+        REQUIRE(queued.send(srv.port, "POST", "/v1/images/generations", adapted.dump()));
+        REQUIRE(saw("shared image queue: waiting for"));
+        const std::string adapter_path = adapters / "local+style.safetensors";
+        const std::string parked_path = adapters / "unpublished.bin";
+        REQUIRE_EQ(std::rename(adapter_path.c_str(), parked_path.c_str()), 0);
+        const auto unload = post(srv.port, "/v1/unload_lora_adapter",
+                                 {{"lora_name", "local+style"}}, &status);
+        REQUIRE(status == 200 || status == 202 || status == 404);
+        if (status == 202) {
+            const int in_flight = unload["in_flight"].get<int>();
+            CHECK(in_flight >= 1 && in_flight <= 2);
+            const auto repeated = post(srv.port, "/v1/unload_lora_adapter",
+                                       {{"lora_name", "local+style"}}, &status);
+            CHECK(status == 202 || status == 404);
+            if (status == 202) {
+                const int remaining = repeated["in_flight"].get<int>();
+                CHECK(remaining >= 1 && remaining <= in_flight);
+            }
+            status = 202;
+        }
+        REQUIRE_EQ(std::rename(parked_path.c_str(), adapter_path.c_str()), 0);
+        if (status == 404) {
+            /* If both requests already retired, unloading a removed file finds no
+             * name to tombstone. Restore the file and explicitly unload it. */
+            post(srv.port, "/v1/unload_lora_adapter", {{"lora_name", "local+style"}}, &status);
+            REQUIRE_EQ(status, 200);
+        }
+        post(srv.port, "/v1/images/generations", adapted, &status);
+        CHECK_EQ(status, 404);
+        REQUIRE_EQ(first.read(&body), 200);
+        REQUIRE_EQ(queued.read(&body), 200);
+        CHECK_EQ(json::parse(body)["data"][0]["b64_json"], adapted_image["data"][0]["b64_json"]);
+        /* HTTP completion can precede driver retirement. Poll until the last hold leaves. */
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            post(srv.port, "/v1/unload_lora_adapter", {{"lora_name", "local+style"}}, &status);
+            if (status != 202) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK_EQ(status, 404);
+        auto retired = image_status();
+        for (int attempt = 0; attempt < 200 &&
+             (retired.at("adapter_request_holds").get<uint64_t>() != 0 ||
+              retired.at("adapter_snapshot_bytes").get<uint64_t>() != 0); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            retired = image_status();
+        }
+        CHECK_EQ(retired.at("adapter_request_holds").get<uint64_t>(), 0u);
+        CHECK_EQ(retired.at("adapter_snapshot_bytes").get<uint64_t>(), 0u);
+    }
+    Call after_unload;
+    REQUIRE(after_unload.send(srv.port, "GET", "/v1/loras", ""));
+    REQUIRE_EQ(after_unload.read(&body), 200);
+    const auto remaining = json::parse(body)["data"];
+    REQUIRE_EQ(remaining.size(), (size_t)2);
+    CHECK_EQ(remaining[0]["id"].get<std::string>(), "bad-bias");
+    CHECK_EQ(remaining[1]["id"].get<std::string>(), "unmatched");
+    post(srv.port, "/v1/images/generations", adapted, &status);
+    CHECK_EQ(status, 404);
+    post(srv.port, "/v1/load_lora_adapter",
+         {{"lora_name", "local+style"}, {"lora_path", adapters / "local+style.safetensors"}}, &status);
+    REQUIRE_EQ(status, 200);
+    const auto restored = post(srv.port, "/v1/images/generations", adapted, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(restored["data"][0]["b64_json"], adapted_image["data"][0]["b64_json"]);
+    post(srv.port, "/v1/load_lora_adapter",
+         {{"lora_name", "manual-style"}, {"lora_path", adapters / "local+style.safetensors"}}, &status);
+    REQUIRE_EQ(status, 200);
+    const auto base_image = post(srv.port, "/v1/images/generations", img, &status);
+    REQUIRE_EQ(status, 200);
+    std::vector<uint8_t> base_bytes;
+    REQUIRE(rad::server::base64_decode(base_image["data"][0]["b64_json"].get<std::string>(),
+                                       &base_bytes));
+    CHECK(std::string(base_bytes.begin(), base_bytes.end()) == baseline.png);
+    tiny::Rng replacement_rng(83);
+    const std::string replacement_path = adapters / "replacement.safetensors";
+    REQUIRE(tiny::write_safetensors(replacement_path, {
+        tiny::noise(target + ".lora_down.weight", {2, 128}, replacement_rng, 0.5f),
+        tiny::noise(target + ".lora_up.weight", {64, 2}, replacement_rng, 0.5f)
+    }));
+    REQUIRE_EQ(std::rename(replacement_path.c_str(),
+                           (adapters / "local+style.safetensors").c_str()), 0);
+
+    const char* load_image = "/v1/images/load_model";
+    auto replace = [&](const std::string& path, const std::string& id) {
+        const json spec = {{"path", path}, {"model", id}};
+        for (int retry = 0; retry < 100; ++retry) {
+            const auto reply = post(srv.port, load_image, spec, &status);
+            if (status != 409) {
+                if (status >= 500)
+                    fprintf(stderr, "    image reload HTTP %d: %s\n%s\n", status,
+                            reply.dump().c_str(), tail(srv.output(), 65).c_str());
+                return reply;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return json{};
+    };
+    {
+        const std::string recalled = "shared image memory: recalled and restored";
+        const size_t before = srv.output().size();
+        Call image_call;
+        REQUIRE(image_call.send(srv.port, "POST", "/v1/images/generations", img.dump()));
+        bool in_flight = false;
+        for (int attempt = 0; attempt < 200 && !in_flight; ++attempt) {
+            in_flight = srv.output().find(recalled, before) != std::string::npos;
+            if (!in_flight) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        REQUIRE(in_flight);
+        post(srv.port, load_image, {{"path", alternative_rad}, {"model", "replacement"}}, &status);
+        CHECK_EQ(status, 409);
+        REQUIRE_EQ(image_call.read(&body), 200);
+    }
+    {
+        json cancelled = img;
+        cancelled["num_inference_steps"] = 200;
+        const std::string recalled = "shared image memory: recalled and restored";
+        auto client_errors = [&]() -> int64_t {
+            Call metrics;
+            std::string output;
+            if (!metrics.send(srv.port, "GET", "/metrics", "") || metrics.read(&output) != 200)
+                return -1;
+            const std::string label = ",class=\"4xx\"} ";
+            const size_t counter = output.find(label);
+            if (counter == std::string::npos) return -1;
+            return std::strtoll(output.c_str() + counter + label.size(), nullptr, 10);
+        };
+        const int64_t errors_before = client_errors();
+        REQUIRE(errors_before >= 0);
+        const size_t before = srv.output().size();
+        Call image_call;
+        REQUIRE(image_call.send(srv.port, "POST", "/v1/images/generations", cancelled.dump()));
+        bool running = false;
+        for (int attempt = 0; attempt < 200 && !running; ++attempt) {
+            running = srv.output().find(recalled, before) != std::string::npos;
+            if (!running) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        REQUIRE(running);
+        ::close(image_call.fd);
+        image_call.fd = -1;
+        bool parked = false;
+        for (int attempt = 0; attempt < 400 && !parked; ++attempt) {
+            parked = srv.output().find(marker, before) != std::string::npos;
+            if (!parked) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(parked);
+        CHECK_EQ(client_errors(), errors_before + 1);
+        CHECK(tokens_of(post(srv.port, "/completion", text, &status)) == expected);
+        CHECK_EQ(status, 200);
+    }
+    const auto load_reply = replace(alternative_rad, "replacement");
+    if (status != 200)
+        fprintf(stderr, "    load model HTTP %d: %s\n%s\n", status,
+                load_reply.dump().c_str(), tail(srv.output(), 120).c_str());
+    REQUIRE_EQ(status, 200);
+    json unknown = img;
+    unknown["model"] = "missing-model";
+    post(srv.port, "/v1/images/generations", unknown, &status);
+    CHECK_EQ(status, 404);
+    json switched = img;
+    switched["model"] = "replacement";
+    const auto switched_image = post(srv.port, "/v1/images/generations", switched, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK(switched_image["data"][0]["b64_json"] != base_image["data"][0]["b64_json"]);
+    const auto switched_status = image_status();
+    REQUIRE(switched_status.is_object());
+    CHECK_EQ(switched_status["active_model"].get<std::string>(), "replacement");
+    CHECK_EQ(switched_status["models"][1]["state"].get<std::string>(),
+             expect_cached ? "host_cached" : "registered");
+    REQUIRE(switched_status["inactive_cache_bytes"].is_number_integer());
+    if (expect_cached) CHECK(switched_status["inactive_cache_bytes"].get<int64_t>() > 0);
+    if (cache_mib && std::strtoll(cache_mib, nullptr, 10) == 0)
+        CHECK_EQ(switched_status["inactive_cache_bytes"].get<int64_t>(), 0);
+    replace(world().qwen35_spec, "not-an-image");
+    CHECK(status >= 400);
+    const auto rolled_back = post(srv.port, "/v1/images/generations", switched, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(rolled_back["data"][0]["b64_json"], switched_image["data"][0]["b64_json"]);
+    const auto rollback_status = image_status();
+    REQUIRE(rollback_status.is_object());
+    CHECK_EQ(rollback_status["active_model"].get<std::string>(), "replacement");
+    CHECK(rollback_status["activating_model"].is_null());
+
+    const size_t before_return = srv.output().size();
+    replace(initial_rad, image_id);
+    REQUIRE_EQ(status, 200);
+    const std::string switch_log = srv.output().substr(before_return);
+    if ((switch_log.find("shared image cache: restored") != std::string::npos) != expect_cached)
+        fprintf(stderr, "%s\n", tail(srv.output(), 150).c_str());
+    CHECK((switch_log.find("shared image cache: restored") != std::string::npos) == expect_cached);
+    CHECK((switch_log.find("embedding placement for") != std::string::npos) == expect_cached);
+    const size_t ready_at = switch_log.find(" ready in ");
+    REQUIRE(ready_at != std::string::npos);
+    fprintf(stderr, "    image switch back (%s): %s\n", expect_cached ? "warm" : "cold",
+            switch_log.substr(ready_at + 1, switch_log.find('\n', ready_at) - ready_at - 1).c_str());
+    const auto switched_back = post(srv.port, "/v1/images/generations", img, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(switched_back["data"][0]["b64_json"], base_image["data"][0]["b64_json"]);
+    /* Refuse a valid generator that exceeds the startup reservation and restore the
+     * prior engine without restarting text. More DiT layers raise the weight budget. */
+    tiny::TempDir oversized{"shared_image_oversized"};
+    REQUIRE(oversized.ok());
+    tiny::QwenImage oversized_spec = alternative_spec;
+    oversized_spec.dit_layers = 32;
+    REQUIRE(tiny::write_qwen_image(oversized.path, oversized_spec));
+    const std::string oversized_rad = oversized / "oversized.rad";
+    REQUIRE_EQ(tiny::run({RAD_E2E_CONVERT, oversized.path, "-o", oversized_rad},
+                         engine_env(), &conversion), 0);
+    const size_t before_oversized = srv.output().size();
+    const auto refused = replace(oversized_rad, "oversized");
+    REQUIRE_EQ(status, 400);
+    CHECK(refused["error"]["message"].get<std::string>().find("the previous model is ready") != std::string::npos);
+    const std::string refusal_log = srv.output().substr(before_oversized);
+    REQUIRE(refusal_log.find("startup reservation;") != std::string::npos);
+    CHECK(refusal_log.find("shared image cache: evict") == std::string::npos);
+    const auto status_after_refusal = image_status();
+    REQUIRE(status_after_refusal.is_object());
+    CHECK_EQ(status_after_refusal["active_model"].get<std::string>(), image_id);
+    CHECK(status_after_refusal["activating_model"].is_null());
+    const auto image_after_refusal = post(srv.port, "/v1/images/generations", img, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(image_after_refusal["data"][0]["b64_json"],
+             base_image["data"][0]["b64_json"]);
+    CHECK(tokens_of(post(srv.port, "/completion", text, &status)) == expected);
+    CHECK_EQ(status, 200);
+
+    {
+        const auto before_unload = image_status();
+        REQUIRE(before_unload["inactive_cache_bytes"].is_number_integer());
+        if (expect_cached) REQUIRE(before_unload["inactive_cache_bytes"].get<int64_t>() > 0);
+        const auto reply = post(srv.port, "/v1/images/unload_model",
+                                {{"model", "replacement"}}, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(reply["status"].get<std::string>(), "unloaded");
+        const auto after_unload = image_status();
+        CHECK_EQ(after_unload["active_model"].get<std::string>(), image_id);
+        CHECK_EQ(after_unload["inactive_cache_bytes"].get<int64_t>(), 0);
+        int matching_aliases = 0;
+        for (const auto& card : after_unload["models"]) {
+            if (card["id"] != "alternative" && card["id"] != "replacement") continue;
+            CHECK_EQ(card["state"].get<std::string>(), "registered");
+            ++matching_aliases;
+        }
+        CHECK_EQ(matching_aliases, 2);
+        const auto retained = post(srv.port, "/v1/images/generations", img, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(retained["data"][0]["b64_json"], base_image["data"][0]["b64_json"]);
+    }
+
+    json manual = adapted;
+    manual["loras"][0]["name"] = "manual-style";
+    const auto manual_image = post(srv.port, "/v1/images/generations", manual, &status);
+    REQUIRE_EQ(status, 200);
+    REQUIRE(manual_image["data"][0]["b64_json"] != base_image["data"][0]["b64_json"]);
+    post(srv.port, "/v1/unload_lora_adapter", {{"lora_name", "manual-style"}}, &status);
+    REQUIRE_EQ(status, 200);
+    post(srv.port, "/v1/images/generations", manual, &status);
+    CHECK_EQ(status, 404);
+    CHECK(tokens_of(post(srv.port, "/completion", text, &status)) == expected);
+    CHECK_EQ(status, 200);
+    const auto first_file = post(srv.port, "/v1/images/generations", adapted, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK(first_file["data"][0]["b64_json"] != restored["data"][0]["b64_json"]);
+
+    tiny::Rng updated_rng(105);
+    REQUIRE(tiny::write_safetensors(replacement_path, {
+        tiny::noise(target + ".lora_down.weight", {2, 128}, updated_rng, 0.5f),
+        tiny::noise(target + ".lora_up.weight", {64, 2}, updated_rng, 0.5f)
+    }));
+    REQUIRE_EQ(std::rename(replacement_path.c_str(),
+                           (adapters / "local+style.safetensors").c_str()), 0);
+    const auto updated_file = post(srv.port, "/v1/images/generations", adapted, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK(updated_file["data"][0]["b64_json"] != first_file["data"][0]["b64_json"]);
+    const std::string replaced_rad = alternative / "replacement.rad";
+    REQUIRE(std::filesystem::copy_file(world().llama_rad, replaced_rad));
+    REQUIRE_EQ(std::rename(replaced_rad.c_str(), initial_rad.c_str()), 0);
+    const auto rejected_revision = replace(initial_rad, image_id);
+    REQUIRE_EQ(status, 400);
+    CHECK(rejected_revision["error"]["message"].get<std::string>().find("previous model is ready")
+          != std::string::npos);
+    const auto restored_revision = post(srv.port, "/v1/images/generations", img, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(restored_revision["data"][0]["b64_json"], base_image["data"][0]["b64_json"]);
+
+    REQUIRE(std::filesystem::copy_file(alternative_rad, replaced_rad));
+    REQUIRE_EQ(std::rename(replaced_rad.c_str(), initial_rad.c_str()), 0);
+    replace(initial_rad, image_id);
+    REQUIRE_EQ(status, 200);
+    const auto replacement_image = post(srv.port, "/v1/images/generations", img, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(replacement_image["data"][0]["b64_json"], switched_image["data"][0]["b64_json"]);
+
+    /* The old alternative may still be warm. An atomic replacement must invalidate it. */
+    REQUIRE(std::filesystem::copy_file(q.bf16, replaced_rad));
+    REQUIRE_EQ(std::rename(replaced_rad.c_str(), alternative_rad.c_str()), 0);
+    auto alternative_status = [&] {
+        const auto snapshot = image_status();
+        for (const auto& entry : snapshot["models"])
+            if (entry["id"] == "alternative") return entry;
+        return json{};
+    };
+    const auto before_stale = alternative_status();
+    REQUIRE(before_stale["revision"].is_string());
+    const auto old_revision = before_stale["revision"];
+    json reserved = img;
+    reserved["model"] = "alternative";
+    const auto stale = post(srv.port, "/v1/images/generations", reserved, &status);
+    REQUIRE_EQ(status, 400);
+    CHECK(stale["error"]["message"].get<std::string>().find("registered checkpoint changed") !=
+          std::string::npos);
+    const auto failed_revision = alternative_status();
+    CHECK_EQ(failed_revision["state"], "failed");
+    CHECK_EQ(failed_revision["revision"], old_revision);
+    const auto still_active = post(srv.port, "/v1/images/generations", img, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(still_active["data"][0]["b64_json"], replacement_image["data"][0]["b64_json"]);
+
+    replace(alternative_rad, "alternative");
+    REQUIRE_EQ(status, 200);
+    const auto refreshed_revision = alternative_status();
+    CHECK_EQ(refreshed_revision["state"], "active");
+    REQUIRE(refreshed_revision["revision"].is_string());
+    CHECK(refreshed_revision["revision"] != old_revision);
+    replace(alternative_rad, "alternative");
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(alternative_status()["revision"], refreshed_revision["revision"]);
+    replace(alternative_rad, "replacement");
+    REQUIRE_EQ(status, 200);
+    const auto replaced_inactive = post(srv.port, "/v1/images/generations", switched, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(replaced_inactive["data"][0]["b64_json"], base_image["data"][0]["b64_json"]);
+
+    /* Queue a switch, then a request for the active model, behind an in-flight image. */
+    json long_image = switched;
+    long_image["num_inference_steps"] = 200;
+    const std::string path = "/v1/images/generations";
+    auto logged = [&](const std::string& marker, size_t from) {
+        for (int attempt = 0; attempt < 1000; ++attempt) {
+            if (srv.output().find(marker, from) != std::string::npos) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    {
+        json invalid = img;
+        invalid["typo"] = 1;
+        const auto start = srv.output().size();
+        post(srv.port, path, invalid, &status);
+        CHECK_EQ(status, 400);
+        CHECK(srv.output().find("'" + image_id + "' ready in ", start) == std::string::npos);
+        invalid.erase("typo");
+        invalid["loras"] = {{{"name", "local+style"}, {"weight", "invalid"}}};
+        const auto adapter_error = post(srv.port, path, invalid, &status);
+        REQUIRE_EQ(status, 400);
+        CHECK_EQ(adapter_error["error"]["param"].get<std::string>(), "loras");
+        CHECK_EQ(image_status()["active_model"].get<std::string>(), "replacement");
+        CHECK(srv.output().find("'" + image_id + "' ready in ", start) == std::string::npos);
+    }
+    {
+        Call first, change, same, second_same, third_same;
+        const auto start = srv.output().size();
+        REQUIRE(first.send(srv.port, "POST", path, long_image.dump()));
+        REQUIRE(logged("shared image memory: recalled and restored", start));
+        REQUIRE(change.send(srv.port, "POST", path, img.dump()));
+        REQUIRE(logged("shared image queue: waiting for '" + image_id + "'", start));
+        REQUIRE(same.send(srv.port, "POST", path, switched.dump()));
+        REQUIRE(logged("shared image queue: waiting for 'replacement'", start));
+        const auto second_enqueue = srv.output().size();
+        json second = switched, third = switched;
+        second["seed"] = 72;
+        third["seed"] = 73;
+        REQUIRE(second_same.send(srv.port, "POST", path, second.dump()));
+        REQUIRE(logged("shared image queue: waiting for 'replacement'", second_enqueue));
+        const auto third_enqueue = srv.output().size();
+        REQUIRE(third_same.send(srv.port, "POST", path, third.dump()));
+        REQUIRE(logged("shared image queue: waiting for 'replacement'", third_enqueue));
+        REQUIRE_EQ(first.read(&body), 200);
+        std::string headers;
+        REQUIRE_EQ(change.read(&body, &headers), 200);
+        const auto queue_timing = headers.find("server-timing: image_queue;dur=");
+        REQUIRE(queue_timing != std::string::npos);
+        const double queue_ms = std::strtod(
+            headers.c_str() + queue_timing + std::strlen("server-timing: image_queue;dur="), nullptr);
+        REQUIRE(std::isfinite(queue_ms) && queue_ms > 0);
+        CHECK(headers.find(", image_selection;dur=", queue_timing) != std::string::npos);
+        CHECK_EQ(json::parse(body)["data"][0]["b64_json"], switched_image["data"][0]["b64_json"]);
+        REQUIRE_EQ(same.read(&body), 200);
+        CHECK_EQ(json::parse(body)["data"][0]["b64_json"], base_image["data"][0]["b64_json"]);
+        REQUIRE_EQ(second_same.read(&body), 200);
+        REQUIRE_EQ(third_same.read(&body), 200);
+        const auto order = srv.output().substr(start);
+        const auto to_image = order.find("'" + image_id + "' ready in ");
+        REQUIRE(to_image != std::string::npos);
+        const auto back = order.find("'replacement' ready in ");
+        REQUIRE(back != std::string::npos);
+        CHECK(back > to_image);
+        const auto second_started = order.find("steps=48 seed=72");
+        const auto third_started = order.find("steps=48 seed=73");
+        REQUIRE(second_started != std::string::npos);
+        REQUIRE(third_started != std::string::npos);
+        if (fifo) CHECK(second_started > to_image);
+        /* With an older switch still below the age limit, both bypasses should
+         * run first. Slow runners can age it out during the preceding image. */
+        else if (queue_ms < 5000) CHECK(second_started < to_image);
+        CHECK(third_started > back);
+    }
+
+    /* A queued disconnect should remove the pending switch before another image is dispatched. */
+    {
+        const std::string active_id = "replacement";
+        const std::string other_id = image_id;
+        json running = long_image, pending = img;
+        running["model"] = active_id;
+        pending["model"] = other_id;
+        Call first, cancelled, last;
+        const auto start = srv.output().size();
+        REQUIRE(first.send(srv.port, "POST", path, running.dump()));
+        REQUIRE(logged("shared image memory: recalled and restored", start));
+        REQUIRE(cancelled.send(srv.port, "POST", path, pending.dump()));
+        REQUIRE(logged("shared image queue: waiting for '" + other_id + "'", start));
+        ::close(cancelled.fd);
+        cancelled.fd = -1;
+        running["num_inference_steps"] = 48;
+        REQUIRE(last.send(srv.port, "POST", path, running.dump()));
+        REQUIRE_EQ(first.read(&body), 200);
+        REQUIRE_EQ(last.read(&body), 200);
+        CHECK(srv.output().find("'" + other_id + "' ready in ", start) == std::string::npos);
+    }
+
+    /* Select the refreshed reservation using the ordinary image API, then switch back. */
+    const auto auto_switch = post(srv.port, "/v1/images/generations", reserved, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(auto_switch["data"][0]["b64_json"], base_image["data"][0]["b64_json"]);
+    const char* register_model = "/v1/images/register_model";
+    const auto before_register = srv.output().size();
+    const auto reg = post(srv.port, register_model,
+                          {{"model", "registered"}, {"path", initial_rad}}, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(reg["status"].get<std::string>(), "registered");
+    post(srv.port, register_model, {{"model", "registered"}, {"path", initial_rad}}, &status);
+    CHECK_EQ(status, 200);
+    Call registered_card;
+    REQUIRE(registered_card.send(srv.port, "GET", "/v1/models/registered", ""));
+    REQUIRE_EQ(registered_card.read(&body), 200);
+    CHECK_EQ(json::parse(body)["id"].get<std::string>(), "registered");
+    post(srv.port, register_model, {{"model", "registered"}, {"path", alternative_rad}}, &status);
+    CHECK_EQ(status, 409);
+    const auto active_after_register = post(srv.port, "/v1/images/generations", reserved, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(active_after_register["data"][0]["b64_json"], auto_switch["data"][0]["b64_json"]);
+    CHECK(srv.output().find(" ready in ", before_register) == std::string::npos);
+    json registered = img;
+    registered["model"] = "registered";
+    const auto registered_image = post(srv.port, "/v1/images/generations", registered, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(registered_image["data"][0]["b64_json"], switched_image["data"][0]["b64_json"]);
+
+    const auto auto_return = post(srv.port, "/v1/images/generations", img, &status);
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(auto_return["data"][0]["b64_json"], switched_image["data"][0]["b64_json"]);
+
+    {
+        const char* unload = "/v1/images/unload_model";
+        post(srv.port, unload, {{"model", "unknown"}}, &status);
+        CHECK_EQ(status, 404);
+        post(srv.port, unload, {{"model", "alternative"}}, &status);
+        REQUIRE_EQ(status, 200);
+        const auto inactive_unload = image_status();
+        CHECK_EQ(inactive_unload["active_model"].get<std::string>(), image_id);
+        CHECK_EQ(inactive_unload["models"][0]["state"].get<std::string>(), "registered");
+
+        auto text_stats = [&] {
+            Call call;
+            std::string response;
+            if (!call.send(srv.port, "GET", "/stats", "") || call.read(&response) != 200)
+                return json{};
+            return json::parse(response);
+        };
+        const auto before_unload = text_stats();
+        REQUIRE(before_unload.is_object());
+        REQUIRE(before_unload["kv_tokens_max"].get<int64_t>() > 0);
+        REQUIRE(before_unload["kv_bytes_carved"].get<int64_t>() > 0);
+
+        Call first;
+        json current = long_image;
+        current["model"] = image_id;
+        const auto start = srv.output().size();
+        REQUIRE(first.send(srv.port, "POST", path, current.dump()));
+        REQUIRE(logged("shared image memory: recalled and restored", start));
+        const auto reply = post(srv.port, unload, {{"model", image_id}}, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(reply["status"].get<std::string>(), "unloaded");
+        REQUIRE_EQ(first.read(&body), 200);
+        const auto unloaded = image_status();
+        CHECK(unloaded["active_model"].is_null());
+        CHECK(tokens_of(post(srv.port, "/completion", text, &status)) == expected);
+        CHECK_EQ(status, 200);
+        const auto after_unload = text_stats();
+        REQUIRE(after_unload.is_object());
+        CHECK_EQ(after_unload["kv_tokens_max"], before_unload["kv_tokens_max"]);
+        CHECK_EQ(after_unload["kv_bytes_carved"], before_unload["kv_bytes_carved"]);
+        const auto reloaded = post(srv.port, path, img, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(reloaded["data"][0]["b64_json"], auto_return["data"][0]["b64_json"]);
+    }
+
+    {
+        const std::string unload = "/v1/images/unload_model";
+        const json operation = {{"model", image_id}};
+        auto wait_for_drain = [&](bool draining) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            do {
+                const auto snapshot = image_status();
+                if (!snapshot.is_object()) return false;
+                for (const auto& model : snapshot["models"])
+                    if (model["id"] == image_id && (model["state"] == "draining") == draining)
+                        return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            } while (std::chrono::steady_clock::now() < deadline);
+            return false;
+        };
+        json current = long_image;
+        current["model"] = image_id;
+        json alternate = reserved;
+        alternate["num_inference_steps"] = current["num_inference_steps"];
+        Call first, pending, drain;
+        auto start = srv.output().size();
+        REQUIRE(first.send(srv.port, "POST", path, current.dump()));
+        REQUIRE(logged("shared image memory: recalled and restored", start));
+        REQUIRE(pending.send(srv.port, "POST", path, alternate.dump()));
+        REQUIRE(logged("shared image queue: waiting for 'alternative'", start));
+        REQUIRE(drain.send(srv.port, "POST", unload, operation.dump()));
+        REQUIRE(wait_for_drain(true));
+        const auto late = post(srv.port, path, reserved, &status);
+        /* The drain can finish between the status poll and this request. */
+        CHECK(status == 429 || status == 200);
+        if (status == 200)
+            CHECK_EQ(late["data"][0]["b64_json"], auto_switch["data"][0]["b64_json"]);
+        REQUIRE_EQ(first.read(&body), 200);
+        REQUIRE_EQ(pending.read(&body), 200);
+        REQUIRE_EQ(drain.read(&body), 200);
+        CHECK_EQ(image_status()["active_model"].get<std::string>(), "alternative");
+
+        post(srv.port, path, img, &status);
+        REQUIRE_EQ(status, 200);
+        Call running, abandoned;
+        start = srv.output().size();
+        REQUIRE(running.send(srv.port, "POST", path, current.dump()));
+        REQUIRE(logged("shared image memory: recalled and restored", start));
+        REQUIRE(abandoned.send(srv.port, "POST", unload, operation.dump()));
+        REQUIRE(wait_for_drain(true));
+        ::close(abandoned.fd);
+        abandoned.fd = -1;
+        REQUIRE(wait_for_drain(false));
+        REQUIRE_EQ(running.read(&body), 200);
+        const auto active_after_disconnect = image_status()["active_model"];
+        CHECK(active_after_disconnect.is_null() || active_after_disconnect == image_id);
+        const auto after_cancel = post(srv.port, path, img, &status);
+        REQUIRE_EQ(status, 200);
+        CHECK_EQ(after_cancel["data"][0]["b64_json"], auto_return["data"][0]["b64_json"]);
+    }
+
+    CHECK_EQ(plain.stop(), 0);
+    {
+        /* An active request plus a pending checkpoint change when SIGTERM arrives. */
+        Call first, waiting;
+        json current = long_image;
+        current["model"] = image_id;
+        const auto start = srv.output().size();
+        REQUIRE(first.send(srv.port, "POST", path, current.dump()));
+        REQUIRE(logged("shared image memory: recalled and restored", start));
+        REQUIRE(waiting.send(srv.port, "POST", path, reserved.dump()));
+        REQUIRE(logged("shared image queue: waiting for 'alternative'", start));
+        CHECK_EQ(srv.stop(), 0);
+        const int response = waiting.read(&body);
+        /* SIGTERM is observed by the watcher. A switch granted before it observes the
+         * signal may finish; a request still waiting when it stops must be interrupted. */
+        CHECK(response == 200 || response == 503 || response == 499 || response == -1);
+        if (response == 200)
+            CHECK_EQ(json::parse(body)["data"][0]["b64_json"], auto_switch["data"][0]["b64_json"]);
+    }
+    const std::string log = srv.output();
+    const std::string draft_marker = "text draft verification during images: ";
+    int64_t verified = 0, accepted = 0;
+    for (size_t at = log.find(draft_marker, startup.size()); at != std::string::npos;
+         at = log.find(draft_marker, at + draft_marker.size())) {
+        long long checked = 0, used = 0;
+        if (std::sscanf(log.c_str() + at + draft_marker.size(), "%lld checked, %lld accepted",
+                        &checked, &used) == 2) {
+            verified += checked;
+            accepted += used;
+        }
+    }
+    if (verified == 0 || accepted == 0) fprintf(stderr, "%s\n", tail(log, 55).c_str());
+    CHECK(verified > 0);
+    CHECK(accepted > 0);
+    CHECK(srv.output().find("shared image memory: recalled and restored") != std::string::npos);
+    if (keep_weights && cache_mib && std::strtoll(cache_mib, nullptr, 10) == 0) {
+        CHECK(log.find("0 B of immutable weights cached in host RAM") != std::string::npos);
+        CHECK(log.find("shared image snapshot capture:") == std::string::npos);
+    }
+}
 
 /* Qwen-Image on the host backend with libavx alone, no reference library loaded: every op the
  * generator declares has a libavx row, the picture comes back, a seed repeats it byte for byte, and

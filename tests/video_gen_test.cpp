@@ -305,7 +305,12 @@ TEST(a_request_runs_prompt_steps_soundtrack_and_chunks_in_order) {
     std::string why;
     auto r = f.req(2);
     auto t = r->ticket;
+    CHECK(!f.drv.busy());
+    r->dispatch_hold = std::make_shared<int>(0);
+    const std::weak_ptr<void> dispatch_hold = r->dispatch_hold;
     CHECK_OK(f.drv.submit(std::move(r), &why));
+    CHECK(f.drv.busy());
+    CHECK(!dispatch_hold.expired());
     CHECK_EQ(t->frames, 5);
     CHECK_EQ(t->steps, 2);
     std::string kinds;
@@ -313,6 +318,7 @@ TEST(a_request_runs_prompt_steps_soundtrack_and_chunks_in_order) {
     for (int i = 0; i < 20; ++i) {
         const RadBatch* b = f.drv.next(i);
         if (!b) break;
+        CHECK(f.drv.busy());
         const RadVideoGenBatch* V = b->vgen_b;
         REQUIRE(V != nullptr);
         kinds += kind_of(b->gen);
@@ -329,7 +335,11 @@ TEST(a_request_runs_prompt_steps_soundtrack_and_chunks_in_order) {
         }
         f.answer(10 * i);
         CHECK_OK(f.drv.done());
+        CHECK(f.drv.busy());
+        CHECK(!dispatch_hold.expired());
     }
+    CHECK(!f.drv.busy());
+    CHECK(dispatch_hold.expired());
     CHECK_EQ(kinds, std::string("CSSADD"));
     CHECK(frames_out == std::vector<int32_t>({ 2, 3 }));
     std::string ev;

@@ -313,7 +313,7 @@ TEST(every_route_answers_malformed_input_with_an_error_object) {
     Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
         d.mm = &mm;
         d.embed = &emb;
-        d.images = &img;
+        d.images = { &img, d.tok };
         o.allow_image = o.allow_audio = o.allow_video = true;
         o.decision_type = "d1";
     } });

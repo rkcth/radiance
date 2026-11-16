@@ -520,7 +520,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     pool_base_ = kv_pool.base();
     pool_ = &kv_pool;
 
-    if (fixed >= budget_bytes) {
+    if (fixed >= budget_bytes && !(plans_.size() <= 1 && fixed == 0)) {
         RAD_ERR("vram_kv does not fit its fixed costs:\n"
                 "  linear/conv state  %10s  (%lld sequences)\n"
                 "  vram_kv            %10s\n"
@@ -567,6 +567,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     /* ---- carve. Every reservation comes from the KV pool only; the mover works inside the
      * weight slab and cannot reach it (spec §6). ---- */
     for (auto& p : plans_) {
+        if (p.index == 0) continue;  /* the null handle owns no storage */
         int64_t bytes = p.paged() ? kv_pool_bytes(p)
                                   : p.n_states * p.bytes_per_state;
         if (p.zero) {

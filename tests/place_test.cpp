@@ -221,6 +221,56 @@ TEST(planner_reports_what_did_not_fit) {
     CHECK(p.report(f.prog).find("DID NOT FIT") != std::string::npos);
 }
 
+TEST(gdn_state_users_stage_offloaded_weights_on_gpu_backends) {
+    for (const char* op : {"gdn_conv_prep", "gdn_conv_update", "gdn_recurrent_update",
+                           "gdn_conv_recurrent_update", "gdn_conv_recurrent_update_had"}) {
+        Fixture f;
+        const rad_weight embedding = f.weight("token_embd.weight", MiB, RAD_ACCESS_VOCAB, -1, -1);
+        f.op("embed", {embedding}, true);
+        rad_weight last = 0;
+        for (int layer = 0; layer < 6; ++layer) {
+            last = f.weight("blk." + std::to_string(layer) + ".weight", MiB,
+                            RAD_ACCESS_PER_TOKEN, layer, -1);
+            f.op(op, {last}, true);
+        }
+        Config cfg = base_config();
+        cfg.placement = "layer_offload";
+        cfg.vram_weights_mib = 5;
+        cfg.host_pool_mib = 8;
+        PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+        Plan gpu;
+        REQUIRE_EQ(Planner(in).plan(&gpu), RAD_OK);
+        CHECK(gpu.weight[last].tier == Tier::HostPinned);
+        CHECK(gpu.weight[last].site == Site::DeviceStaged);
+        CHECK(gpu.host_runs.empty());
+        CHECK(!gpu.prefetch.empty());
+        CHECK(gpu.totals.bytes[(int)Tier::VRAM] + gpu.slab_overhead <= gpu.vram_budget);
+
+        in.host_backend = true;
+        Plan cpu;
+        REQUIRE_EQ(Planner(in).plan(&cpu), RAD_OK);
+        CHECK(cpu.weight[last].tier == Tier::HostPageable);
+        CHECK(cpu.weight[last].site == Site::Host);
+        CHECK(cpu.prefetch.empty());
+    }
+}
+
+TEST(gpu_placement_refuses_gdn_state_without_a_device_kernel) {
+    Fixture f;
+    const rad_weight w = f.weight("blk.0.conv.weight", MiB, RAD_ACCESS_PER_TOKEN, 0, -1);
+    f.op("gdn_conv_prep", {w}, true);
+    f.prog.ops.back().bands.front().dom[RAD_DOMAIN_DEVICE].row = nullptr;
+    Config cfg = base_config();
+    cfg.vram_weights_mib = 8;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    Plan gpu;
+    CHECK_EQ(Planner(in).plan(&gpu), RAD_E_NOKERNEL);
+
+    in.host_backend = true;
+    Plan cpu;
+    CHECK_EQ(Planner(in).plan(&cpu), RAD_OK);
+}
+
 TEST(planner_host_runs_are_contiguous) {
     Fixture f;
     build_dense(f, 8, 1 * MiB, /*host_kernel=*/true);
@@ -2545,6 +2595,55 @@ TEST(a_recall_takes_the_slots_back_before_it_returns) {
     CHECK(resident_count(r.h, r.hf.plan) > r.planned);
 }
 
+TEST(image_loan_recalls_and_refills_experts_with_host_backing) {
+    LoanRig r;
+    CHECK_OK(r.build());
+    Loan image;
+    for (LoanStrip& strip : image.strips) {
+        strip.unit_bytes = 1;
+        strip.unit_tokens = 1;
+    }
+    CHECK_OK(stamp_units(r, false, nullptr));
+    Loan replacement;
+    for (LoanStrip& strip : replacement.strips) {
+        strip.unit_bytes = 1;
+        strip.unit_tokens = 1;
+    }
+    const int64_t original_capacity = r.m.flex_capacity();
+    const uint64_t d2h = r.m.stats().d2h_bytes;
+    const int64_t lendable = r.m.lendable_host_bytes();
+    REQUIRE(lendable > 0);
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        Loan& lender = cycle % 2 == 0 ? image : replacement;
+        CHECK_OK(r.m.lend_from(Mover::kLendImage, lender.strips));
+        const int64_t amount = r.m.loan_ceiling(Mover::kLendImage);
+        REQUIRE(amount > 0);
+        CHECK_OK(r.m.set_loan(Mover::kLendImage, amount));
+        CHECK_EQ(r.m.detach_image_loan(), RAD_E_STATE);
+        for (Deadline dl; (r.m.loan_held(Mover::kLendImage) == 0 || any_busy(r.h, r.hf.plan))
+                          && !dl.passed();)
+            CHECK_OK(r.dispatch());
+        CHECK(r.m.loan_held(Mover::kLendImage) > 0);
+        CHECK(resident_count(r.h, r.hf.plan) > r.planned);
+        CHECK_OK(r.m.reclaim(Mover::kLendImage, 0, &r.h));
+        CHECK_EQ(r.m.loan_held(Mover::kLendImage), (int64_t)0);
+        CHECK_EQ(r.m.stats().d2h_bytes, d2h);
+        CHECK_EQ(r.m.stats().donated, (uint64_t)0);
+        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+            CHECK(!lender.inside(r.addr(u)));
+        CHECK_OK(r.m.detach_image_loan());
+        CHECK_EQ(r.m.flex_capacity(), original_capacity);
+        CHECK_EQ(r.m.loan_ceiling(Mover::kLendImage), (int64_t)0);
+        CHECK_EQ(r.m.lendable_host_bytes(), lendable);
+        CHECK_OK(rad_memset_async(lender.mem, 0x5a, 2 * Loan::kStrip, r.compute));
+        CHECK_OK(rad_stream_sync(r.compute));
+        int bad = 0;
+        CHECK_OK(stamp_units(r, true, &bad));
+        CHECK_EQ(bad, 0);
+    }
+}
+
 /* An idle server still fills what it is lent, via its own tick, so a loan made while idle is not
  * left empty until the next request pays for filling it. */
 TEST(an_idle_mover_fills_what_it_is_lent) {
@@ -3842,6 +3941,30 @@ TEST(tower_ram_pins_every_tower_unit_in_the_pool_and_costs_no_vram) {
     for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
         CHECK(plan2.weight[w].tier == Tier::VRAM);
     CHECK_EQ(plan2.tower_host_bytes, 0ll);
+}
+
+TEST(layer_offload_only_counts_layers_that_can_leave_vram) {
+    Fixture f;
+    build_dense(f, /*layers=*/4, /*per_layer=*/4 * MiB, /*host_kernel=*/true);
+    add_tower(f, /*first_layer=*/4, /*blocks=*/6, /*per_block=*/8 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "layer_offload";
+    cfg.vram_weights_mib = 9;
+    cfg.host_pool_mib = 8;
+    cfg.tower_resolved = TablePlacement::Ram;
+    cfg.tower_host_mib = 50;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    Plan plan;
+    REQUIRE_EQ(Planner(in).plan(&plan), RAD_OK);
+    CHECK_EQ(plan.tower_host_bytes, 50 * MiB);
+    CHECK_EQ(plan.totals.bytes[(int)Tier::VRAM], 9 * MiB);
+    CHECK_EQ(plan.slab_overhead, 0ll);
+    for (const MoveUnit& unit : plan.units) {
+        if (unit.layer < 0) continue;
+        if (unit.layer < 2) CHECK(unit.site == Site::Device);
+        else if (unit.layer < 4) CHECK(unit.site == Site::Host);
+        else CHECK(unit.site == Site::DeviceZeroCopy);
+    }
 }
 
 /* A tower too large for its room is refused, and so is ram for a program with no tower (the

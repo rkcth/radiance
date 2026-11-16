@@ -55,8 +55,10 @@ void sweep_buffers_keep(bool on);
 
 class Kld;
 class StallWatch;
+class SharedService;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
-namespace server { class Sink; class Front; class Server; }
+namespace server { class Front; class Server; class Sink; struct Deps; struct ServerOptions; struct TextEndpoint; }
+namespace mm { class Processor; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
@@ -225,7 +227,14 @@ private:
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
+    friend class SharedService;
     struct Rank;
+    enum class ServiceRole { Standalone, PrimaryText, Generator, SupplementalText };
+    SharedService* shared_ = nullptr;
+    ServiceRole service_role_ = ServiceRole::Standalone;
+    bool reuse_registry_ = false;
+    /* The service captures the live plugin names under its lifecycle lock before declaration. */
+    std::set<std::string> occupied_arch_plugins_;
     std::vector<std::unique_ptr<Rank>> ranks_;
     /* Per rank and KV group, that rank's stream view or null; the batch builder takes these, since it
      * cannot reach each rank's manager. */
@@ -242,20 +251,22 @@ private:
      * span the startup watch covers (main.cpp creates it here and ends it at the listen). */
     uint64_t              startup_begin_ns_ = 0;
     std::vector<std::thread>           rank_threads_;
+    std::thread                        stepper_;
+    std::atomic<bool>                  stepper_done_{true};
 
     Config cfg_;
-    /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
+    /* The VRAM split each rank actually takes, filled by resolve_memory_budget(). Equal to cfg_ on every
      * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
      * attention-zero rank) gets a KV pool sized for the common token count and the difference in
      * its weights pool. Pools::configure and the planner must read the rank's entry, never cfg_;
-     * plan() refuses a rank whose plan and weights pool disagree. */
+     * allocate_weight_pools() refuses a rank whose plan and weights pool disagree. */
     std::vector<Config> rank_cfg_;
-    int64_t kv_planned_tokens_ = 0;   /* the common token count plan() sized the re-split pools for */
+    int64_t kv_planned_tokens_ = 0;   /* the common token count for the re-split pools */
 
     /* The model's source, one of the two. A container stays mapped for the engine's life because
      * the mapped and file tiers read it in place (spec §4.3). A checkpoint served directly also
      * stays mapped and is read once, at load (spec §4.3). */
-    std::unique_ptr<RadFile> file_;
+    std::shared_ptr<RadFile> file_;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
     /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
@@ -282,14 +293,17 @@ private:
     void (*arch_step_)(RadCtx*, const RadBatch*) = nullptr;
     uint64_t (*arch_pass_key_)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
 
-    int load_plugins();
+    int load_plugins(const std::string& tune_machine);
     int read_metadata();
     int read_checkpoint_metadata();
     /* --rope-scaling over the free-form keys, then the startup line and the context checks;
      * runs on meta_kv_k_/meta_kv_v_ before their pointer arrays are built. */
     int apply_rope_scaling();
+    int declare_model();
+    int load_model();
     int declare();
-    int plan();
+    int resolve_memory_budget();
+    int allocate_weight_pools();
     /* Runtime LoRA (core/engine_lora.cpp). Targets are fixed before declare; adapters are loaded
      * into slots after every rank's Ctx is bound, and a request's `model` names one. */
     int lora_targets();
@@ -299,7 +313,8 @@ public:
     /* Unpublish an adapter (lora::SlotTable::unload). Idle, its slot is freed at once; in use, it
      * drains: *in_flight says how many requests still hold it, no new request may name it, and the
      * last of them frees the slot, which cools before reuse (lora/slots.h). */
-    int lora_unload(const std::string& name, std::string* err, int* in_flight);
+    int lora_unload(const std::string& name, std::string* err, int* in_flight,
+                    bool known_to_service = false);
     /* RAD_OK with the slot, the uid of its load and a hold: the adapter is not freed while the
      * hold lives (the server keeps it in the request's Generation). RAD_E_NOTFOUND for a name no
      * slot holds, or one that is draining. */
@@ -314,21 +329,49 @@ public:
     struct LoraUse { std::string name; double weight = 1.0; };
     int gen_lora_acquire(const std::vector<LoraUse>& uses, int32_t* slot,
                          std::shared_ptr<void>* hold, std::string* note, std::string* err);
+    int gen_lora_acquire_pinned(const std::vector<lora::PinnedAdapter>& adapters,
+                               int32_t* slot, std::shared_ptr<void>* hold,
+                               std::string* note, std::string* err);
+    int gen_lora_validate(const std::vector<lora::PinnedAdapter>& adapters, std::string* err);
     /* The adapter files a generator request may name: --lora's and those under --lora-dir. */
     std::vector<std::string> gen_lora_names() const;
 private:
     /* A generator's adapter files by name (--lora, POST /v1/load_lora_adapter, --lora-dir), opened
      * once and kept mapped; compositions read them when a combination is put in a slot. */
     int gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
-                      std::string* err);
+                      uint64_t* version, std::string* err);
     int gen_lora_start();
+    int gen_lora_acquire_impl(const std::vector<LoraUse>& uses,
+                              const std::vector<lora::PinnedAdapter>* pinned,
+                              int32_t* slot, std::shared_ptr<void>* hold,
+                              std::string* note, std::string* err);
+    struct LoraReplacement {
+        rad_buf buffer;
+        std::vector<uint16_t> values;
+    };
+    using LoraReplacements = std::vector<std::vector<LoraReplacement>>;
+    int gen_lora_prepare_replacements(const std::map<std::string, lora::Composite>& modules,
+                                      const std::map<std::string, std::vector<float>>& deltas,
+                                      LoraReplacements* replacements, std::string* err) const;
+    int gen_lora_prepare(const std::vector<lora::Strength>& adapters,
+                         std::vector<std::vector<lora::PackedSite>>* packed,
+                         LoraReplacements* replacements, lora::ComposeReport* report,
+                         size_t* bias_count, std::string* err) const;
+    int gen_lora_copy_replacements(int slot, const LoraReplacements& replacements);
     /* Every rank's packed bytes into `slot` of its pools, each rank on a stream of its own. */
     int lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
                   std::string* err);
     bool                        lora_gen_ = false;
     std::unique_ptr<lora::KeyMap> lora_keys_;
     mutable std::mutex          lora_lib_mu_;
-    std::map<std::string, std::pair<std::string, std::shared_ptr<const lora::AdapterFile>>> lora_lib_;
+    std::set<std::string>       gen_lora_unloaded_;
+    struct AdapterEntry {
+        std::shared_ptr<const lora::AdapterFile> file;
+        std::string identity;  /* empty for an adapter explicitly loaded by the operator */
+        uint64_t version;
+    };
+    std::map<std::string, AdapterEntry> lora_lib_;
+    uint64_t next_adapter_version_ = 1;
 private:
     std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */
     lora::SlotTable            lora_table_;      /* reads lora_epoch_, so declared after it */
@@ -781,14 +824,32 @@ private:
      * checked against both. */
     int64_t  late_step_bytes_ = 0;
     int64_t  late_lazy_bytes_ = 0;
+    std::vector<int64_t> shared_image_footprint_;
     /* Linear-state snapshot store: pinned host memory, --checkpoint-slots slots, each holding every
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */
     HostArena ck_store_;
+    int  prepare_runtime();
+    int  start_runtime();
+    void stop_runtime();
     std::atomic<bool> ck_released_{ false };   /* release_host_spare closed it; unpark opens it */
     int64_t           ck_slot_ = 0, ck_cap_ = 0;
     int  repin_host_spare(std::string* why);
     int  run_server();
+    int  configure_supplemental_text(server::ServerOptions& options);
+    int  start_supplemental_text();
+    void stop_supplemental_text();
+    std::shared_ptr<Engine> supplemental_text_;
+    std::shared_ptr<const server::TextEndpoint> supplemental_text_endpoint_;
+    int  with_server_dependencies(
+        const std::function<int(server::Deps&, server::ServerOptions&)>& use);
+    /* Start an already loaded text engine without binding a listener. On success the
+     * service owns worker shutdown and retires requests before releasing the Engine. */
+    int start_text_endpoint(const std::shared_ptr<Engine>& engine_lease,
+                            std::chrono::steady_clock::time_point deadline,
+                            std::shared_ptr<const server::TextEndpoint>* out);
+    int  validate_server_options(server::Server& srv, bool has_chat_template);
+    int  serve_http(server::Deps& deps, server::ServerOptions& options);
     /* KL mode (core/kld.h), replacing run_server: submits the corpus documents as scoring
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
      * block per rank, holding a step's tokens of that rank's logits columns. */
