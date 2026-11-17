@@ -17,7 +17,27 @@ GPU memory.
 Radiance can keep recently used image models in system RAM so they’re
 quicker to bring back too, we call it Hot Swapping.
 
-### Now with 2 new model packages
+### Run Wan video and switch between text models
+
+Generate a short clip from a prompt or a reference image with Wan 2.2.
+Choose either Gemma 4 model by name for a chat while Qwen Flash Next
+stays available for other requests. The server loads the selected
+secondary model on demand.
+
+| Model package | Checkpoint | Download |
+| --- | --- | --- |
+| Wan 2.2 TI2V-5B BF16 | `wan-2.2-ti2v-5b-bf16.rad` | [Checkpoint](https://huggingface.co/rkcth/Wan-2.2-TI2V-5B-Radiance-BF16/resolve/main/wan-2.2-ti2v-5b-bf16.rad) · [Model card](https://huggingface.co/rkcth/Wan-2.2-TI2V-5B-Radiance-BF16) |
+| Huihui Gemma 4 26B MoE INT8 | `huihui-gemma4-26b-a4b-it-i8.rad` | [Checkpoint](https://huggingface.co/rkcth/Huihui-Gemma-4-26B-A4B-it-Abliterated-Radiance-INT8/resolve/main/huihui-gemma4-26b-a4b-it-i8.rad) · [Model card](https://huggingface.co/rkcth/Huihui-Gemma-4-26B-A4B-it-Abliterated-Radiance-INT8) |
+| Huihui Gemma 4 31B Dense W4A8 | `huihui-gemma4-31b-it-w4a8.rad` | [Checkpoint](https://huggingface.co/rkcth/Huihui-Gemma-4-31B-it-Abliterated-Radiance-W4A8/resolve/main/huihui-gemma4-31b-it-w4a8.rad) · [Model card](https://huggingface.co/rkcth/Huihui-Gemma-4-31B-it-Abliterated-Radiance-W4A8) |
+
+The [two-card Wan and Gemma example](deploy/compose/flashnext-wan-gemma.radiance.yaml)
+uses two Radeon AI PRO R9700s and about 184 GiB of system RAM visible to
+Linux. Send the Wan model ID to `POST /v1/videos` and the Gemma model ID
+to `POST /v1/chat/completions`. Wan outputs an MP4 with a video track.
+The [Wan qualification notes](docs/WAN-PORT.md) include clip timings,
+memory use, and the effect on concurrent text streams.
+
+### Image model packages
 
 | Model package verified on two Radeon AI PRO R9700s | Checkpoint | Download |
 | --- | --- | --- |
