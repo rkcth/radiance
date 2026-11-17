@@ -1,9 +1,9 @@
 # Radiance with Secondary Models
 
-## Keep Your Local Assistant Running While You Make Images
+## Keep Your Local Assistant Running While You Make Images and Videos
 
 This Radiance 2.1 preview fork lets you run Qwen Flash Next for chat or coding
-and use the same AMD GPUs to create and edit images. The fork builds on
+and use the same AMD GPUs to create and edit images or animate them with sound. The fork builds on
 [StillDeadcode’s Radiance](https://codeberg.org/StillDeadcode/radiance).
 
 Generate a first draft with Qwen Image, then send it to Krea for an edit
@@ -16,6 +16,32 @@ When the image tools are idle, Qwen Flash Next can borrow some of their
 GPU memory.
 Radiance can keep recently used image models in system RAM so they’re
 quicker to bring back too, we call it Hot Swapping.
+
+### Turn a Krea image into a video with sound
+
+MiniMax H3 can animate a saved image or generate a clip from a text prompt.
+Choose FL2VA for first/last-frame workflows and Ref2VA for subject references.
+Qwen Flash Next stays available on the same GPUs while the selected video
+model runs. Model loading, generation, and memory recovery can substantially
+slow text requests.
+
+| Model package | Checkpoint | Download |
+| --- | --- | --- |
+| MiniMax H3 FL2VA W4A8 | `minimax-h3-fl2va-w4a8.rad` | [Model card and download](https://huggingface.co/rkcth/MiniMax-H3-FL2VA-Radiance-W4A8) |
+| MiniMax H3 Ref2VA W4A8 | `minimax-h3-ref2va-w4a8.rad` | [Model card and download](https://huggingface.co/rkcth/MiniMax-H3-Ref2VA-Radiance-W4A8) |
+
+Each package is 53.31 GiB and includes the text/vision encoder and audio/video
+components. Build this fork's executable and plugins together with
+`-DRAD_WITH_FFMPEG=ON`. The [two-card H3 profile](deploy/compose/flashnext-h3.radiance.yaml)
+keeps Qwen at 200K context with eight slots and RAM prefix caching. It uses
+the native fleet's `models` entries and an exclusive secondary group.
+The H3 entries cap output at 864×480 worth of pixels and support short clips
+of about five seconds under the configured processing budget.
+
+Use `POST /v1/videos` to submit a job, poll its ID, and download the MP4 when
+complete. The [H3 guide](docs/H3-PORT.md) covers setup, Krea-to-video requests,
+tested behavior, and limitations. The MiniMax H3 Community License includes
+territory and use restrictions. Read the package license before use.
 
 ### Run Wan video and switch between text models
 

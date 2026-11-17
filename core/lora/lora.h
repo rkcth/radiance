@@ -142,7 +142,8 @@ bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets
 /* Is this op a LoRA-capable GEMM over weight handle `w` (as its `b` operand)? `why` says why not.
  * gemm_nt; gemm_nt_bias without `act`; gemm_nt_q without `pb1`/`pb2`, with K == the weight's K,
  * over a weight without a transform; gemm_nt_q_bias (same encoding rule).
- * A generator's i8a8h GEMM over fwht128 int8 weights can also adapt in the rotated basis. */
+ * A generator's GEMM over supported fwht128 INT8 and asymmetric U4 weights can also adapt
+ * in the rotated basis. */
 bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::string* why);
 
 /* Every op that reads a targeted weight (any view of it) and is not a capable site over it. */

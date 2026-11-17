@@ -763,7 +763,7 @@ TEST(stacked_adapters_of_every_kind_pack_to_their_dense_delta_on_every_rank) {
     }
 }
 
-TEST(rotated_int8_generator_packs_lora_in_the_activation_basis) {
+TEST(rotated_generators_pack_lora_in_the_activation_basis) {
     const std::string path = new_dir("genlora-fwht128") + "/one.safetensors";
     const std::string block = "transformer.transformer_blocks.0.";
     const TW q = tensor(block + "attn.to_q.lora_A.weight", "F32", {1, kD}, 71);
@@ -782,13 +782,26 @@ TEST(rotated_int8_generator_packs_lora_in_the_activation_basis) {
             if (op.op != "gemm_nt_q") continue;
             WeightInfo& w = program.weights[op.weights[0]];
             if (w.name != "dit.0.qkv.weight" && w.name != "dit.0.down.weight") continue;
+            const bool u4 = w.name == "dit.0.down.weight";
             w.enc_known = true;
-            w.enc.n_planes = 1;
-            w.enc.plane[0].dtype = RAD_I8;
-            std::strcpy(w.enc.transform, "fwht128");
-            op.base.set_s("dtype", "i8a8h");
-            op.base.set_i("group", w.name == "dit.0.qkv.weight" ? 128 : 256);
+            rad_enc_clear(&w.enc);
+            rad_enc_copy_str(w.enc.scheme, "affine");
+            rad_enc_copy_str(w.enc.transform, "fwht128");
+            rad_enc_add_plane(&w.enc, "codes", u4 ? RAD_U4 : RAD_I8, 1, 1);
+            if (u4) {
+                rad_enc_add_plane(&w.enc, "scale", RAD_F16, 1, 128);
+                rad_enc_add_plane(&w.enc, "zero", RAD_U8, 1, 128);
+            }
+            op.base.set_s("dtype", u4 ? "w4a8i8_asym" : "i8a8h");
+            op.base.set_i("group", 256);
+            CHECK_EQ(lora::op_is_site(program, op, nullptr, nullptr), !u4);
+            op.base.set_i("group", 128);
             CHECK(lora::op_is_site(program, op, nullptr, nullptr));
+            if (u4) {
+                w.enc.plane[1].block[1] = 64;
+                CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
+                w.enc.plane[1].block[1] = 128;
+            }
             op.base.set_i("pb1", 16);
             CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
             op.base.set_i("pb1", 0);

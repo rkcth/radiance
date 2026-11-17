@@ -89,6 +89,7 @@ struct Server::VideoJob {
     int         steps_done = 0, steps_total = 0;
     int64_t     step_ns0 = 0;
     int64_t     completed_at = 0, expires_at = 0;
+    uint64_t    dispatch_ns = 0;
     bool        failed = false;
     std::string err_code, err_message;
     std::string mp4;
@@ -385,6 +386,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     std::shared_ptr<void> dispatch_hold;
     Deps::VideoEndpoint video = deps_.videos;
     std::string model = opt_.model_id;
+    uint64_t dispatch_ns = 0;
     if (opt_.queue_video) {
         if (!has(body, "model") || !body["model"].is_string() ||
             body["model"].get_ref<const std::string&>().empty())
@@ -398,9 +400,11 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         for (const auto& key : keys) bytes += key.data.size();
         const auto cancelled = [&] { return stopping_.load() || req.peer_gone(); };
         std::string why;
+        const uint64_t dispatch_started = rad_mono_ns();
         const int status = opt_.queue_video(model, bytes, size_t(queue_depth_),
                                             2 * opt_.max_body_bytes, cancelled, &video,
                                             &dispatch_hold, &why);
+        dispatch_ns = rad_mono_ns() - dispatch_started;
         if (status == RAD_E_CANCELLED && !stopping_.load()) {
             metrics_.observe_http(499);
             return HttpResponse::text(499, "client closed request\n");
@@ -1045,6 +1049,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     j->seconds = auto_len ? std::string("auto") : rad::fmt("%.2f", (double)frames / fps);
     j->size = std::to_string(W) + "x" + std::to_string(H);
     j->created_at = unix_now();
+    j->dispatch_ns = dispatch_ns;
     j->seed = r->seed;
     j->sampler = r->sampler;
     j->shift_video = r->shift_video;
@@ -1068,6 +1073,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     j->from_image = !r->image.empty();
     j->decoder = decoder;
     const double upscale = r->upscale;
+    auto model_lease = deps_.front ? deps_.front->hold_active_job(this) : nullptr;
     {
         std::string w;
         const int s = video.gen->submit(std::move(r), &w);
@@ -1098,9 +1104,12 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     sweep_videos_locked(unix_now());
     videos_.push_back(j);
     if (deps_.background) deps_.background->fetch_add(1);
-    j->worker = std::thread([this, j] {
+    /* The create response can leave while the job is still running. Keep the fleet model open
+     * through encoding and publication of the finished job, so ID polling keeps routing here. */
+    j->worker = std::thread([this, j, model_lease = std::move(model_lease)]() mutable {
         video_work(j);
         if (deps_.background) deps_.background->fetch_sub(1);
+        model_lease.reset();
     });
     admission.release();
     return HttpResponse::json_body(200, json_dump(video_json(*j)));
@@ -1111,8 +1120,16 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
     gen::VideoTicket& t = *j->ticket;
     mm::Mp4Writer mp4;
     std::string why;
-    int st = mp4.open(t.width, t.height, j->fps_num, j->fps_den, t.sample_rate, t.channels,
-                      &why);
+    uint64_t mp4_writer_ns = 0;
+    auto time_writer = [&](auto&& write) {
+        const uint64_t started = rad_mono_ns();
+        const int status = write();
+        mp4_writer_ns += rad_mono_ns() - started;
+        return status;
+    };
+    int st = time_writer([&] {
+        return mp4.open(t.width, t.height, j->fps_num, j->fps_den, t.sample_rate, t.channels, &why);
+    });
     int32_t frames = 0;
     bool aborted = false;
     while (st >= 0) {
@@ -1151,7 +1168,9 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
             j->seconds = rad::fmt("%.2f", (double)e.n * j->fps_den / j->fps_num);
         } else if (e.kind == gen::VideoEvent::AUDIO) {
             if (t.channels > 0)
-                st = mp4.add_audio(e.samples.data(), (int64_t)e.samples.size() / t.channels, &why);
+                st = time_writer([&] {
+                    return mp4.add_audio(e.samples.data(), (int64_t)e.samples.size() / t.channels, &why);
+                });
         } else if (e.kind == gen::VideoEvent::FRAMES) {
             if (e.first == 0 && e.n > 0) {
                 std::lock_guard<std::mutex> lk(videos_m_);
@@ -1159,7 +1178,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
                 j->w = t.width;
                 j->h = t.height;
             }
-            st = mp4.add_frames(e.rgb.data(), e.n, &why);
+            st = time_writer([&] { return mp4.add_frames(e.rgb.data(), e.n, &why); });
             frames += e.n;
             std::lock_guard<std::mutex> lk(videos_m_);
             j->progress = 90 + (t.frames > 0 ? (int)(10LL * frames / t.frames) : 0);
@@ -1168,7 +1187,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
     if (st < 0) t.cancel.store(true);
     std::string file;
     if (st >= 0 && !aborted && t.status() >= 0 && frames == t.frames)
-        st = mp4.finish(&file, &why);
+        st = time_writer([&] { return mp4.finish(&file, &why); });
     release(1);
 
     std::lock_guard<std::mutex> lk(videos_m_);
@@ -1186,9 +1205,11 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
                        sec(t.t_upscaled_ns, t.t_denoised_ns))
             : rad::fmt("steps %.1f s", sec(t.t_cond_ns, t.t_denoised_ns));
         RAD_INFO("video %s: completed, %.1f MB (%s), %.1f s: queue and prompt %.1f s, %s, "
-                 "decode %.1f s", j->id.c_str(), (double)j->mp4.size() / 1e6,
+                 "decode %.1f s, fleet dispatch %.3f s, MP4 writer %.3f s",
+                 j->id.c_str(), (double)j->mp4.size() / 1e6,
                  mp4.video_encoder().c_str(), sec(t.t_submit_ns, t.t_done_ns),
-                 sec(t.t_submit_ns, t.t_cond_ns), steps.c_str(), sec(t.t_denoised_ns, t.t_done_ns));
+                 sec(t.t_submit_ns, t.t_cond_ns), steps.c_str(), sec(t.t_denoised_ns, t.t_done_ns),
+                 (double)j->dispatch_ns / 1e9, (double)mp4_writer_ns / 1e9);
     } else {
         j->status = "failed";
         j->failed = true;

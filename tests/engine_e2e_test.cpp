@@ -2473,6 +2473,29 @@ TEST(qwen_image_with_bounded_buffers_preserves_the_picture_and_exits_cleanly) {
     CHECK(baseline.rgba == bounded.rgba);
 }
 
+TEST(qwen_image_fleet_backs_both_guidance_branches) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const auto& q = qwen_image();
+    REQUIRE(!q.bf16.empty());
+    Server server;
+    /* Check both branches are backed before a request can trigger cache growth. */
+    REQUIRE(server.start_yaml(
+        "server: {host: 127.0.0.1, port: 0, kernels: libref, debug-accept-reference-kernels: true}\n"
+        "models:\n  image:\n    model: " + q.bf16 +
+        "\n    pin: true\n    image-gen-max-pixels: 4096\n    image-gen-max-refs: 1\n"
+        "    max-num-seqs: 1\n    max-model-len: 4096\n", device_env(4096)));
+    REQUIRE(has(server.output(), "kv: the pool backs 100% of the worst case "
+                                 "(2 sequences all at 4096 tokens)"));
+    int status = 0;
+    const auto result = post(server.port, "/v1/images/generations",
+        {{"model", "image"}, {"prompt", "a green mug"}, {"size", "64x64"}, {"seed", 42},
+         {"negative_prompt", "a red mug"}, {"true_cfg_scale", 2.0}, {"num_inference_steps", 1}},
+        &status);
+    REQUIRE_EQ(status, 200);
+    CHECK(!result["data"][0].value("b64_json", std::string()).empty());
+    CHECK_EQ(server.stop(), 0);
+}
+
 TEST(qwen_image_with_vision_serves_an_edit) {
     if (std::getenv("RAD_E2E_SKIP_VISION_EDIT")) SKIP("runs as qwen_vision_edit_e2e");
     if (!rad::mm::decoder_available()) SKIP("this build has no image codec");

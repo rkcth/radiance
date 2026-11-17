@@ -5747,13 +5747,36 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
 }
 
 
+struct WpaColumnSlice {
+    const Planes& weight;
+    int64_t full_k;
+    int64_t col0;
+    std::vector<uint16_t>& output;
+};
+
+// Copy every row's matching packed code, scale and zero-point bytes before device relayout.
+static Planes wpa_slice_columns(const WpaColumnSlice& slice, int64_t N, int64_t K) {
+    Planes p;
+    p.enc = slice.weight.enc;
+    p.size(N, K);
+    for (int plane = 0; plane < p.enc.n_planes; ++plane) {
+        const int64_t source_bytes = slice.weight.row_bytes(plane);
+        const int64_t shard_bytes = p.row_bytes(plane);
+        const int64_t offset = source_bytes * slice.col0 / slice.full_k;
+        for (int64_t n = 0; n < N; ++n)
+            std::memcpy(p.data[plane].data() + n * shard_bytes,
+                        slice.weight.data[plane].data() + n * source_bytes + offset, shard_bytes);
+    }
+    return p;
+}
+
 /* The 4/5-bit asymmetric x int8 prefill GEMM against the planes' meaning: u4/u5 codes, an f16
  * scale and a u8 zero per 128 of K, an int8 activation with an f32 scale per (row, 128), parts
  * side by side. */
 static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
-                            int64_t pb2 = 0, uint32_t zdt = RAD_U8, int64_t arm = 0) {
+                            int64_t pb2 = 0, uint32_t zdt = RAD_U8, int64_t arm = 0,
+                            const WpaColumnSlice* slice = nullptr) {
     const char* row = bits == 4 ? "gemm_w4a8i8_tiled" : "gemm_w5a8i8_tiled";
-    if (!sel(row)) return;
     const PartCut cut(N, pb1, pb2);
     const int parts = cut.parts;
     char nm[160];
@@ -5762,7 +5785,7 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
-    const Planes p = asym_planes(bits, N, K, zdt);
+    const Planes p = slice ? wpa_slice_columns(*slice, N, K) : asym_planes(bits, N, K, zdt);
     const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
     const int64_t rb = p.row_bytes(ic);
     std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
@@ -5776,11 +5799,14 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
     const int64_t PK = parts * K, PG = parts * G;
     std::vector<uint8_t> ha((size_t)(M * PK));
     std::vector<float> av((size_t)(M * PK)), as((size_t)(M * PG));
+    const int64_t full_width = slice ? slice->full_k : PK;
+    const int64_t col0 = slice ? slice->col0 : 0;
     for (int64_t i = 0; i < M; ++i) {
         for (int64_t c = 0; c < PG; ++c)
-            as[(size_t)(i * PG + c)] = 0.002f * (float)(1 + st_mix32((uint32_t)(i * PG + c) ^ 0xa5u) % 97);
+            as[(size_t)(i * PG + c)] = 0.002f * (float)(1 +
+                st_mix32((uint32_t)(i * (full_width / 128) + col0 / 128 + c) ^ 0xa5u) % 97);
         for (int64_t k = 0; k < PK; ++k) {
-            const int q8 = (int)(st_mix32((uint32_t)(i * PK + k) ^ 0x3cu) % 255u) - 127;
+            const int q8 = (int)(st_mix32((uint32_t)(i * full_width + col0 + k) ^ 0x3cu) % 255u) - 127;
             ha[(size_t)(i * PK + k)] = (uint8_t)(int8_t)q8;
             av[(size_t)(i * PK + k)] = (float)q8;
         }
@@ -5818,7 +5844,10 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
     }
     const int rc = r->launch(&a, (RadStream) nullptr);
     if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "rc=" + std::to_string(rc)); return; }
-    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+    if (st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+        ok(nm, false, "could not read the projection output");
+        return;
+    }
     const int64_t nstep = N > 96 ? N / 96 : 1;
     double num = 0, den = 0;
     for (int64_t i = 0; i < M; i += (M > 64 ? 3 : 1))
@@ -5857,6 +5886,54 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
         std::printf("        %s\n", d);
     }
     ok(nm, rel < 1e-2, d);
+    if (slice) slice->output = std::move(hy);
+}
+
+static void h3_w4a8_projection_shapes(const Plugin& pl) {
+    // H3's default TP2 dense QKV, sparse QKV/gate or FFN gate/up, attention output and FFN down.
+    const int64_t shapes[][2] = { {10752, 5376}, {14336, 5376}, {5376, 3584}, {5376, 7168} };
+    for (const auto& shape : shapes) {
+        wpa8i8_numeric(pl, 4, 70, shape[0], shape[1]);
+        dfree_all();
+    }
+}
+
+static void h3_w4a8_reduce_columns(const Plugin& pl, const std::vector<int>& devs,
+                                   const std::vector<uint16_t>& left,
+                                   const std::vector<uint16_t>& right);
+
+static void h3_w4a8_column_parity(const Plugin& pl, const std::vector<int>& devs) {
+    const char* name = "h3_w4a8_column_parity";
+    if (devs.size() < 2) { skip(name, "needs two RDNA4 cards"); return; }
+    constexpr int64_t M = 70, N = 5376;
+    // The attention output and FFN down projections are H3's column-parallel linears.
+    for (int64_t full_k : { 7168, 14336 }) {
+        const auto weight = asym_planes(4, N, full_k);
+        std::vector<uint16_t> output[3];
+        for (int i = 0; i < 3; ++i) {
+            if (st_set_device(devs[i == 2 ? 1 : 0]) != hipSuccess) {
+                ok(name, false, "could not select the projection device");
+                return;
+            }
+            const WpaColumnSlice slice{weight, full_k, i == 2 ? full_k / 2 : 0, output[i]};
+            wpa8i8_numeric(pl, 4, M, N, i == 0 ? full_k : full_k / 2, 0, 0, RAD_U8, 0, &slice);
+            dfree_all();
+            if (output[i].empty()) return; // The projection helper has already reported a failure.
+        }
+        double diff_sq = 0, full_sq = 0;
+        for (size_t i = 0; i < output[0].size(); ++i) {
+            const double full = h_bf16(output[0][i]);
+            const double summed = h_bf16(rad_f32_to_bf16(h_bf16(output[1][i]) + h_bf16(output[2][i])));
+            diff_sq += (full - summed) * (full - summed);
+            full_sq += full * full;
+        }
+        // Each rank rounds its projection to BF16 before reduction, unlike the single GEMM.
+        const double rel = std::sqrt(diff_sq / full_sq);
+        const auto detail = fmt("N=%lld K=%lld host-summed shards rel_l2 %.3e", (long long)N,
+                                (long long)full_k, rel);
+        ok(detail.c_str(), rel < 1e-2);
+        h3_w4a8_reduce_columns(pl, devs, output[1], output[2]);
+    }
 }
 
 
@@ -10221,19 +10298,21 @@ void tile_offsets(const std::vector<int64_t>& sy, const std::vector<int64_t>& sx
 void vtile_plan_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "vtile_plan");
     if (!r) { ok("vtile_plan", false, "row absent"); return; }
-    const int64_t gs[][2] = { { 640, 320 }, { 128, 96 }, { 96, 768 }, { 320, 560 } };
+    const int64_t gs[][3] = { { 1, 640, 320 }, { 1, 128, 96 }, { 1, 96, 768 },
+                              { 1, 320, 560 }, { 17, 640, 320 } };
     for (const auto& g : gs) {
-        const int64_t H = g[0], W = g[1];
+        const int64_t frames = g[0], H = g[1], W = g[2];
         std::vector<int64_t> sy, sx, oy, ox;
         split_axis(H / 16, 16, 4, &sy, &oy);
         split_axis(W / 16, 16, 4, &sx, &ox);
         const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size(), M = nh * nw;
         void* dy = dalloc((size_t)(M * 22) * 4);
-        const std::string nm = fmt("vtile_plan %lld x %lld in %lld x %lld tiles", (long long)H,
-                                   (long long)W, (long long)nh, (long long)nw);
+        const std::string nm = fmt("vtile_plan %lld x %lld x %lld in %lld x %lld tiles",
+                                   (long long)frames, (long long)H, (long long)W,
+                                   (long long)nh, (long long)nw);
         /* M rides the band's bound (m.tiles), as the engine binds it -- never this call's tile
          * count; the tile count comes from geom and y's rows. */
-        const int rc = launch(r, { TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+        const int rc = launch(r, { TI32({ 3 }, { (int32_t)frames, (int32_t)H, (int32_t)W }),
                                    T(dy, RAD_I32, { M, 22 }) },
                               { PI("M", 33), PI("tile", 16), PI("overlap", 4), PI("ratio", 16) });
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
@@ -10249,7 +10328,9 @@ void vtile_plan_cases(const Plugin& pl) {
                 w[3] = (int32_t)tw;
                 for (int L = 0; L < 6; ++L) {
                     const int64_t d = (int64_t)1 << std::min(L, 4);
-                    w[4 + 3 * L] = 1;
+                    const int64_t time[] = { frames, frames, (frames + 1) / 2, (frames + 3) / 4,
+                                             (frames + 3) / 4, (frames + 3) / 4 };
+                    w[4 + 3 * L] = (int32_t)time[L];
                     w[5 + 3 * L] = (int32_t)(th / d);
                     w[6 + 3 * L] = (int32_t)(tw / d);
                 }
@@ -10320,23 +10401,47 @@ void vtile_crop_cases(const Plugin& pl) {
 void vtile_join_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "vtile_join");
     if (!r) { ok("vtile_join", false, "row absent"); return; }
-    const int64_t gs[][5] = { { 6, 9, 4, 1, 5 }, { 3, 3, 4, 2, 1 }, { 1, 20, 16, 4, 3 },
-                              { 20, 35, 16, 4, 48 } };
+    if (const RadKernelInfo* crop = find(pl, "vtile_crop")) {
+        constexpr int64_t frames = 5, side = 6, tile = 4, overlap = 2, channels = 3;
+        constexpr int64_t canvas_rows = frames * side * side, tile_rows = frames * tile * tile;
+        std::vector<float> input(canvas_rows * channels);
+        for (size_t i = 0; i < input.size(); ++i) input[i] = (float)i;
+        void* source = up_f32(input);
+        void* tiled = dalloc(4 * tile_rows * channels * sizeof(float));
+        void* output = dalloc(canvas_rows * channels * sizeof(float));
+        const auto geom = TI32({ 3 }, { frames, side, side });
+        int rc = launch(crop, { T(source, RAD_F32, { canvas_rows, channels }), geom,
+                                T(tiled, RAD_F32, { 4 * tile_rows, channels }) },
+                        { PI("M", 4 * tile_rows), PI("tile", tile), PI("overlap", overlap),
+                          PI("ratio", 1), PS("dtype", "f32") });
+        if (rc == RAD_OK)
+            rc = launch(r, { T(tiled, RAD_F32, { 4 * tile_rows, channels }), geom,
+                              T(output, RAD_F32, { canvas_rows, channels }) },
+                        { PI("M", canvas_rows), PI("tile", tile), PI("overlap", overlap),
+                          PI("n", channels), PS("dtype", "f32") });
+        const bool exact = rc == RAD_OK && differ(down_f32(output, input.size()), input) == 0;
+        ok("vtile_crop and vtile_join preserve temporal planes", exact,
+           exact ? "" : "five-frame round trip differs");
+    } else {
+        ok("vtile_crop and vtile_join preserve temporal planes", false, "crop row absent");
+    }
+    const int64_t gs[][6] = { { 1, 6, 9, 4, 1, 5 }, { 1, 3, 3, 4, 2, 1 },
+                              { 3, 1, 20, 16, 4, 3 }, { 3, 20, 35, 16, 4, 48 } };
     for (const auto& g : gs) {
-        const int64_t H = g[0], W = g[1], tile = g[2], ov = g[3], n = g[4];
+        const int64_t frames = g[0], H = g[1], W = g[2], tile = g[3], ov = g[4], n = g[5];
         std::vector<int64_t> sy, sx, oy, ox, off;
         split_axis(H, tile, ov, &sy, &oy);
         split_axis(W, tile, ov, &sx, &ox);
         const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
         tile_offsets(sy, sx, H, W, tile, &off);
-        const int64_t Sm = off.back(), M = H * W;
+        const int64_t Sm = frames * off.back(), M = frames * H * W;
         std::vector<float> x = randv((size_t)(Sm * n), 2.0f);
         void* dx = up_bf16(x);
         void* dy = dalloc((size_t)(M * n) * 2);
-        const std::string nm = fmt("vtile_join %lld x %lld bf16 tile %lld", (long long)H,
-                                   (long long)W, (long long)tile);
+        const std::string nm = fmt("vtile_join %lld x %lld x %lld bf16 tile %lld",
+                                   (long long)frames, (long long)H, (long long)W, (long long)tile);
         /* M rides the band's bound, as the engine binds it; the canvas rows come from y. */
-        const int rc = launch(r, { T(dx, RAD_BF16, { Sm, n }), TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+        const int rc = launch(r, { T(dx, RAD_BF16, { Sm, n }), TI32({ 3 }, { (int32_t)frames, (int32_t)H, (int32_t)W }),
                                    T(dy, RAD_BF16, { M, n }) },
                               { PI("M", 320 * 320), PI("tile", tile), PI("overlap", ov), PI("n", n),
                                 PS("dtype", "bf16") });
@@ -10345,13 +10450,15 @@ void vtile_join_cases(const Plugin& pl) {
         auto rd = [](float v) { return bfr(v); };
         auto wb = [&](int64_t p, int64_t e) { return rd((float)p / (float)e); };
         auto wa = [&](int64_t p, int64_t e) { return rd(1.0f - rd((float)p / (float)e)); };
-        auto Tv = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
-            return x[(size_t)((off[(size_t)(i * nw + j)] +
-                               ly * std::min(tile, W - sx[(size_t)j]) + lx) * n + c)];
+        auto Tv = [&](int64_t frame, int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+            const int64_t h = std::min(tile, H - sy[(size_t)i]);
+            const int64_t w = std::min(tile, W - sx[(size_t)j]);
+            const int64_t row = frames * off[(size_t)(i * nw + j)] + (frame * h + ly) * w + lx;
+            return x[(size_t)(row * n + c)];
         };
         std::vector<float> want((size_t)(M * n));
         for (int64_t rr = 0; rr < M; ++rr) {
-            const int64_t Y = rr / W, X = rr % W;
+            const int64_t frame = rr / (H * W), Y = (rr / W) % H, X = rr % W;
             int64_t i = 0, j = 0;
             while (i + 1 < nh && Y >= sy[(size_t)(i + 1)]) ++i;
             while (j + 1 < nw && X >= sx[(size_t)(j + 1)]) ++j;
@@ -10359,12 +10466,12 @@ void vtile_join_cases(const Plugin& pl) {
             const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0;
             const int64_t eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
             for (int64_t c = 0; c < n; ++c) {
-                float v = Tv(i, j, ly, lx, c);
+                float v = Tv(frame, i, j, ly, lx, c);
                 if (ly < ev)
-                    v = rd(rd(Tv(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                    v = rd(rd(Tv(frame, i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
                            rd(v * wb(ly, ev)));
                 if (lx < eh)
-                    v = rd(rd(Tv(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                    v = rd(rd(Tv(frame, i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
                            rd(v * wb(lx, eh)));
                 want[(size_t)(rr * n + c)] = v;
             }
@@ -12465,6 +12572,57 @@ void conv3d_cases(const Plugin& pl) {
                   ps) == RAD_E_SHAPE,
            "launched");
     }
+}
+
+void conv3d_plain_case(const Plugin& pl, bool rgb, int32_t frames) {
+    const char* name = rgb ? "conv3d_ndhwc_rgb" : "conv3d_ndhwc_pointwise";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const Vol v{ frames, 2, 5 };
+    const int64_t m = v.T * v.H * v.W, cin = rgb ? 3 : 48, cout = 5;
+    const int64_t taps = rgb ? 27 : 1, k = rgb ? 3 : 1;
+    const int64_t ldx = cin + 3, ldy = cout + 2;
+    std::vector<float> x(m * cin), weights(cout * cin * taps), bias(cout), residual(m * cout);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = ((int)(i % 7) - 3) / 16.f;
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = ((int)(i % 11) - 5) / 32.f;
+    for (size_t i = 0; i < bias.size(); ++i) bias[i] = ((int)i - 2) / 64.f;
+    for (size_t i = 0; i < residual.size(); ++i) residual[i] = ((int)(i % 5) - 2) / 8.f;
+    void* dx = up_rows(x, m, cin, ldx, m);
+    void* dw = up_f32(weights);
+    void* db = up_f32(bias);
+    void* dy = up_rows(residual, m + 1, cout, ldy, m);
+    if (!dx || !dw || !db || !dy) { ok(name, false, "hipMalloc failed"); return; }
+    const auto dst = pitched(dy, RAD_BF16, m + 1, cout, ldy);
+    const int rc = launch(r, { pitched(dx, RAD_BF16, m, cin, ldx),
+                               T(dw, RAD_F32, { cout, cin, k, k, k }), T(db, RAD_F32, { cout }),
+                               TI32({ 3 }, { frames, (int32_t)v.H, (int32_t)v.W }), dst, dst },
+                          { PI("M", m), PI("cin", cin), PI("cout", cout), PI("k", k), PI("kt", k),
+                            PS("dtype", "bf16"), PI("causal", rgb), PI("reflect", rgb) });
+    if (rc != RAD_OK) { ok(name, false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> tap_major(weights.size());
+    for (int64_t o = 0; o < cout; ++o)
+        for (int64_t c = 0; c < cin; ++c)
+            for (int64_t t = 0; t < taps; ++t)
+                tap_major[(o * taps + t) * cin + c] = weights[(o * cin + c) * taps + t];
+    const auto result = down_u16(dy, (m + 1) * ldy);
+    std::vector<float> want(m * cout), got(want.size());
+    for (int64_t row = 0; row < m; ++row) {
+        if (rgb) {
+            conv3d_row(x, cin, tap_major, bias, &residual[row * cout], v, v, 1, 1,
+                       1, 0, 1, cout, row, &want[row * cout]);
+        }
+        for (int64_t o = 0; o < cout; ++o) {
+            const int64_t idx = row * cout + o;
+            if (!rgb) {
+                float sum = 0.f;
+                for (int64_t c = 0; c < cin; ++c) sum += x[row * cin + c] * weights[o * cin + c];
+                want[idx] = bfr(bfr(sum + bias[o]) + residual[idx]);
+            }
+            got[idx] = h_bf16(result[row * ldy + o]);
+        }
+    }
+    check(fmt("%s, %d frames, pitched rows with in-place residual", name, frames), got, want, 0.f);
+    ok(name, marks_moved(result, m + 1, cout, ldy, m) == 0, "padding changed");
 }
 
 /* ------------------------------------------------------------------ group_norm */
@@ -28154,6 +28312,7 @@ struct ArPattern {
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<std::vector<float>> out;
+    const std::vector<uint16_t>* bf16_input = nullptr; // Optional real partial projection input.
 };
 
 static float ar_pattern_value(int rank, int64_t i) {
@@ -28233,10 +28392,14 @@ static void ar_pattern_worker(ArPattern* t) {
     for (size_t k = 0; t->rc_init == RAD_OK && t->rc_launch != RAD_E_NOMEM &&
                        k < t->sizes.size(); ++k) {
         const int64_t n = t->sizes[k];
-        for (int64_t i = 0; i < n; ++i) {
-            const float v = ar_value(t->coded_pattern, t->rank, i);
-            if (bf) { const uint16_t b = h_to_bf16(v); std::memcpy(&h[(size_t)i * 2], &b, 2); }
-            else    std::memcpy(&h[(size_t)i * 4], &v, 4);
+        if (t->bf16_input) {
+            std::memcpy(h.data(), t->bf16_input->data(), (size_t)n * sizeof(uint16_t));
+        } else {
+            for (int64_t i = 0; i < n; ++i) {
+                const float v = ar_value(t->coded_pattern, t->rank, i);
+                if (bf) { const uint16_t b = h_to_bf16(v); std::memcpy(&h[(size_t)i * 2], &b, 2); }
+                else    std::memcpy(&h[(size_t)i * 4], &v, 4);
+            }
         }
         copy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
         const bool oop = (int)k == t->out_of_place;
@@ -28291,6 +28454,41 @@ static void ar_pattern_run(std::vector<ArPattern>& t, const std::vector<int>& de
     }
     for (std::thread& x : th) x.join();
     for (ArPattern& x : t) x.shared = nullptr;
+}
+
+static void h3_w4a8_reduce_columns(const Plugin& pl, const std::vector<int>& devs,
+                                   const std::vector<uint16_t>& left,
+                                   const std::vector<uint16_t>& right) {
+    const char* name = "H3 W4A8 shards through exact BF16 lane all-reduce";
+    const auto* row = find(pl, "ar_oneshot_2rank_exact_lane");
+    if (!row) { ok(name, false, "kernel row absent"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards"); return; }
+    if (left.size() != right.size()) { ok(name, false, "different shard output sizes"); return; }
+
+    std::vector<ArPattern> ranks(2);
+    ranks[0].bf16_input = &left;
+    ranks[1].bf16_input = &right;
+    for (auto& rank : ranks) {
+        rank.row = row;
+        rank.dtype = "bf16";
+        rank.overlap = 1;
+        rank.sizes = { (int64_t)left.size() };
+    }
+    ar_pattern_run(ranks, devs);
+    for (auto& rank : ranks) if (rank.inst) row->fini(rank.inst);
+    for (const auto& rank : ranks) {
+        if (rank.rc_init != RAD_OK || rank.rc_launch != RAD_OK || rank.out.size() != 1 ||
+            rank.out[0].size() != left.size()) {
+            ok(name, false, fmt("rank %d init/launch %d/%d", rank.rank, rank.rc_init, rank.rc_launch));
+            return;
+        }
+    }
+    size_t bad = 0;
+    for (size_t i = 0; i < left.size(); ++i) {
+        const uint16_t want = h_to_bf16(h_bf16(left[i]) + h_bf16(right[i]));
+        for (const auto& rank : ranks) bad += h_to_bf16(rank.out[0][i]) != want;
+    }
+    ok(name, bad == 0, fmt("%zu elements differed from the host BF16 sum", bad));
 }
 
 /* One run on a fresh instance per rank, every size checked against the fold. False when init
@@ -30876,6 +31074,15 @@ static void device_phase(const Plugin& pl) {
     if (devs.empty()) { skip("device phase", "no gfx1200/gfx1201 device"); return; }
     st_set_device(devs[0]);
 
+    if (g_case && sel("h3_w4a8_projection_shapes")) {
+        h3_w4a8_projection_shapes(pl);
+        return;
+    }
+    if (g_case && sel("h3_w4a8_column_parity")) {
+        h3_w4a8_column_parity(pl, devs);
+        return;
+    }
+
     if (!g_case) std::printf("\ndevice smoke tests (device %d)\n", devs[0]);
 
     ngram_ahead_case(pl);
@@ -33085,6 +33292,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
     /* A video latent upscaler's ops, at its source and target sizes. */
     if (sel("conv3d_ndhwc_bf16")) ups::conv3d_cases(pl);
+    if (sel("conv3d_ndhwc_rgb")) {
+        ups::conv3d_plain_case(pl, true, 1);
+        ups::conv3d_plain_case(pl, true, 4);
+    }
+    if (sel("conv3d_ndhwc_pointwise")) ups::conv3d_plain_case(pl, false, 3);
     if (sel("group_norm")) ups::group_norm_cases(pl);
     if (sel("tconv_dw_bf16")) ups::tconv_dw_cases(pl);
     if (sel("resize_bilinear")) ups::resize_bilinear_cases(pl);
@@ -33658,6 +33870,8 @@ static void device_phase(const Plugin& pl) {
             wpa8i8_numeric(pl, bits, 100, 2560, 1280, 1536, 0, RAD_U8, arm);
         }
         if (bits == 4) {
+            dfree_all();
+            h3_w4a8_projection_shapes(pl);
             /* An int4 W4A16 release imported with a u4 zero plane and no rotation: five groups
              * a row, so each zero row ends in a pad nibble; then the delta net's qkv|z, the MLP's
              * gate|up and down at a prefill chunk. */

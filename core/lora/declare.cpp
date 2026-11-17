@@ -311,13 +311,13 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
             if (a_dt != RAD_I8 || a.rank != 2 || a.shape[1] != x.K_r ||
                 reads.size() != 2 || !g.base.get_i("group", &group) || group <= 0 ||
                 x.K_r % group != 0) {
-                refuse("i8a8h LoRA requires a full row of int8 activation codes");
+                refuse("Hadamard LoRA requires a full row of int8 activation codes");
                 continue;
             }
             const RadBufDecl& scales = P.buffers[reads[1]].decl;
             if (scales.dtype != RAD_F32 || scales.rank != 2 || scales.shape[0] != a.shape[0] ||
                 scales.shape[1] != x.K_r / group) {
-                refuse("i8a8h LoRA requires one f32 activation scale per code group");
+                refuse("Hadamard LoRA requires one f32 activation scale per code group");
                 continue;
             }
         }

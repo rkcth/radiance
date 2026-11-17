@@ -6086,6 +6086,13 @@ static const RadConstraint cSnakeAa[] = { C_IN("dtype", "f32"), C_LE("k", 32) };
  * its 5-frame window in registers; the fold's lists are kernel arguments, 64 floats at most. */
 static const RadConstraint cConv3d[] = { C_IN("dtype", "bf16"), C_EQ("k", 3), C_EQ("kt", 3),
                                          C_DIV("cin", 8) };
+#define C_CONV3D_PLAIN C_IN("dtype", "bf16"), C_EQ("stride", 1), C_EQ("stride_t", 1), \
+    C_IN("pad", "same"), C_IN("tpad", "zero"), C_EQ("tpre", 0), C_GE("cout", 1), C_LE("cout", 16384)
+static const RadConstraint cConv3dRgb[] = { C_CONV3D_PLAIN, C_EQ("k", 3), C_EQ("kt", 3),
+                                           C_EQ("cin", 3), C_EQ("causal", 1), C_EQ("reflect", 1) };
+static const RadConstraint cConv3dPointwise[] = { C_CONV3D_PLAIN, C_EQ("k", 1), C_EQ("kt", 1),
+    C_GE("cin", 1), C_LE("cin", 16384), C_EQ("causal", 0), C_EQ("reflect", 0) };
+#undef C_CONV3D_PLAIN
 static const RadConstraint cGroupNorm[] = { C_IN("dtype", "bf16 f32"), C_DIV("n", 8),
                                             C_LE("n", 8192), C_LE("groups", 256) };
 static const RadConstraint cTconvDw[] = { C_IN("dtype", "bf16"), C_EQ("k", 5), C_DIV("n", 8) };
@@ -10840,6 +10847,20 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cConv3d), NOTUNE,
   nullptr, nullptr, r4d_rad_conv3d_ndhwc, nullptr, r4d_rad_layout_conv3d_tap,
   r4d_rad_relayout_conv3d_tap, nullptr, r4d_rad_unrelayout_conv3d_tap },
+
+{ "conv3d_ndhwc_rgb", "conv3d_ndhwc", "conv",
+  "3 x 3 x 3 RGB convolution with causal temporal padding and spatial reflection",
+  "one thread per output value, device geometry and unit strides",
+  "bf16 voxels with plain f32 weights and bias",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cConv3dRgb), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv3d_plain, nullptr },
+
+{ "conv3d_ndhwc_pointwise", "conv3d_ndhwc", "conv",
+  "1 x 1 x 1 convolution over device geometry",
+  "one thread per output value, unit strides",
+  "bf16 voxels with plain f32 weights and bias",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cConv3dPointwise), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv3d_plain, nullptr },
 
 { "group_norm", "group_norm", "norm",
   "GroupNorm over all rows in three launches: per-part (count, mean, M2), their merge to mean and "

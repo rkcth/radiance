@@ -2711,6 +2711,43 @@ TEST(a_wan_pipeline_normalizes_its_umt5_encoder_dimensions) {
     CHECK(ck.find("shared.weight") != nullptr);
 }
 
+TEST(a_diffusers_pipeline_can_select_a_linked_reference_transformer) {
+    namespace fs = std::filesystem;
+    const std::string source = fresh_dir();
+    const std::string staged = fresh_dir();
+    for (const char* component : { "transformer", "transformer_ref" }) {
+        const std::string path = source + "/" + component;
+        REQUIRE(fs::create_directory(path));
+        const bool ref = std::strcmp(component, "transformer_ref") == 0;
+        write_file(path + "/config.json", ref ? R"({"num_layers":7})" : R"({"num_layers":3})");
+        write_shard(path + "/diffusion_pytorch_model-00001-of-00002.safetensors",
+                    {bf16("w", {2, 2}, ref ? 7.0f : 3.0f)});
+        write_shard(path + "/diffusion_pytorch_model-00002-of-00002.safetensors",
+                    {bf16("second", {2, 2}, ref ? 8.0f : 4.0f)});
+        write_file(path + "/diffusion_pytorch_model.safetensors.index.json",
+                   R"({"weight_map":{"w":"diffusion_pytorch_model-00001-of-00002.safetensors",
+                       "second":"diffusion_pytorch_model-00002-of-00002.safetensors"}})");
+    }
+    write_file(staged + "/model_index.json", R"({"_class_name":"MiniMaxH3ModularPipeline"})");
+    const std::string reference = source + "/transformer_ref";
+    const std::string selected = staged + "/transformer";
+    std::error_code ec;
+    fs::create_directory_symlink(reference, selected, ec);
+    REQUIRE(!ec);
+
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(staged), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("minimaxh3"));
+    const SrcTensor* weight = ck.find("transformer.w");
+    const SrcTensor* second = ck.find("transformer.second");
+    const char* layers = ck.meta().get("transformer.num_layers");
+    REQUIRE(weight && second && layers);
+    CHECK_EQ(rad_load_f32(weight->data, RAD_BF16, 0), 7.0f);
+    CHECK_EQ(rad_load_f32(second->data, RAD_BF16, 0), 8.0f);
+    CHECK_EQ(std::string(layers), std::string("7"));
+    CHECK(ck.find("transformer_ref.w") == nullptr);
+}
+
 /* ================================================================== a drafter of its own
  *
  * A drafter that ships as its own repository (DFlash2) merges under `draft.`: its tensors, and its

@@ -12,6 +12,7 @@
 #include "gen/video.h"
 #include "mm/imaging.h"
 #include "mm/media.h"
+#include "server/front.h"
 
 #include <chrono>
 #include <thread>
@@ -23,6 +24,7 @@ struct FakeVideoGen : IVideoGen {
     int         finish_status = RAD_OK;
     int         submit_status = RAD_OK;
     std::string finish_why;
+    bool        hold_completion = false;
     std::vector<std::unique_ptr<gen::VideoRequest>> got;
     mutable std::mutex got_m;
 
@@ -104,7 +106,7 @@ struct FakeVideoGen : IVideoGen {
             for (size_t i = 0; i < f.rgb.size(); ++i) f.rgb[i] = (uint8_t)(i * 7);
             t.push(std::move(f));
         }
-        t.finish(finish_status, finish_why);
+        if (!hold_completion) t.finish(finish_status, finish_why);
         got.push_back(std::move(r));
         return RAD_OK;
     }
@@ -498,6 +500,43 @@ TEST(the_video_routes_are_501_without_a_video_model) {
     Fixture f;
     CHECK_EQ(f.post("/v1/videos", Videos::body().dump()).status, 501);
     CHECK_EQ(f.get("/v1/videos").status, 501);
+}
+
+TEST(a_fleet_video_holds_its_model_until_the_result_is_kept) {
+    Front front(TransportOptions{}, 0);
+    FakeVideoGen gen;
+    gen.hold_completion = true;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& options, Deps& deps) {
+        options.model_id = "fleet-video";
+        options.video_model = true;
+        deps.videos = { &gen, deps.tok, nullptr, {} };
+        deps.front = &front;
+    }});
+    front.attach("fleet-video", {}, f.srv.get());
+    gen.submit_status = RAD_E_DEVICE;
+    CHECK_EQ(f.post("/v1/videos", Videos::body().dump()).status, 503);
+    CHECK_EQ(front.activity("fleet-video").leases, 0);
+    gen.submit_status = RAD_OK;
+    const HttpResponse created = f.post("/v1/videos", Videos::body().dump());
+    REQUIRE_EQ(created.status, 200);
+    HttpRequest poll;
+    poll.path = "/v1/videos/" + str_at(json::parse(created.body), "id");
+    const int64_t active_leases = front.activity("fleet-video").leases;
+    const bool detached_before_completion = front.detach("fleet-video", 0);
+    CHECK_EQ(f.get(poll.path.c_str()).status, 200);
+    gen.last().ticket->finish(RAD_OK, {});
+    REQUIRE(front.detach("fleet-video", 5000));
+    const Handler kept = front.kept_job(poll);
+    REQUIRE(kept);
+    const json result = json::parse(kept(poll).body);
+    if (str_at(result, "status") == "failed" &&
+        has(str_at(result["error"], "message"), "no libavcodec"))
+        SKIP("this build has no libavcodec to write the video");
+    CHECK_EQ(active_leases, 1);
+    CHECK(!detached_before_completion);
+    REQUIRE_EQ(str_at(result, "status"), "completed");
+    poll.path += "/content";
+    CHECK_EQ(kept(poll).status, 200);
 }
 
 TEST(shared_video_job_survives_the_selected_model_retiring) {

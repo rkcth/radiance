@@ -1,0 +1,44 @@
+# minimax-h3-w4a8.recipe -- experimental H3 with a four-bit denoiser.
+#
+#   rad-convert <MiniMax-H3 pipeline directory> --recipe data/recipes/minimax-h3-w4a8.recipe \
+#       -o minimax-h3-w4a8.rad
+#
+# The four main DiT projections use 128-column Hadamard-rotated uint4 weights
+# with int8 activations. Conditioning, modulation and the media codecs use the
+# same recipe as minimax-h3-i8.recipe. This changes neither the architecture nor
+# its denoising schedule. Start from compatible source tensors with adequate
+# precision. Packed ConvRot checkpoints have a different format.
+te.blk.*.attn_qkv.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_output.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_gate_up.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_down.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_norm.weight            cast dtype=f32
+te.blk.*.ffn_norm.weight             cast dtype=f32
+ref.blk.*.attn_qkv.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+ref.blk.*.attn_output.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+ref.blk.*.ffn_gate_up.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+ref.blk.*.ffn_down.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.attn_qkv.weight           rtn  codes=u4 zero=u8 group=128 scale=f16 transform=fwht128 rule=search
+dit.blk.*.attn_output.weight        rtn  codes=u4 zero=u8 group=128 scale=f16 transform=fwht128 rule=search
+dit.blk.*.ffn_gate_up.weight        rtn  codes=u4 zero=u8 group=128 scale=f16 transform=fwht128 rule=search
+dit.blk.*.ffn_down.weight           rtn  codes=u4 zero=u8 group=128 scale=f16 transform=fwht128 rule=search
+dit.blk.*.ada*.weight                rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+vae.blk.*.attn_qkv.weight            cast dtype=bf16
+vae.blk.*.attn_out.weight            cast dtype=bf16
+vae.blk.*.ffn_up.weight              cast dtype=bf16
+vae.blk.*.ffn_down.weight            cast dtype=bf16
+vae.proj_out.*                       cast dtype=bf16
+aud.*.weight                         cast dtype=f32
+aenc.d*.w                            cast dtype=bf16
+aenc.d*.b                            cast dtype=bf16
+aenc.pb.*                            cast dtype=bf16
+aenc.b*.u*.c1.weight                 cast dtype=f32
+aenc.b*.u*.c2.weight                 cast dtype=f32
+aenc.cin.weight                      cast dtype=f32
+aenc.fin.weight                      cast dtype=f32
+venc.l*.b*.c1w                       cast dtype=bf16
+venc.l*.b*.c2w                       cast dtype=bf16
+venc.l*.dnw                          cast dtype=bf16
+venc.cout.weight                     cast dtype=bf16
+ups.embed.*                          cast dtype=f32
+ups.*.emb_layers.*                   cast dtype=f32

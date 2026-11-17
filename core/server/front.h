@@ -135,6 +135,10 @@ public:
     /* Every model's name, in the order added. */
     std::vector<std::string> names() const;
 
+    /* A job accepted on a leased server outlives the create response. Retain the model until
+     * the job finishes and keep_job owns its response. A leased server may be draining. */
+    std::shared_ptr<void> hold_active_job(const Server* server);
+
     /* A finished job of a model (a video, a shape), named by its id in the path (/v1/videos/{id},
      * /status/{id}). The model's memory may go at any moment after it finishes, and with it the
      * server that made the job, so from here on `answer` serves every request naming that id, and

@@ -4124,9 +4124,11 @@ int Engine::with_server_dependencies(
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
     };
-    if (!img_gen_ && (cfg_.image_gen_max_pixels > 0 || cfg_.image_gen_max_refs > 0))
-        RAD_WARN("--image-gen-max-pixels / --image-gen-max-refs: this model makes no images; "
-                 "ignored");
+    if (!img_gen_ && cfg_.image_gen_max_refs > 0)
+        RAD_WARN("--image-gen-max-refs: this model makes no images; ignored");
+    if (!img_gen_ && cfg_.image_gen_max_pixels > 0 &&
+        (!vid_gen_ || ranks_[0]->program.video_gen.max_area > cfg_.image_gen_max_pixels))
+        RAD_WARN("--image-gen-max-pixels: the selected model does not use this limit; ignored");
     if (img_gen_) {
         struct ImageEndpointOwner {
             std::shared_ptr<server::TokenizerBridge> tokenizer;

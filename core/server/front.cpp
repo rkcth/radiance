@@ -596,6 +596,16 @@ void Front::keep_job(const std::string& id, int64_t expires_at, int64_t max_kept
     if (jobs_.size() > cap) jobs_.erase(jobs_.begin(), jobs_.end() - (std::ptrdiff_t)cap);
 }
 
+std::shared_ptr<void> Front::hold_active_job(const Server* server) {
+    if (!server) return {};
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& p : entries_)
+        if (!p->removed && p->server == server &&
+            (p->state == State::Open || p->state == State::Closing))
+            return lease_quiet(p.get());
+    return {};
+}
+
 Handler Front::kept_job(const HttpRequest& q) {
     if (!id_route(q.path)) return nullptr;
     const std::string id = route_id(q.path);

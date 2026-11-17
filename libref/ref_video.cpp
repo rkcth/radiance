@@ -927,14 +927,14 @@ int ref_cond_aug(const RadArgs* a, RadStream) {
  * parameters. */
 
 /* ------------------------------------------------------------------ vtile_plan */
-/* The tiles of one frame of `geom` = (clip, H, W) pixels: split_tiles_axis over each spatial axis
+/* The tiles of a volume with `geom` = (clip, H, W) pixels: split_tiles_axis over each spatial axis
  * in latent units (`tile` a side, `overlap` the least blend, `ratio` pixels a latent), numbered
  * row-major. Row t of y (i32 [M, 22]):
  *
  *   [0] [1]     the tile's first pixel (y0, x0)
  *   [2] [3]     its pixel extent (th, tw): `tile` x ratio, except a lone short tile
- *   3 L + 4..6  level L's volume (1, th / 2^min(L, 4), tw / 2^min(L, 4)), L = 0..5: venc_geom's
- *               level layout for one frame (levels 4 and 5 share a size)
+ *   3 L + 4..6  level L's volume (time[L], th / 2^min(L, 4), tw / 2^min(L, 4)), L = 0..5
+ *               as in venc_geom. Levels 4 and 5 share a size.
  *
  * `M` is the band's bound, a ceiling only (band_rows); y must hold the tiles. */
 int ref_vtile_plan(const RadArgs* a, RadStream) {
@@ -944,6 +944,7 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(ldi(geom, 0), 1);
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
@@ -953,6 +954,7 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
     const int64_t M = band_rows(nh * nw, band);
     if (M <= 0 || rows_of(y, 22) < M) return RAD_E_SHAPE;
+    const int64_t half = 1 + (frames - 1) / 2, quarter = 1 + (frames - 1) / 4;
     REF_PAR_FOR(M)
     for (int64_t t = 0; t < M; ++t) {
         const int64_t i = t / nw, j = t % nw;
@@ -960,17 +962,18 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
         const int64_t tw = std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
         const int64_t yb = rowoff(y, t, 22), ys = laststride(y);
         const int64_t v[22] = { sy[(size_t)i] * ratio, sx[(size_t)j] * ratio, th, tw,
-                                1, th, tw,   1, th / 2, tw / 2,   1, th / 4, tw / 4,
-                                1, th / 8, tw / 8,   1, th / 16, tw / 16,   1, th / 16, tw / 16 };
+                                frames, th, tw, frames, th / 2, tw / 2, half, th / 4, tw / 4,
+                                quarter, th / 8, tw / 8, quarter, th / 16, tw / 16,
+                                quarter, th / 16, tw / 16 };
         for (int64_t c = 0; c < 22; ++c) st_int(y->dtype, y->data, yb + c * ys, v[c]);
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ vtile_crop */
-/* One frame's pixel plane cut into vtile_plan's tiles: x f32 [>= H W, 3] is the plane (pixel
- * (Y, X) at row Y W + X), geom = (clip, H, W) in pixels; y f32 [M, 3] holds the tiles' pixels
- * tile-major, each tile's rows in plane order. The tiles overlap, so y is larger than x and a
+/* A pixel volume cut into vtile_plan's spatial tiles: x f32 [>= clip H W, 3] in frame, row and
+ * column order; geom = (clip, H, W) in pixels. y f32 [M, 3] holds each tile's full pixel volume in
+ * frame, row and column order. The tiles overlap, so y is larger than x and a
  * buffer of its own. `M` is a ceiling only (band_rows). */
 int ref_vtile_crop(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
@@ -979,7 +982,9 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(ldi(geom, 0), 1);
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
+    const int64_t plane = H * W;
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
         !split_tiles_axis(H / ratio, tile, overlap, &sy, &oy) ||
@@ -994,15 +999,22 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
                 off[(size_t)(i * nw + j)] +
                 th * std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
     }
-    const int64_t M = band_rows(off.back(), band);
-    if (M <= 0 || rows_of(x, 3) < H * W || rows_of(y, 3) < M) return RAD_E_SHAPE;
+    if (plane > rows_of(x, 3) / frames || off.back() > INT64_MAX / frames)
+        return RAD_E_SHAPE;
+    const int64_t M = band_rows(frames * off.back(), band);
+    if (M <= 0 || rows_of(y, 3) < M) return RAD_E_SHAPE;
     REF_PAR_FOR(M * 3)
     for (int64_t r = 0; r < M; ++r) {
-        const int64_t t = (int64_t)(std::upper_bound(off.begin(), off.end(), r) - off.begin()) - 1;
+        const int64_t tile_row = r / frames;
+        const int64_t t = (int64_t)(std::upper_bound(off.begin(), off.end(), tile_row) - off.begin()) - 1;
         const int64_t i = t / nw, j = t % nw;
         const int64_t tw = std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
-        const int64_t k = r - off[(size_t)t];
-        const int64_t src = (sy[(size_t)i] * ratio + k / tw) * W + sx[(size_t)j] * ratio + k % tw;
+        const int64_t tile_plane = std::min(tile, H / ratio - sy[(size_t)i]) * ratio * tw;
+        const int64_t k = r - frames * off[(size_t)t];
+        const int64_t spatial_row = k % tile_plane;
+        const int64_t src = (k / tile_plane) * plane +
+                            (sy[(size_t)i] * ratio + spatial_row / tw) * W +
+                            sx[(size_t)j] * ratio + spatial_row % tw;
         const int64_t xb = rowoff(x, src, 3), yb = rowoff(y, r, 3), xs = laststride(x);
         const int64_t ys = laststride(y);
         for (int64_t c = 0; c < 3; ++c) stt(y, yb + c * ys, ldt(x, xb + c * xs));
@@ -1011,11 +1023,12 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ vtile_join */
-/* The tiles' moments blended into one latent plane, as vae.py's `tiled_encode` does: x holds the
+/* The tiles' moments blended into a latent volume, as vae.py's `tiled_encode` does: x holds the
  * tiles' n-channel moments tile-major (vtile_crop's layout at latent extent), geom = (clip, lat_h,
- * lat_w) in latents, and y f32 or bf16 [M, n] is the canvas, M = lat_h lat_w. Position (Y, X)
+ * lat_w) in latents, and y f32 or bf16 [M, n] is the canvas, M = clip lat_h lat_w. Position (Y, X)
  * belongs to the tile (i, j) whose range [start, next start) holds it, at (ly, lx) within it;
- * T(i, j, ly, lx) is that tile's value. The neighbours are read unblended and the top blend comes
+ * T(i, j, ly, lx) is that tile's value at the current frame. The neighbours are read unblended
+ * from the current frame, and the top blend comes
  * before the left one; every product and sum rounds to x's dtype (`rd`), with
  * wa(p, e) = rd(1 - rd(p / e)) and wb(p, e) = rd(p / e):
  *
@@ -1033,13 +1046,16 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
     const int64_t overlap = p_int(a, "overlap", 0), n = p_int(a, "n", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(ldi(geom, 0), 1);
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
+    const int64_t plane = H * W;
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || !split_tiles_axis(H, tile, overlap, &sy, &oy) ||
         !split_tiles_axis(W, tile, overlap, &sx, &ox))
         return RAD_E_SHAPE;
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
-    const int64_t M = band_rows(H * W, band);
+    if (plane > INT64_MAX / frames) return RAD_E_SHAPE;
+    const int64_t M = band_rows(frames * plane, band);
     std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
     for (int64_t i = 0; i < nh; ++i) {
         const int64_t th = std::min(tile, H - sy[(size_t)i]);
@@ -1047,7 +1063,8 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
             off[(size_t)(i * nw + j + 1)] =
                 off[(size_t)(i * nw + j)] + th * std::min(tile, W - sx[(size_t)j]);
     }
-    if (M <= 0 || rows_of(x, n) < off.back() || rows_of(y, n) < M) return RAD_E_SHAPE;
+    if (M <= 0 || off.back() > rows_of(x, n) / frames || rows_of(y, n) < M)
+        return RAD_E_SHAPE;
     /* The owner tile of every canvas row and column. */
     std::vector<int64_t> own_y((size_t)H), own_x((size_t)W);
     for (int64_t Y = 0, i = 0; Y < H; ++Y) {
@@ -1062,25 +1079,27 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
     auto rd = [dt](float v) { return round_dt(dt, v); };
     auto wb = [&](int64_t p, int64_t e) { return rd((float)p / (float)e); };
     auto wa = [&](int64_t p, int64_t e) { return rd(1.0f - rd((float)p / (float)e)); };
-    auto T = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
-        const int64_t row = off[(size_t)(i * nw + j)] + ly * std::min(tile, W - sx[(size_t)j]) + lx;
+    auto fetch = [&](int64_t frame, int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+        const int64_t height = std::min(tile, H - sy[(size_t)i]);
+        const int64_t width = std::min(tile, W - sx[(size_t)j]);
+        const int64_t row = frames * off[(size_t)(i * nw + j)] + (frame * height + ly) * width + lx;
         return ldt(x, rowoff(x, row, n) + c * laststride(x));
     };
     const int64_t ys = laststride(y);
     REF_PAR_FOR(M * n)
     for (int64_t r = 0; r < M; ++r) {
-        const int64_t Y = r / W, X = r % W;
+        const int64_t frame = r / plane, Y = (r % plane) / W, X = r % W;
         const int64_t i = own_y[(size_t)Y], j = own_x[(size_t)X];
         const int64_t ly = Y - sy[(size_t)i], lx = X - sx[(size_t)j];
         const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0, eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
         const int64_t yb = rowoff(y, r, n);
         for (int64_t c = 0; c < n; ++c) {
-            float v = T(i, j, ly, lx, c);
+            float v = fetch(frame, i, j, ly, lx, c);
             if (ly < ev)
-                v = rd(rd(T(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                v = rd(rd(fetch(frame, i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
                        rd(v * wb(ly, ev)));
             if (lx < eh)
-                v = rd(rd(T(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                v = rd(rd(fetch(frame, i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
                        rd(v * wb(lx, eh)));
             stt(y, yb + c * ys, v);
         }

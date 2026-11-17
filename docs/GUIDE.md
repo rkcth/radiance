@@ -2882,7 +2882,7 @@ keys are refused on it, and so are the pixel bands.
 | `video-min-frames: N`, `video-max-frames: N` | container's | the fewest and most frames sampled from a video |
 | `video-max-frame-tokens: N` | container's | the most prompt tokens one frame may become; 0 is no cap. A token-budget processor (Gemma 4's) takes 70, 140, 280, 560 or 1120 |
 | `image-tokens: N` | container's | a token-budget processor's image budget: Gemma 4's 70, 140, 280, 560 or 1120, which a request's `image_tokens` overrides; GLM-5.3's ceiling, at most `mm-max-patches` / 4 (the checkpoint states 8000, which `auto` lowers to 4096). The pixel-band keys are refused on such a model |
-| `image-gen-max-pixels: N`, `image-gen-max-refs: N` | the model's | an image generator's largest image, in pixels, and the reference pictures a request. The generator sizes its per-image and conditioning buffers, and so the activation arena, for them; on a card the weights nearly fill, a smaller image is what makes room. Larger requests are refused; a generator that keeps fixed buffers is named at startup. Images in flight follow `max-num-seqs` |
+| `image-gen-max-pixels: N`, `image-gen-max-refs: N` | the model's | an image generator's largest image, in pixels, and the reference pictures a request. The generator sizes its per-image and conditioning buffers, and so the activation arena, for them; on a card the weights nearly fill, a smaller image is what makes room. Larger requests are refused; a generator that keeps fixed buffers is named at startup. `max-num-seqs` limits entries in a denoising pass. A guided image uses two entries, so the engine raises a value of one to two |
 | `max-source-pixels: N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
 **Quality measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
@@ -4240,6 +4240,15 @@ models:
     tp: 2
     vision-tower-placement: ram
 ```
+
+For MiniMax-H3, `image-gen-max-pixels` also caps the video frame area and sizes the output
+activation buffers at startup. For example, `414720` allows 864×480. The minimum cap is 65536
+pixels (256×256). Reference encoding retains its own limits.
+
+An explicit `max-num-batched-tokens` can further reduce denoising memory by limiting H3's
+maximum clip duration. It must hold the shortest step and the largest decoder pass at the
+configured pixel cap. The resulting duration limit applies to all frame sizes. References
+consume rows from the same denoising budget and can exhaust it even on the shortest clip.
 
 ```sh
 radiance --config radiance.yaml

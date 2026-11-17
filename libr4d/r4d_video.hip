@@ -452,7 +452,7 @@ __global__ __launch_bounds__(kT) void vtile_plan_kernel(
     const int* __restrict__ geom, int* __restrict__ y, int tile, int overlap, int ratio, int y_ld,
     int64_t M, int64_t y_rows) {
     const int64_t id = (int64_t)blockIdx.x * kT + threadIdx.x;
-    const int H = geom[1], W = geom[2];
+    const int T = max(geom[0], 1), H = geom[1], W = geom[2];
     if (id >= M * 22 || id >= y_rows * 22 || H <= 0 || W <= 0 || H % ratio || W % ratio) return;
     const Tiles ty = split_tiles_axis(H / ratio, tile, overlap);
     const Tiles tx = split_tiles_axis(W / ratio, tile, overlap);
@@ -469,7 +469,8 @@ __global__ __launch_bounds__(kT) void vtile_plan_kernel(
         v = c == 0 ? ty.start(i) * ratio : c == 1 ? tx.start(j) * ratio : c == 2 ? th : tw;
     } else {
         const int L = (c - 4) / 3, k = (c - 4) % 3, d = 1 << min(L, 4);
-        v = k == 0 ? 1 : k == 1 ? th / d : tw / d;
+        const int temporal_stride = 1 << min(max(L - 1, 0), 2);
+        v = k == 0 ? 1 + (T - 1) / temporal_stride : k == 1 ? th / d : tw / d;
     }
     y[t * y_ld + c] = v;
 }
@@ -481,23 +482,31 @@ __global__ __launch_bounds__(kT) void vtile_crop_kernel(
     const T* __restrict__ x, const int* __restrict__ geom, T* __restrict__ y, int tile,
     int overlap, int ratio, int x_ld, int y_ld, int64_t M, int64_t x_rows, int64_t y_rows) {
     const int64_t r = (int64_t)blockIdx.x * kT + threadIdx.x;
-    const int H = geom[1], W = geom[2];
+    const int frames = max(geom[0], 1), H = geom[1], W = geom[2];
     if (r >= M || r >= y_rows || H <= 0 || W <= 0 || H % ratio || W % ratio) return;
     const Tiles ty = split_tiles_axis(H / ratio, tile, overlap);
     const Tiles tx = split_tiles_axis(W / ratio, tile, overlap);
-    if (ty.n == 0 || tx.n == 0 || (int64_t)H * W > x_rows) return;
+    const int64_t plane = (int64_t)H * W;
+    if (ty.n == 0 || tx.n == 0 || plane > x_rows / frames) return;
     const int nh = ty.n, nw = tx.n;
     int t = -1;
-    int64_t acc = 0, k = 0;
+    int64_t acc = 0, k = 0, frame = 0;
+    const int64_t tile_row = r / frames;
     for (int tt = 0; tt < nh * nw; ++tt) {
         const int64_t sz = (int64_t)min(tile, H / ratio - ty.start(tt / nw)) * ratio *
                            min(tile, W / ratio - tx.start(tt % nw)) * ratio;
-        if (r < acc + sz) { t = tt; k = r - acc; break; }
+        if (tile_row < acc + sz) {
+            t = tt;
+            const int64_t local_row = r - frames * acc;
+            frame = local_row / sz;
+            k = local_row % sz;
+            break;
+        }
         acc += sz;
     }
     if (t < 0) return;  // r past the tiles' sum: M was not it
     const int tw = min(tile, W / ratio - tx.start(t % nw)) * ratio;
-    const int64_t src = ((int64_t)ty.start(t / nw) * ratio + k / tw) * W +
+    const int64_t src = frame * plane + ((int64_t)ty.start(t / nw) * ratio + k / tw) * W +
                         (int64_t)tx.start(t % nw) * ratio + k % tw;
     for (int c = 0; c < 3; ++c) stv(y + r * (int64_t)y_ld, c, ldv(x + src * (int64_t)x_ld, c));
 }
@@ -510,14 +519,17 @@ __global__ __launch_bounds__(kT) void vtile_join_kernel(
     const T* __restrict__ x, const int* __restrict__ geom, T* __restrict__ y, int tile,
     int overlap, int n, int x_ld, int y_ld, int64_t M, int64_t x_rows, int64_t y_rows) {
     const int64_t r = (int64_t)blockIdx.x * kT + threadIdx.x;
-    const int H = geom[1], W = geom[2];
-    if (r >= M || r >= y_rows || r >= (int64_t)H * W || H <= 0 || W <= 0) return;
+    const int frames = max(geom[0], 1), H = geom[1], W = geom[2];
+    if (r >= M || r >= y_rows || H <= 0 || W <= 0) return;
+    const int64_t plane = (int64_t)H * W;
+    const int64_t frame = r / plane;
+    if (frame >= frames) return;
     const Tiles ty = split_tiles_axis(H, tile, overlap), tx = split_tiles_axis(W, tile, overlap);
     if (ty.n == 0 || tx.n == 0) return;
     const int nh = ty.n, nw = tx.n;
     // The tiles' row extents and their prefix sums, in tile-major order.
     const int64_t ext_y = nh == 1 ? H : (int64_t)tile * nh, ext_x = nw == 1 ? W : (int64_t)tile * nw;
-    if (ext_y * ext_x > x_rows) return;
+    if (ext_y * ext_x > x_rows / frames) return;
     auto sz = [&](int ii, int jj) {
         return (int64_t)min(tile, H - ty.start(ii)) * min(tile, W - tx.start(jj));
     };
@@ -526,17 +538,21 @@ __global__ __launch_bounds__(kT) void vtile_join_kernel(
         for (int t = 0; t < ii * nw + jj; ++t) a += sz(t / nw, t % nw);
         return a;
     };
-    const int Y = (int)(r / W), X = (int)(r % W);
+    const int Y = (int)((r % plane) / W), X = (int)(r % W);
     int i = 0;
     while (i + 1 < nh && Y >= ty.start(i + 1)) ++i;
     int j = 0;
     while (j + 1 < nw && X >= tx.start(j + 1)) ++j;
     const int ly = Y - ty.start(i), lx = X - tx.start(j);
     const int ev = i > 0 ? ty.ov(i - 1) : 0, eh = j > 0 ? tx.ov(j - 1) : 0;
-    const int64_t own = off(i, j), up = i > 0 ? off(i - 1, j) : 0, left = j > 0 ? off(i, j - 1) : 0;
     // A tile's width: this tile and the one above share a column (`own_w`, short only in the last
     // column); the left neighbour's column is never the last, so it is `tile` wide.
     const int own_w = min(tile, W - tx.start(j));
+    const auto frame_offset = [&](int ii, int jj) {
+        return frames * off(ii, jj) + frame * sz(ii, jj);
+    };
+    const int64_t own = frame_offset(i, j), up = i > 0 ? frame_offset(i - 1, j) : 0,
+                  left = j > 0 ? frame_offset(i, j - 1) : 0;
     const auto fetch = [&](int64_t base, int w, int ay, int ax, int c) {
         return ldv(x, (base + (int64_t)ay * w + ax) * x_ld + c);
     };

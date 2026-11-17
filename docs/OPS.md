@@ -1791,20 +1791,22 @@ above, except that an axis no longer than a tile is one tile `[0, L)`, short if 
 MiniMax-H3: `tile` 16 latents, `overlap` 4, `ratio` 16. An `M` in a shape below is that operand's
 row count, read from the operand; the ranged `M` argument is a ceiling only.
 
-- `vtile_plan`: the plan for one frame of `geom` = `(clip, H, W)` pixels, split in latent units
+- `vtile_plan`: a volume plan for `geom` = `(clip, H, W)` pixels, split in latent units
   over the spatial axes and numbered row-major over (row band, column band). Row `t` of the i32
   `y [M, 22]`: the tile's first pixel `(y0, x0)` at [0] [1], its pixel extent `(th, tw)` at
   [2] [3] (`tile ratio`, except a lone short tile), and level `L`'s volume
-  `(1, th / 2^min(L, 4), tw / 2^min(L, 4))` at `3 L + 4` for `L = 0..5` (levels 4 and 5 share a
-  size).
-- `vtile_crop`: the frame's pixel plane `x [>= H W, 3]` (pixel `(Y, X)` at row `Y W + X`) cut into
-  the plan's tiles: `y [M, 3]` holds the tiles' pixels tile-major, each tile's rows in plane
-  order; `M` is the tiles' pixel count, more than the plane's since the tiles overlap.
+  `(time[L], th / 2^min(L, 4), tw / 2^min(L, 4))` at `3 L + 4` for `L = 0..5`. The two temporal
+  strides give extents `clip, clip, ceil(clip / 2), ceil(clip / 4), ceil(clip / 4), ceil(clip / 4)`.
+  A nonpositive `clip` uses the single-frame plan.
+- `vtile_crop` takes pixels `x [>= clip H W, 3]` in frame and spatial order. Its output
+  `y [M, 3]` holds all frames of each spatial tile contiguously. Overlapping pixels appear in
+  each tile that contains them.
 - `vtile_join`: the tiles' `n`-channel moments (`vtile_crop`'s row layout at latent extent)
   blended into the canvas `y [M, n]` of `geom` = `(clip, lat_h, lat_w)` in latent units, `M`
-  `lat_h lat_w`. As in the stitch, position `(Y, X)` belongs to the tile `(i, j)` whose range
-  `[start_i, start_{i+1})` holds it, at `(ly, lx)` within it, `T(i, j, ly, lx)` that tile's
-  value; unlike the stitch, the neighbours are read unblended. `rd`, `wa` and `wb` are the
+  `clip lat_h lat_w` in frame and spatial order. Position `(Y, X)` belongs to the tile
+  `(i, j)` whose range `[start_i, start_{i+1})` holds it, at `(ly, lx)` within it.
+  `T(i, j, ly, lx)` is that tile's value in the current frame. The blend reads unblended
+  neighbours from that same frame. `rd`, `wa` and `wb` are the
   stitch's, rounding to `x`'s dtype:
 
       V = rd(rd(T(i-1, j, ly + tile - ev, lx) wa(ly, ev)) + rd(T(i, j, ly, lx) wb(ly, ev)))

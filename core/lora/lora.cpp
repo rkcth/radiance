@@ -326,18 +326,27 @@ void compositions(int P, int n, std::vector<std::vector<std::pair<int, int>>>* o
 
 constexpr int64_t kLoraTransformWidth = 128;
 
-/* i8a8h reads row-major, unnormalised H128(x) codes plus their scales. The scale group may
- * cover two transforms. Other rotated kernel families may change the basis or element order. */
+/* These paths read row-major, unnormalised H128(x) codes plus their scales. The INT8 scale
+ * group may cover two transforms. The asymmetric U4 path shares the same input basis. */
 bool accepts_fwht128_input(const Program& prog, const OpInfo& op, const WeightInfo& w) {
     if (!gen_scope(prog) || op.op != "gemm_nt_q" || !w.enc_known ||
-        w.enc.n_planes == 0 || w.enc.plane[0].dtype != RAD_I8 ||
+        w.enc.n_planes == 0 ||
         std::strncmp(w.enc.transform, "fwht128", RAD_ENC_STR) != 0)
         return false;
     const char* dtype = op.base.get_s("dtype");
     long long group = 0;
-    return dtype && std::strcmp(dtype, "i8a8h") == 0 &&
-           op.base.get_i("group", &group) &&
-           (group == kLoraTransformWidth || group == 2 * kLoraTransformWidth);
+    if (!dtype || !op.base.get_i("group", &group)) return false;
+    if (std::strcmp(dtype, "i8a8h") == 0 && w.enc.plane[0].dtype == RAD_I8)
+        return group == kLoraTransformWidth || group == 2 * kLoraTransformWidth;
+    if (std::strcmp(dtype, "w4a8i8_asym") != 0 || group != kLoraTransformWidth ||
+        w.enc.plane[0].dtype != RAD_U4 || !rad_enc_is(&w.enc, "affine") || w.enc.n_planes != 3)
+        return false;
+    const RadEncPlane* scale = rad_enc_plane(&w.enc, "scale");
+    const RadEncPlane* zero = rad_enc_plane(&w.enc, "zero");
+    return w.enc.plane[0].block[1] == 1 && scale && zero && scale->dtype == RAD_F16 &&
+           (zero->dtype == RAD_U8 || zero->dtype == RAD_U4) &&
+           scale->block[0] == 1 && zero->block[0] == 1 &&
+           scale->block[1] == group && zero->block[1] == group;
 }
 
 bool same_layout(const Site& a, const Site& b) {

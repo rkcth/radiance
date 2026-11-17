@@ -1,0 +1,47 @@
+# Qualified on two 32 GiB Radeon AI PRO R9700s with about 184 GiB host RAM.
+# Download both H3 packages, adjust paths, and build with RAD_WITH_FFMPEG=ON.
+server:
+  host: 127.0.0.1
+  port: 8000
+memory:
+  host-headroom-mib: 8192
+  gpu-headroom-mib: 384
+scheduler:
+  warm-up: false
+  load-timeout: 180s
+models:
+  qwen-flash-next:
+    # Supply your own compatible primary checkpoint at this path.
+    model: /models/swift15-flashnext-autoround.rad
+    aliases: [default]
+    pin: true
+    priority: 100
+    tp: 2
+    tp-wire: wht6
+    placement: expert_tiered
+    host-pool-mib: 65536
+    gpu-memory-mib: 13600
+    ngram-placement: disk
+    vision-tower-placement: ram
+    kv-cache-dtype: i8
+    prefix-cache-mib: 16384
+    max-model-len: 200000
+    max-num-seqs: 8
+    max-num-batched-tokens: 2048
+    num-speculative-tokens: 4
+    draft-window: adaptive
+  minimax-h3-fl2va:
+    model: /models/minimax-h3-fl2va-w4a8.rad
+    tp: 2
+    vision-tower-placement: ram
+    image-gen-max-pixels: 414720
+    max-num-batched-tokens: 27000
+  minimax-h3-ref2va:
+    model: /models/minimax-h3-ref2va-w4a8.rad
+    tp: 2
+    vision-tower-placement: ram
+    image-gen-max-pixels: 414720
+    max-num-batched-tokens: 27000
+groups:
+  secondaries:
+    exclusive: [minimax-h3-fl2va, minimax-h3-ref2va]

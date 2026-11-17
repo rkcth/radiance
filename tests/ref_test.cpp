@@ -7895,6 +7895,20 @@ TEST(vtile_plan_plans_one_frame_the_way_vae_py_splits_it) {
                                1, 16, 12,   1, 8, 6,   1, 8, 6 };
     for (int i = 0; i < 22; ++i) CHECK_EQ(y1.iat(i), lone[i]);
 
+    /* A padded temporal clip uses the same spatial plan and two causal temporal downsamplers. */
+    T clip(RAD_I32, {3}); clip.n({17, 640, 320});
+    T yc(RAD_I32, {6, 22});
+    A ac; ac.t(clip).t(yc).i("M", 6).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", ac));
+    const int64_t temporal[6] = { 17, 17, 9, 5, 5, 5 };
+    for (int64_t tile = 0; tile < 6; ++tile)
+        for (int entry = 0; entry < 22; ++entry) {
+            const int64_t index = tile * 22 + entry;
+            const int64_t expected = entry >= 4 && (entry - 4) % 3 == 0
+                ? temporal[(entry - 4) / 3] : y.iat(index);
+            CHECK_EQ(yc.iat(index), expected);
+        }
+
     /* A 96 x 768 px plane: one short row band (6 latents) and 48 latents a row, split at 0, 10,
      * 21, 32 -- the slack of 4 going to the overlaps one at a time round-robin (6, 5, 5),
      * so the last column still runs the full 16 latents to the plane's edge. A short band only
@@ -7934,6 +7948,31 @@ TEST(vtile_plan_plans_one_frame_the_way_vae_py_splits_it) {
     T ys(RAD_I32, {5, 22});
     A g; g.t(geom).t(ys).i("M", 33).i("tile", 16).i("overlap", 4).i("ratio", 16);
     CHECK_EQ(run("vtile_plan", g), RAD_E_SHAPE);
+}
+
+TEST(vtile_round_trip_keeps_temporal_planes_separate) {
+    constexpr int64_t frames = 5, side = 6, tile = 4, overlap = 2, channels = 3;
+    constexpr int64_t canvas_rows = frames * side * side;
+    constexpr int64_t tile_rows = frames * tile * tile;
+    T geom(RAD_I32, {3}); geom.n({frames, side, side});
+    T pixels(RAD_F32, {canvas_rows, channels});
+    std::vector<float> data(canvas_rows * channels);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = (float)i;
+    pixels.f(data);
+    T tiled(RAD_F32, {4 * tile_rows, channels});
+    A crop;
+    crop.t(pixels).t(geom).t(tiled).i("M", 4 * tile_rows).i("tile", tile)
+        .i("overlap", overlap).i("ratio", 1);
+    CHECK_OK(run("vtile_crop", crop));
+    /* The second tile starts at x = 2 and holds all five frames contiguously. */
+    CHECK_EQ(tiled.at(tile_rows * channels), 2 * channels);
+    CHECK_EQ(tiled.at((tile_rows + tile * tile) * channels), (side * side + 2) * channels);
+    T result(RAD_F32, {canvas_rows, channels});
+    A join;
+    join.t(tiled).t(geom).t(result).i("M", canvas_rows).i("tile", tile)
+        .i("overlap", overlap).i("n", channels).s("dtype", "f32");
+    CHECK_OK(run("vtile_join", join));
+    for (size_t i = 0; i < data.size(); ++i) CHECK_EQ(result.at((int64_t)i), data[i]);
 }
 
 /* A 20 x 20 px plane in ratio 4, tiles of 3 latents (12 px) with overlap 1: each axis splits at
@@ -8065,6 +8104,23 @@ TEST(vtile_join_blends_raw_neighbours_down_then_across) {
     CHECK_EQ(qx(3, 5), 16.0f);   CHECK_EQ(qx(3, 6), 18.0f);   /* left fully at lx = 0; half up at 1 */
     CHECK_EQ(qx(5, 2), 8.0f);    CHECK_EQ(qx(5, 3), 12.0f);   /* fully left at lx = 0, half at 1 */
     CHECK_EQ(qx(0, 8), 4.0f);    CHECK_EQ(qx(4, 2), 8.0f);    /* past every blend: own or fully left */
+
+    /* A second plane with distinct tile moments must blend only its own neighbours. */
+    T temporal_geom(RAD_I32, {3}); temporal_geom.n({2, 6, 6});
+    T temporal_tiles(RAD_BF16, {128, 1});
+    std::vector<float> tile_values(128);
+    for (int tile = 0; tile < 4; ++tile)
+        for (int frame = 0; frame < 2; ++frame)
+            std::fill_n(tile_values.begin() + (tile * 2 + frame) * 16, 16,
+                        base[tile] * (frame + 1));
+    temporal_tiles.f(tile_values);
+    T temporal_canvas(RAD_BF16, {72, 1});
+    A temporal;
+    temporal.t(temporal_tiles).t(temporal_geom).t(temporal_canvas).i("M", 72)
+        .i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", temporal));
+    CHECK_EQ(temporal_canvas.at(3 * 6 + 3), 18.0f);
+    CHECK_EQ(temporal_canvas.at(36 + 3 * 6 + 3), 36.0f);
 
     /* A canvas below one tile is a lone tile: the join is the copy. */
     T g1(RAD_I32, {3}); g1.n({1, 3, 3});

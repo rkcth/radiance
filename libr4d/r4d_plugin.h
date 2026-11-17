@@ -349,6 +349,7 @@ int     r4d_rad_snake_aa              (const RadArgs*, RadStream);
 /* r4d_upscaler.hip: a video latent upscaler's 3D convolution, group norm, temporal depthwise
  * convolution and resize, the patch fold and the re-noise. */
 int     r4d_rad_conv3d_ndhwc          (const RadArgs*, RadStream);
+int     r4d_rad_conv3d_plain          (const RadArgs*, RadStream);
 int     r4d_rad_group_norm            (const RadArgs*, RadStream);
 int     r4d_rad_tconv_dw              (const RadArgs*, RadStream);
 int     r4d_rad_resize_bilinear       (const RadArgs*, RadStream);
