@@ -964,6 +964,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `attn_paged_sink` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`?, `sinks`w → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_dense_ref` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens` → `out`, `mode_cu`, `ref_log_bias` |
+| `attn_umt5` | `M`(range) `heads` `dtype` | `q`, `k`, `v`, `cu_seqlens`, `bias` → `out` |
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
@@ -1025,6 +1026,11 @@ contains `3*S+1` offsets: the text, reference and target starts for each sequenc
 final row offset. The float32 `ref_log_bias` array has one value per sequence. The kernel adds
 that value to scores from target queries to reference keys. A bias of negative infinity instead
 restricts reference queries to their own reference keys.
+
+**`attn_umt5`** implements Wan UMT5's bidirectional attention in BF16. Each head has 64 channels
+and each packed sequence has at most 512 rows. The learned `bias` has shape `[32, heads]` and is
+indexed by the signed key-minus-query distance. The unscaled QK dot product and biased logits
+round to BF16. Softmax runs in FP32 and its probabilities round to BF16 before the final value product.
 
 **`attn_cross`** is `attn_dense` with each entry's keys a run of their own: entry `s`'s queries
 are rows `[cu_seqlens[s], cu_seqlens[s+1])` of `q`, its keys and values rows `[cu_k[s], cu_k[s+1])`
@@ -1312,6 +1318,7 @@ says which (`libref/ref_gen.cpp`).
 | `gate_add` | `M`(range) `n` `dtype` `act`/opt | `y`, `g`, `cu_seqlens`, `x`:inout |
 | `ln_mod_had_quant_i8g` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
 | `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `clamp_min`:f64/opt `curve`/opt `dtype` | `t` → `y`, `table`w? |
+| `timestep_embed_f64` | `M`(range) `n` `max_period`:f64 `dtype` | F32 `t` → F32 `y`, with FP64 angles and trigonometry |
 | `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
 | `table_add` | `M`(range) `n` `L` `dtype` | `x`, `t`w → `y` |
 | `mix_rows` | `M`(range) `n` `k` `dtype` | `x`, `w`w → `y` |
@@ -1330,6 +1337,7 @@ says which (`libref/ref_gen.cpp`).
 | `s2d_avg_add` | `M`(range) `cin` `cout` `ft` `dtype` | `x`, `y`:inout |
 | `to_rgba8` | `M`(range) `n` `dtype` | `x` → `y` |
 | `gelu_tanh` | `M`(range) `n` `dtype` | `x` → `y` |
+| `gelu_umt5` | `M`(range) `n` `dtype` | BF16 `x` → BF16 `y` with Wan UMT5's intermediate rounding |
 | `scatter_add_rows` | `M`(range) `n` `dtype` | `v`, `idx`, `x`:inout |
 | `attn_prefix_self` | `q_len` `head_dim` `gqa` `block_size`/der `causal` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `qk`/opt `pv`/opt | `q`, `k`, `v`, `kv_cache`?, `block_table`?, `seqused`?, `cu_seqlens`, `k_descale`?, `v_descale`?, `k_i8`?, `k_scale`? → `out`, `v_scale`? |
 
@@ -1658,6 +1666,7 @@ bf16 tensor and keeps f32 where it computes in f32; the libref function says whi
 | `rms_mod_had_quant_i8g` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`?, `colmap`? |
 | `flow_x0_step` | `M`(range) `n` `dtype` | `v`, `t`, `sigma`, `sigma_next`, `x`:inout |
 | `flow_res_multistep` | `M`(range) `n` `dtype` | `v`, `x0`:inout, `sigma`, `r`, `hb1`, `hb2`, `order`, `x`:inout |
+| `flow_unipc_step` | `M`(range) `n` `dtype` | `v`, `coefficients`, `history`:inout, `x`:inout |
 | `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
 | `vtile_gather` | `M`(range) `n` `tile` `overlap` `frames` `period` `n_reg` `dtype` | `x`, `reg`w, `geom` → `y` |
 | `vtile_stitch` | `M`(range) `tile` `overlap` `scale` `pt` `skip` `keep` `blend` `period` `mean` `std` | `x`, `geom`, `prev`:inout → `y` |
@@ -1707,6 +1716,14 @@ reads its entry's rows of `s` and `g`.
   Euler step `x = f32(f32(r x) + f32(f32(1 - r) d))`, which a step with no previous estimate on its
   grid takes (core/gen/video_driver.cpp's `stage_sched` has the coefficients, `hb1 + hb2 = 1 - r`).
   `sigma`, `r`, `hb1`, `hb2` and `order` are one f32 value each; `v` f32 or bf16.
+- `flow_unipc_step` advances flow-prediction UniPC BH2 by one evaluation. The
+  clean estimate is `x - sigma * v`; the corrector uses saved history before
+  the predictor advances the sample. `coefficients` is a contiguous eight-value
+  f32 vector in `rad_unipc_math.h` order. The f32 `history` has `3*n` columns per
+  row, holding the last corrected sample, last clean estimate, and older clean
+  estimate. Zero the history for a new trajectory. The operation updates it and
+  the f32 sample `x` in place. Velocity `v` can be f32 or bf16. Each matrix
+  has contiguous columns and a row pitch at least its width.
 
 **The decoder** runs over a request's latent geometry, which `geom`, i32 on the device, carries
 (the parameters are fixed at declare). `mul`, `add`, `mean` and `std` are space-separated lists
@@ -2029,6 +2046,13 @@ guidance and sampler in f32.
 | `ltx_guide` | `M`(range) `n` `dtype` | `vc`, `vu`?, `vs`?, `vm`?, `scales`, `sched`, `stats`:inout, `x`:inout |
 | `pixel_norm` | `M`(range) `n` `eps`:f64 `form` `act`/opt `ileave`/opt `dtype` `mult`:f64/opt | `x` → `y` |
 | `d2s3d` | `M`(range) `C` `st` `sh` `sw` `drop`/opt `dtype` | `x`, `geom` → `y` |
+| `wan_rope_table` | `M`(range) `dtype` | I32 latent `geom` → F32 `table` |
+| `wan_rope` | `M`(range) `heads` `dtype` | `q`:inout, `k`:inout, F32 `table` |
+| `wan_mod_norm` | `M`(range) `n` `group` `eps`:f64/opt `round_norm`/opt `dtype` | F32 `x`, F32 `time`, F32 `table`w, I32 `split`? → `y` |
+| `wan_gated_add` | `M`(range) `n` `gate` `dtype` | F32 `x`:inout, BF16 `update`, F32 `time`?, F32 `table`w?, I32 `split`? |
+| `wan_unpatch` | `M`(range) `n` `dtype` | `patches`, I32 latent `geom` → F32 `velocity` |
+| `wan_vae_history` | `M`(range) `temporal` `reset` `dtype` | BF16 `x`, BF16 `history`:inout → BF16 `y` |
+| `wan_vae_expand` | `M`(range) `cin` `cout` `st` `s` `drop` `temporal` `dtype` | BF16 `x`, I32 `geom` → BF16 `y` |
 | `s2d3d` | `M`(range) `C` `st` `sh` `sw` `tpre`/opt `group`/opt `mode` `add`/opt `dtype` | `x`, `geom`, `y`:inout |
 | `pix_patch` | `M`(range) `p` `C` `order`/opt `dtype` | `x` → `y` |
 | `stft_logmel` | `M`(range) `hop` `nfft` `n_mel` `ch` `dtype` | `x`, `basis`w, `mel`w → `y` |
@@ -2051,6 +2075,28 @@ guidance and sampler in f32.
   4096, `n_dims` 3, `max` `20 2048 2048` (two padded pairs); the soundtrack's and both cross
   attentions' `dim` 2048, `n_dims` 1, `max` `20`; the text connectors' `max` 4096 over the row
   index.
+- Wan's latent `geom` is `[T, H, W]` with even `H` and `W`. `wan_rope_table` builds a row
+  of interleaved cosines and sines for each 1 × 2 × 2 patch. The 128-wide head rotates adjacent
+  pairs, with 22 pairs on time and 21 each on height and width. Each axis starts its own
+  frequency ladder at 1. Angles and trigonometry use FP64, and the table stores FP32.
+  `wan_rope` reuses that table across heads and rotates BF16 or F32 queries and keys in place.
+  `wan_unpatch` expands `[dy, dx, channel]` head columns to F32 voxel rows, with
+  x varying fastest, then y, then time. Its `dtype` is the source patch dtype.
+- `wan_mod_norm` applies layer normalization and then `norm(x) * (1 + scale) + shift`.
+  Groups 0 and 3 read the first or second modulation triplet. Group -1 uses the same time
+  embedding for both head coefficients. Each coefficient adds its learned table row.
+  An optional scalar `split` marks the first row after the conditioned frame. Rows below it
+  read the timestep-zero coefficients. Without it, every row uses the sole time row.
+  `round_norm` is used in the first block, whose inputs originated as BF16 patch embeddings.
+  `wan_gated_add` accumulates into F32. Gates 2 and 5 select the self-attention and feed-forward
+  coefficients. Gate -1 adds the cross-attention update directly.
+- `wan_vae_history` stores two frames per decoder layer and request lane. For spatial
+  convolution it prepends those frames to the current volume. For a temporal convolution it
+  forms three adjacent samples per channel in each output row. `reset=1` supplies zero
+  history and then saves the current chunk's tail. The spatial geometry is fixed until reset.
+- `wan_vae_expand` converts time-convolution output columns `[dt, C]` into consecutive
+  frames when `temporal=1`. With `temporal=0` it repeats channels and expands the shortcut's
+  `[C, dt, dy, dx]` layout. `drop` removes leading output frames on the first chunk.
 - `head_gate`: `x = rd(x rd(2 rd(sigmoid(g))))` for each head's `head_dim` values, `g`
   `[M, >= n_head]` the head's logit (the gated attention's `to_gate_logits`), each operand at its
   own row pitch.

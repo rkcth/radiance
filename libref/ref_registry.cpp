@@ -455,6 +455,10 @@ static const RadParamSpec pAttnDense[] = { P_INT("M"), P_INT("head_dim"), P_INT(
                                            P_INTO("window_right") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
+static const RadParamSpec pAttnUmt5[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oAttnUmt5[] = {
+    OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"), WGT("bias"), OUT("out"),
+};
 static const RadParamSpec pAttnDenseRef[] = {
     P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
     P_F64O("scale"),
@@ -903,10 +907,15 @@ static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD(
                                           INOUT("x") };
 static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
                                           OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
+static const RadOperandSpec oFlowUniPC[] = { OPD("v"), OPD("coefficients"),
+                                             INOUT("history"), INOUT("x"), OPD_O("negative"), OPD_O("guidance") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
                                           P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
                                           P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y"), WGT_O("table") };
+static const RadParamSpec pTimestepF64[] = { P_INT("M"), P_INT("n"), P_F64("max_period"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oTimestepF64[] = { OPD("t"), OUT("y") };
 static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
 static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
 static const RadOperandSpec oLaneGather[] = { OPD("src"), OPD("lane"), OPD("cu_seqlens"), OUT("y") };
@@ -936,7 +945,9 @@ static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
 static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
                                         P_STR("pad"), P_INT("up"), P_STR("dtype") };
-static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadParamSpec pL2Norm[] = {
+    P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"), P_INTO("round_length"),
+};
 static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
 static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
                                             P_STR("dtype") };
@@ -982,6 +993,31 @@ static const RadOperandSpec oVtileJoin[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
                                           P_INT("period"), P_F64("scale") };
 static const RadOperandSpec oGridPos3[] = { OUT("y") };
+static const RadParamSpec pWanTable[] = { P_INT("M"), P_STR("dtype") };
+static const RadParamSpec pWanRope[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oWanTable[] = { OPD("geom"), OUT("table") };
+static const RadOperandSpec oWanRope[] = { INOUT("q"), INOUT("k"), OPD("table") };
+static const RadParamSpec pWanModNorm[] = { P_INT("M"), P_INT("n"), P_INT("group"),
+                                            P_F64O("eps"), P_INTO("round_norm"), P_STR("dtype") };
+static const RadParamSpec pWanGate[] = { P_INT("M"), P_INT("n"), P_INT("gate"), P_STR("dtype") };
+static const RadOperandSpec oWanModNorm[] = {
+    OPD("x"), OPD("time"), WGT("table"), OPD_O("split"), OUT("y"),
+};
+static const RadOperandSpec oWanGate[] = {
+    INOUT("x"), OPD("update"), OPD_O("time"), WGT_O("table"), OPD_O("split"),
+};
+static const RadOperandSpec oWanUnpatch[] = { OPD("patches"), OPD("geom"), OUT("velocity") };
+static const RadParamSpec pWanVaeFrameCu[] = { P_INT("M") };
+static const RadOperandSpec oWanVaeFrameCu[] = { OPD("geom"), OUT("cu") };
+static const RadParamSpec pWanVaeHistory[] = {
+    P_INT("M"), P_INT("temporal"), P_INT("reset"), P_STR("dtype"),
+};
+static const RadParamSpec pWanVaeExpand[] = {
+    P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("st"), P_INT("s"), P_INT("drop"),
+    P_INT("temporal"), P_STR("dtype"),
+};
+static const RadOperandSpec oWanVaeHistory[] = { OPD("x"), INOUT("history"), OUT("y") };
+static const RadOperandSpec oWanVaeExpand[] = { OPD("x"), OPD("geom"), OUT("y") };
 /* ---- video sparse attention (ref_vsa.cpp). `segs` cuts the rows into dense segments and the
  * video grid, last; `geom` is the request's RadVideoGeom on the device (RAD_VGEOM_*). The two ops
  * share their parameters: attn_vsa recomputes k from `sparsity`. `v` of vsa_select is read for
@@ -1606,6 +1642,9 @@ static const RadOpSchema kSchemas[] = {
   "Dense attention with a logit bias on target queries to reference keys. mode_cu gives "
   "each sequence's text, reference and target starts and the last sequence's end. A bias "
   "of negative infinity restricts reference queries to reference keys instead." },
+{ "attn_umt5", ARR(pAttnUmt5), ARR(oAttnUmt5),
+  "UMT5 BF16 bidirectional attention with an unscaled query-key dot and learned relative bias. "
+  "Each packed sequence uses its own key range and 32 signed distance buckets." },
 { "attn_cross", ARR(pAttnCross), ARR(oAttnCross),
   "attn_dense with each entry's keys a run of their own: queries rows [cu[s], cu[s+1]), keys and "
   "values rows [cu_k[s], cu_k[s+1]); with `causal` a query sees key j of its run when j <= its own "
@@ -1920,6 +1959,8 @@ static const RadOpSchema kSchemas[] = {
   "pipeline hands it to its transformer. With `curve` > 0 and a `table` [curve, n] f32 operand: "
   "y[m] = table sampled at clamp01(max(t[m], clamp_min)) * (curve - 1), lerped between the two "
   "rows around that position -- a precomputed adaln time-embedding curve." },
+{ "timestep_embed_f64", ARR(pTimestepF64), ARR(oTimestepF64),
+  "sinusoidal embedding of unscaled timesteps, with f64 frequencies and trigonometry, f32 output." },
 { "gather_rows2", ARR(pMnD), ARR(oGather2),
   "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]: a sequence assembled from two sources." },
 { "lane_gather", ARR(pLane), ARR(oLaneGather),
@@ -1970,6 +2011,7 @@ static const RadOpSchema kSchemas[] = {
   "decoded pixels in [-1, 1] to bytes as diffusers' postprocess makes them: "
   "round(clamp(bf16(bf16(clamp(x) / 2) + 0.5), 0, 1) * 255), u8 out." },
 { "gelu_tanh", ARR(pMnD), ARR(oUnary), "the tanh approximation of gelu." },
+{ "gelu_umt5", ARR(pMnD), ARR(oUnary), "Wan UMT5's tanh GELU with BF16 intermediates." },
 { "gelu_quick", ARR(pMnD), ARR(oUnary),
   "CLIP's quick_gelu, three roundings: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)." },
 { "scatter_add_rows", ARR(pMnD), ARR(oScatterRows),
@@ -1999,6 +2041,9 @@ static const RadOpSchema kSchemas[] = {
   "then d written back for the next). order<2 makes it Euler (x = r x + (1 - r) d), the first "
   "step, a schedule restart and the last step; there hb1 + hb2 = 1 - r. sigma, r, hb1, hb2 and "
   "order one f32 each; x and x0 f32 (MiniMax-H3's DPM-Solver++2M / res_multistep)." },
+{ "flow_unipc_step", ARR(pMnD), ARR(oFlowUniPC),
+  "Flow-prediction UniPC BH2 corrector and predictor. F32 history per row is "
+  "[last corrected sample | last clean estimate | older clean estimate]." },
 { "patch_unfold", ARR(pPatchUnfold), ARR(oPatchUnfold),
   "patch rows [F Hp Wp, C pt ph pw] (geom = (F, Hp, Wp)) unfolded to voxel rows "
   "[(F pt) (Hp ph) (Wp pw), C] and denormalised, f32(f32(x * mul[c]) + add[c]) with `mul` and "
@@ -2032,6 +2077,14 @@ static const RadOpSchema kSchemas[] = {
   "a video decoder's rotary positions over tiles of `period` rows: token (t, i, j) of a tile's "
   "T x H x W gets f32(scale) * (2 (c + 0.5) / n - 1) on each axis, in f32 as torch makes it, "
   "the rest of the period 0; y f32 [3, >= M] component-major at its own row pitch." },
+{ "wan_rope_table", ARR(pWanTable), ARR(oWanTable), "Wan's three-axis rotary coefficients." },
+{ "wan_rope", ARR(pWanRope), ARR(oWanRope), "Apply Wan rotary coefficients to queries and keys." },
+{ "wan_mod_norm", ARR(pWanModNorm), ARR(oWanModNorm), "Wan's timestep-modulated layer normalization." },
+{ "wan_gated_add", ARR(pWanGate), ARR(oWanGate), "Wan's FP32 residual update with an optional gate." },
+{ "wan_unpatch", ARR(pMnD), ARR(oWanUnpatch), "Expand Wan head patches into F32 NDHWC velocity rows." },
+{ "wan_vae_frame_cu", ARR(pWanVaeFrameCu), ARR(oWanVaeFrameCu), "Wan VAE per-frame attention offsets." },
+{ "wan_vae_history", ARR(pWanVaeHistory), ARR(oWanVaeHistory), "Wan VAE causal history and temporal taps." },
+{ "wan_vae_expand", ARR(pWanVaeExpand), ARR(oWanVaeExpand), "Wan VAE temporal shuffle and shortcut upsample." },
 { "vsa_select", ARR(pVsa), ARR(oVsaSelect),
   "video sparse attention's tile selection. Tiles: each dense segment of `segs` in chunks of "
   "tile_t tile_h tile_w rows (P prefix tiles), then tile_t x tile_h x tile_w boxes over the "
@@ -2604,6 +2657,8 @@ SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_s
        ref_attn_dense),
 SIMPLE("ref_attn_dense_ref", "attn_dense_ref", "attn", "dense attention with reference key bias",
        DT_FLOAT, ref_attn_dense_ref),
+SIMPLE("ref_attn_umt5", "attn_umt5", "attn", "UMT5 signed relative-position attention",
+       "bf16, h64", ref_attn_umt5),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",
        "dense varlen attention, keys bounded apart from the queries (cu_k)", DT_FLOAT,
        ref_attn_cross),
@@ -2744,6 +2799,8 @@ SIMPLE("ref_gate_add", "gate_add", "elem", "x += act(gate row) * y, act tanh or 
        ref_gate_add),
 SIMPLE("ref_timestep_embed", "timestep_embed", "elem", "sinusoidal timestep embedding",
        DT_FLOAT, ref_timestep_embed),
+SIMPLE("ref_timestep_embed_f64", "timestep_embed_f64", "elem", "FP64 sinusoidal timestep embedding",
+       "f32", ref_timestep_embed_f64),
 SIMPLE("ref_gather_rows2", "gather_rows2", "elem", "rows from two sources by a signed index",
        DT_ANY, ref_gather_rows2),
 SIMPLE("ref_lane_gather", "lane_gather", "elem", "each entry's rows out of its lane", DT_ANY,
@@ -2772,6 +2829,7 @@ SIMPLE("ref_s2d_avg_add", "s2d_avg_add", "elem", "a downsampling shortcut added 
        ref_s2d_avg_add),
 SIMPLE("ref_to_rgba8", "to_rgba8", "elem", "decoded pixels to bytes", DT_FLOAT, ref_to_rgba8),
 SIMPLE("ref_gelu_tanh", "gelu_tanh", "elem", "tanh gelu", DT_FLOAT, ref_gelu_tanh),
+SIMPLE("ref_gelu_umt5", "gelu_umt5", "elem", "Wan UMT5 tanh GELU", "bf16", ref_gelu_umt5),
 SIMPLE("ref_gelu_quick", "gelu_quick", "elem", "quick gelu", DT_FLOAT, ref_gelu_quick),
 SIMPLE("ref_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", DT_FLOAT,
        ref_scatter_add_rows),
@@ -2784,6 +2842,8 @@ SIMPLE("ref_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the cl
        DT_FLOAT, ref_flow_x0_step),
 SIMPLE("ref_flow_res_multistep", "flow_res_multistep", "elem",
        "a second-order sampler step on the clean estimate", DT_FLOAT, ref_flow_res_multistep),
+SIMPLE("ref_flow_unipc_step", "flow_unipc_step", "elem",
+       "flow-prediction UniPC BH2 corrector and predictor", DT_FLOAT, ref_flow_unipc_step),
 SIMPLE("ref_patch_unfold", "patch_unfold", "elem", "patch rows to denormalised voxel rows",
        DT_FLOAT, ref_patch_unfold),
 SIMPLE("ref_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out of the latent",
@@ -2799,6 +2859,17 @@ SIMPLE("ref_vtile_join", "vtile_join", "elem",
        "per-tile encoder moments blended into the latent canvas", DT_FLOAT, ref_vtile_join),
 SIMPLE("ref_grid_pos3", "grid_pos3", "elem", "a video decoder's rotary positions over its tiles",
        DT_FLOAT, ref_grid_pos3),
+SIMPLE("ref_wan_rope_table", "wan_rope_table", "elem", "Wan rotary coefficients", "f32", ref_wan_rope_table),
+SIMPLE("ref_wan_rope", "wan_rope", "elem", "Wan rotary on queries and keys", "bf16/f32", ref_wan_rope),
+SIMPLE("ref_wan_mod_norm", "wan_mod_norm", "norm", "Wan's timestep-modulated layer normalization",
+       "f32 input, f32 or bf16 output", ref_wan_mod_norm),
+SIMPLE("ref_wan_gated_add", "wan_gated_add", "elem", "Wan's FP32 residual update",
+       "f32 state and bf16 update", ref_wan_gated_add),
+SIMPLE("ref_wan_unpatch", "wan_unpatch", "elem", "Wan patch velocity to voxel velocity", "bf16/f32", ref_wan_unpatch),
+SIMPLE("ref_wan_vae_frame_cu", "wan_vae_frame_cu", "elem",
+       "Wan VAE per-frame attention offsets.", "i32", ref_wan_vae_frame_cu),
+SIMPLE("ref_wan_vae_history", "wan_vae_history", "elem", "Wan VAE causal history", "bf16", ref_wan_vae_history),
+SIMPLE("ref_wan_vae_expand", "wan_vae_expand", "elem", "Wan VAE temporal shuffle and shortcut", "bf16", ref_wan_vae_expand),
 SIMPLE("ref_vsa_select", "vsa_select", "attn",
        "video sparse attention's top-k tiles by pooled score, and the coarse branch",
        "float q, k, v and coarse; i32 segs, geom and sel", ref_vsa_select),

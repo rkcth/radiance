@@ -259,6 +259,7 @@ int     r4d_rad_seg_sinusoid          (const RadArgs*, RadStream);
  * (an image decoder's mid block). */
 int     r4d_rad_attn_prefix_self      (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense_h128       (const RadArgs*, RadStream);
+int     r4d_rad_attn_umt5             (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense_ref_h128   (const RadArgs*, RadStream);
 int     r4d_rad_attn_cross            (const RadArgs*, RadStream);
 int     r4d_rad_table_add             (const RadArgs*, RadStream);
@@ -270,6 +271,7 @@ int     r4d_rad_ln_mod                (const RadArgs*, RadStream);
 int     r4d_rad_ln_mod_had_quant_i8g  (const RadArgs*, RadStream);
 int     r4d_rad_gate_add              (const RadArgs*, RadStream);
 int     r4d_rad_timestep_embed        (const RadArgs*, RadStream);
+int     r4d_rad_timestep_embed_f64    (const RadArgs*, RadStream);
 int     r4d_rad_gather_rows2          (const RadArgs*, RadStream);
 int     r4d_rad_lane_gather           (const RadArgs*, RadStream);
 int     r4d_rad_lane_store            (const RadArgs*, RadStream);
@@ -285,6 +287,7 @@ int     r4d_rad_d2s_add               (const RadArgs*, RadStream);
 int     r4d_rad_s2d_avg_add           (const RadArgs*, RadStream);
 int     r4d_rad_to_rgba8              (const RadArgs*, RadStream);
 int     r4d_rad_gelu_tanh             (const RadArgs*, RadStream);
+int     r4d_rad_gelu_umt5             (const RadArgs*, RadStream);
 int     r4d_rad_gelu_quick            (const RadArgs*, RadStream);
 int     r4d_rad_scatter_add_rows      (const RadArgs*, RadStream);
 /* r4d_audio.hip */
@@ -326,6 +329,7 @@ int     r4d_rad_rms_mod_quant_i8      (const RadArgs*, RadStream);
 int     r4d_rad_rms_mod_had_quant_i8g (const RadArgs*, RadStream);
 int     r4d_rad_flow_x0_step          (const RadArgs*, RadStream);
 int     r4d_rad_flow_res_multistep    (const RadArgs*, RadStream);
+int     r4d_rad_flow_unipc_step       (const RadArgs*, RadStream);
 int     r4d_rad_patch_unfold          (const RadArgs*, RadStream);
 int     r4d_rad_vtile_gather          (const RadArgs*, RadStream);
 int     r4d_rad_vtile_stitch          (const RadArgs*, RadStream);
@@ -333,6 +337,14 @@ int     r4d_rad_vtile_plan            (const RadArgs*, RadStream);
 int     r4d_rad_vtile_crop            (const RadArgs*, RadStream);
 int     r4d_rad_vtile_join            (const RadArgs*, RadStream);
 int     r4d_rad_grid_pos3             (const RadArgs*, RadStream);
+int     r4d_rad_wan_rope_table         (const RadArgs*, RadStream);
+int     r4d_rad_wan_rope               (const RadArgs*, RadStream);
+int     r4d_rad_wan_mod_norm           (const RadArgs*, RadStream);
+int     r4d_rad_wan_gated_add          (const RadArgs*, RadStream);
+int     r4d_rad_wan_unpatch            (const RadArgs*, RadStream);
+int     r4d_rad_wan_vae_frame_cu          (const RadArgs*, RadStream);
+int     r4d_rad_wan_vae_history        (const RadArgs*, RadStream);
+int     r4d_rad_wan_vae_expand         (const RadArgs*, RadStream);
 int     r4d_rad_snake_aa              (const RadArgs*, RadStream);
 /* r4d_upscaler.hip: a video latent upscaler's 3D convolution, group norm, temporal depthwise
  * convolution and resize, the patch fold and the re-noise. */

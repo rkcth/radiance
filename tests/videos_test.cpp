@@ -65,8 +65,8 @@ struct FakeVideoGen : IVideoGen {
         t.width = r->width;
         t.height = r->height;
         t.steps = 2;
-        t.sample_rate = 32000;
-        t.channels = 2;
+        t.sample_rate = inf.sample_rate;
+        t.channels = inf.channels;
         t.fps = 24.0;
         if (r->upscale > 1.0) {
             t.small_width = (int32_t)(r->width / r->upscale) / 32 * 32;
@@ -87,13 +87,15 @@ struct FakeVideoGen : IVideoGen {
                 e.steps_done = s;
                 t.push(std::move(e));
             }
-            gen::VideoEvent a;
-            a.kind = gen::VideoEvent::AUDIO;
-            for (int i = 0; i < 3200; ++i) {
-                a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
-                a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+            if (t.channels > 0) {
+                gen::VideoEvent a;
+                a.kind = gen::VideoEvent::AUDIO;
+                for (int i = 0; i < 3200; ++i) {
+                    a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
+                    a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+                }
+                t.push(std::move(a));
             }
-            t.push(std::move(a));
             gen::VideoEvent f;
             f.kind = gen::VideoEvent::FRAMES;
             f.first = 0;
@@ -239,6 +241,24 @@ TEST(the_generator_gets_the_size_the_chunks_and_the_steps) {
 
 /* `shift`/`audio_shift` thread to the request and echo back; omitted, the request carries 0 (the
  * driver keeps the model's trained shift) and the echo adds neither field. */
+TEST(a_short_first_chunk_is_counted_in_the_video_api_duration) {
+    Videos v;
+    auto& d = v.gen.inf;
+    d.fps_num = 16;
+    d.frames_per_chunk = 4;
+    d.frames_tail = -3;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+
+    for (const auto& [seconds, chunks] : std::vector<std::pair<double, int>>{
+             {0.0625, 1}, {0.20, 2}, {0.33, 3}}) {
+        const auto r = v.create(Videos::body({{"seconds", seconds}, {"size", "256x256"}}));
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().chunks, chunks);
+    }
+    CHECK_EQ(v.refused(Videos::body({{"seconds", 0.6}})), std::string("seconds"));
+}
+
 TEST(the_shift_threads_to_the_request_and_echoes) {
     Videos v;
     HttpResponse r = v.create(Videos::body({ { "shift", 6 }, { "audio_shift", 2 } }));
@@ -1173,6 +1193,46 @@ TEST(guidance_and_the_negative_prompt_reach_a_guided_model) {
     o = json::parse(r.body, nullptr, false);
     CHECK(!o.contains("negative_prompt"));
     v.wait(str_at(o, "id"));
+}
+
+TEST(a_video_only_model_refuses_soundtrack_options_and_finishes_an_mp4) {
+    Videos v;
+    auto& info = v.gen.inf;
+    info.channels = info.sample_rate = 0;
+    info.guidance = true;
+    info.guidance_default[0] = 1.0;
+    CHECK_EQ(v.refused(Videos::body({ { "audio_shift", 3 } })), std::string("audio_shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "audio_guidance_scale", 1 } })),
+             std::string("audio_guidance_scale"));
+
+    const HttpResponse r = v.create(Videos::body());
+    REQUIRE_EQ(r.status, 200);
+    const json video = json::parse(r.body, nullptr, false);
+    CHECK(!video.contains("audio_guidance_scale"));
+    CHECK(!video.contains("negative_prompt"));
+    CHECK_EQ(str_at(v.wait(str_at(video, "id")), "status"), std::string("completed"));
+}
+
+TEST(a_unipc_model_reports_its_sampler_and_refuses_other_samplers) {
+    Videos v;
+    v.gen.inf.unipc_only = true;
+    v.gen.inf.guidance = true;
+    v.gen.inf.guidance_cfg_only = true;
+    CHECK_EQ(v.refused(Videos::body({{"stg_scale", 1}})), std::string("stg_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"modality_scale", 2}})), std::string("modality_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"guidance_rescale", .2}})), std::string("guidance_rescale"));
+    v.gen.inf.step_evals = true;
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "euler" } })), std::string("sampler"));
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "res_multistep" } })), std::string("sampler"));
+    for (const auto& body : { Videos::body(), Videos::body({ { "sampler", "unipc" },
+                                                          { "num_inference_steps", 1 } }) }) {
+        const HttpResponse r = v.create(body);
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().sampler, RAD_SAMPLER_UNIPC);
+        const json video = json::parse(r.body, nullptr, false);
+        CHECK_EQ(str_at(video, "sampler"), std::string("unipc"));
+        CHECK_EQ(str_at(v.wait(str_at(video, "id")), "status"), std::string("completed"));
+    }
 }
 
 /* input_reference: refused by a text-only model; on a model that starts from a picture, a data URL

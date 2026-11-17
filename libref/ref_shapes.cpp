@@ -68,6 +68,9 @@
 #include "rad_plugin.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_N */
 #include "rad_sample.h"
+#include "rad_unipc_math.h"
+#include "rad_umt5_attention.h"
+#include "rad_wan_dit.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1629,6 +1632,22 @@ int ref_attn_dense_ref_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return attn_dense_shape(p, n_p, operand, out, true);
 }
 
+int ref_attn_umt5_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t m = gi(p, n_p, "M", 0), heads = gi(p, n_p, "heads", 0);
+    if (heads < 1 || heads > 128 || m < 1 || m > INT32_MAX) return RAD_E_SHAPE;
+    const int64_t width = heads * rad_umt5::head_width;
+    // Use as few balanced sequences as the per-sequence limit allows.
+    const int64_t segments = (m + rad_umt5::max_tokens - 1) / rad_umt5::max_tokens;
+    Opd o;
+    o.t(RAD_BF16, { m, width });
+    o.t(RAD_BF16, { m, width });
+    o.t(RAD_BF16, { m, width });
+    o.t_idx({ segments + 1 }, m, -1, RAD_OPD_F_IDX_CU);
+    o.t(RAD_BF16, { rad_umt5::buckets, heads });
+    o.t(RAD_BF16, { m, width });
+    return o.finish("attn_umt5", operand, out);
+}
+
 int ref_attn_cross_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
@@ -3068,6 +3087,18 @@ int ref_flow_res_multistep_shape(const RadParam* p, int n_p, int operand, RadOpd
     o.t(F, { M, n });                                         /* x, INOUT */
     return o.finish("flow_res_multistep", operand, out);
 }
+int ref_flow_unipc_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0 || n > INT32_MAX / 3) return RAD_E_SHAPE;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });
+    o.t_fill(RAD_F32, { rad_unipc::COUNT }, RAD_FILL_SIGMOID, 0);
+    o.t(RAD_F32, { M, 3 * n });
+    o.t(RAD_F32, { M, n });
+    o.skip();  // Classifier-free guidance is covered by a separate correctness test.
+    o.skip();
+    return o.finish("flow_unipc_step", operand, out);
+}
 int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const uint32_t D = act_dt(p, n_p);
@@ -3085,6 +3116,16 @@ int ref_timestep_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     o.t(act_dt(p, n_p), { M, n });                                    /* y */
     if (G > 0) o.t((uint32_t)RAD_F32, { G, n }); else o.skip();        /* table */
     return o.finish("timestep_embed", operand, out);
+}
+int ref_timestep_embed_f64_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    if (act_dt(p, n_p) != RAD_F32) return RAD_E_DTYPE;
+    if (rows < 1 || rows > INT32_MAX || width < 2 || width > INT32_MAX || (width & 1))
+        return RAD_E_SHAPE;
+    Opd o;
+    o.t(RAD_F32, {rows});
+    o.t(RAD_F32, {rows, width});
+    return o.finish("timestep_embed_f64", operand, out);
 }
 int ref_gather_rows2_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     (void)p; (void)n_p; (void)operand; (void)out;
@@ -3377,6 +3418,14 @@ int ref_gelu_tanh_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t(D, { M, n });
     return o.finish("gelu_tanh", operand, out);
 }
+int ref_gelu_umt5_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    if (act_dt(p, n_p) != RAD_BF16) return RAD_E_DTYPE;
+    Opd o;
+    o.t(RAD_BF16, {rows, width});
+    o.t(RAD_BF16, {rows, width});
+    return o.finish("gelu_umt5", operand, out);
+}
 int ref_gelu_quick_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const uint32_t D = act_dt(p, n_p);
@@ -3495,6 +3544,115 @@ static int64_t cube_side(int64_t M) {
     int64_t c = 0;
     while ((c + 1) * (c + 1) * (c + 1) <= M) ++c;
     return c;
+}
+
+int ref_wan_rope_table_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bound = gi(p, n_p, "M", 0);
+    if (bound < 2 || bound > (1ll << 30)) return RAD_E_UNSUPPORTED;
+    const int64_t side = std::min<int64_t>(cube_side(bound / 2), 512);
+    const int64_t rows = 2 * side * side * side;
+    Opd o;
+    o.t_idx({3}, 0, 2 * side, 0);
+    o.t(RAD_F32, {rows, rad_wan_dit::head_width});
+    return o.finish("wan_rope_table", operand, out);
+}
+
+int ref_wan_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), heads = gi(p, n_p, "heads", 0);
+    if (rows < 1 || rows > INT32_MAX || heads < 1 || heads > 128) return RAD_E_SHAPE;
+    const int64_t width = heads * rad_wan_dit::head_width;
+    const uint32_t dtype = act_dt(p, n_p);
+    if (dtype != RAD_BF16 && dtype != RAD_F32) return RAD_E_DTYPE;
+    Opd o;
+    o.t(dtype, {rows, width});
+    o.t(dtype, {rows, width});
+    o.t(RAD_F32, {rows, rad_wan_dit::head_width});
+    return o.finish("wan_rope", operand, out);
+}
+
+int ref_wan_mod_norm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    const bool head = gi(p, n_p, "group", 0) == -1;
+    if (rows < 1 || rows > INT32_MAX || width < 1 || width > 4096) return RAD_E_SHAPE;
+    const uint32_t dtype = act_dt(p, n_p);
+    if (dtype != RAD_BF16 && dtype != RAD_F32) return RAD_E_DTYPE;
+    Opd o;
+    o.t(RAD_F32, {rows, width});
+    o.t(RAD_F32, {1, head ? width : 6 * width});
+    o.t(RAD_F32, {1, head ? 2 : 6, width});
+    o.skip();
+    o.t(dtype, {rows, width});
+    return o.finish("wan_mod_norm", operand, out);
+}
+
+int ref_wan_gated_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0), width = gi(p, n_p, "n", 0);
+    if (rows < 1 || rows > INT32_MAX || width < 1 || width > 4096) return RAD_E_SHAPE;
+    const bool gated = gi(p, n_p, "gate", -1) != -1;
+    Opd o;
+    o.t(RAD_F32, {rows, width});
+    o.t(RAD_BF16, {rows, width});
+    if (gated) {
+        o.t(RAD_F32, {1, 6 * width});
+        o.t(RAD_F32, {1, 6, width});
+    } else {
+        o.skip();
+        o.skip();
+    }
+    o.skip();
+    return o.finish("wan_gated_add", operand, out);
+}
+
+int ref_wan_unpatch_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bound = gi(p, n_p, "M", 0), channels = gi(p, n_p, "n", 0);
+    if (bound < 2 || bound > (1ll << 30)) return RAD_E_UNSUPPORTED;
+    const int64_t side = std::min<int64_t>(cube_side(bound / 2), 512);
+    const int64_t patches = 2 * side * side * side;
+    if (channels < 1 || channels > 1024) return RAD_E_SHAPE;
+    const uint32_t dtype = act_dt(p, n_p);
+    if (dtype != RAD_F32 && dtype != RAD_BF16) return RAD_E_DTYPE;
+    Opd o;
+    o.t(dtype, {patches, 4 * channels});
+    o.t_idx({3}, 0, 2 * side, 0);
+    o.t(RAD_F32, {4 * patches, channels});
+    return o.finish("wan_unpatch", operand, out);
+}
+
+int ref_wan_vae_frame_cu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t offsets = gi(p, n_p, "M", 0);
+    if (offsets < 2 || offsets > 9) return RAD_E_SHAPE;
+    Opd o;
+    o.t_idx({3}, 0, offsets - 1, 0);
+    o.t(RAD_I32, {offsets});
+    return o.finish("wan_vae_frame_cu", operand, out);
+}
+
+int ref_wan_vae_history_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t rows = gi(p, n_p, "M", 0);
+    const bool temporal = gi(p, n_p, "temporal", 0) != 0;
+    if (rows < 1 || rows > INT32_MAX) return RAD_E_SHAPE;
+    constexpr int64_t channels = 8;
+    const int64_t cached = rows % 2 == 0 ? 4 : 2;
+    Opd o;
+    o.t(RAD_BF16, {rows, channels});
+    o.t(RAD_BF16, {cached, channels});
+    o.t(RAD_BF16, {temporal ? rows : rows + cached, temporal ? 3 * channels : channels});
+    return o.finish("wan_vae_history", operand, out);
+}
+
+int ref_wan_vae_expand_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bound = gi(p, n_p, "M", 0);
+    if (bound < 1 || bound > (1ll << 30)) return RAD_E_SHAPE;
+    const int64_t side = cube_side(bound);
+    const int64_t cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    const int64_t st = gi(p, n_p, "st", 1), s = gi(p, n_p, "s", 1), drop = gi(p, n_p, "drop", 0);
+    if (cin < 1 || cin > 4096 || cout < 1 || cout > 4096 || st < 1 || st > 2 ||
+        s < 1 || s > 2 || drop < 0 || drop >= st) return RAD_E_SHAPE;
+    Opd o;
+    o.t(RAD_BF16, {side * side * side, cin});
+    o.t_idx({3}, 0, side, 0);
+    o.t(RAD_BF16, {(side * st - drop) * side * side * s * s, cout});
+    return o.finish("wan_vae_expand", operand, out);
 }
 
 int ref_conv3d_ndhwc_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

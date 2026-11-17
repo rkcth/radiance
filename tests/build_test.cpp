@@ -376,6 +376,83 @@ TEST(host_and_device_buffers_get_separate_offset_spaces) {
     CHECK_EQ(rep.host_bytes, 4096 + 2048);
 }
 
+TEST(a_video_only_declaration_requires_consistent_soundtrack_fields) {
+    RadVideoGenDecl d{};
+    d.max_text = 8;
+    d.fps_num = 24;
+    d.fps_den = 1;
+    d.frames_per_chunk = 4;
+    d.frames_tail = 1;
+    d.latents_per_chunk = 1;
+    d.latents_tail = 1;
+    d.dec_latents = 2;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+    d.latent_scale = 16;
+    d.latent_channels = 48;
+    d.patch = 2;
+    d.size_multiple = d.min_side = 32;
+    d.max_area = 64 * 64;
+    d.max_aspect = 2;
+    d.default_width = 64;
+    d.default_height = 32;
+    d.default_steps = d.max_steps = 4;
+    d.shift_video = 5.0;
+    d.max_lanes = 1;
+    d.name = "video-only";
+    d.tmpl = "{prompt}";
+
+    auto declare = [](RadVideoGenDecl decl) {
+        Registry registry;
+        RadModelMeta meta{};
+        RadBuildCtx ctx{};
+        Builder builder(registry, meta, ctx);
+        RadBufDecl frames{};
+        frames.dtype = RAD_U8;
+        frames.rank = 1;
+        frames.shape[0] = (decl.frames_per_chunk + std::max<int64_t>(0, decl.frames_tail)) * decl.max_area * 3;
+        frames.kind = RAD_BUF_PERSIST;
+        frames.domain = RAD_DOMAIN_DEVICE;
+        decl.frames_out = builder.decl_buffer("frames", &frames);
+        return builder.declare_video_generator(&decl);
+    };
+
+    CHECK_EQ(declare(d), RAD_OK);
+    RadVideoGenDecl incomplete = d;
+    incomplete.audio_rate = 40;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+    incomplete = d;
+    incomplete.audio_out = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+    incomplete = d;
+    incomplete.audio_streams = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+
+    d.sched_kind = RAD_VIDEO_SCHEDULE_UNIPC;
+    CHECK_EQ(declare(d), RAD_OK);
+    RadVideoGenDecl first_trim = d;
+    first_trim.frames_tail = -3;
+    first_trim.latents_tail = 0;
+    first_trim.dec_latents = 1;
+    CHECK_EQ(declare(first_trim), RAD_OK);
+    first_trim.frames_tail = -first_trim.frames_per_chunk;
+    CHECK_EQ(declare(first_trim), RAD_E_INVAL);
+    RadVideoGenDecl unsupported = d;
+    unsupported.max_steps = 1001;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.dyn_shift = 1;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.upscale_max = 2.0;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.audio_channels = unsupported.audio_latent_channels = 1;
+    unsupported.sample_rate = 48000;
+    unsupported.audio_rate = 100;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+}
+
 TEST(buffer_uses_drive_liveness) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
@@ -1063,10 +1140,11 @@ TEST(the_c_surface_drives_the_builder) {
     rad_weight w = rad_decl_weight(h, "blk.0.ffn_gate.weight", &wd);
     CHECK(w != RAD_NULL_HANDLE);
 
+    const rad_weight weights[] = { w };
     rad_op op = RAD_OP(h, "t_gemm",
                        RAD_PARAMS(RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
                                   RAD_STR("dtype", "bf16")),
-                       RAD_WEIGHTS(w));
+                       weights, 1);
     CHECK(op != RAD_NULL_HANDLE);
     CHECK_EQ(rad_op_resolved(h, op), 1);
     CHECK_EQ(rad_op_resolved(h, 99), 0);
