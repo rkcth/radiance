@@ -12,6 +12,7 @@
 
 #include "build/rad_build.h"
 #include "lora/adapter.h"
+#include "lora/cpu_blas.h"
 #include "lora/lora.h"
 #include "plugin/registry.h"
 #include "rad_plugin.h"
@@ -26,6 +27,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -537,6 +539,68 @@ TEST(krea_projector_lora_resolves_and_composes_without_a_gemm_site) {
 
 /* A delta given as an operator truncates to its best rank-r form: exact at or above its rank, and
  * otherwise keeping what the sketch says it keeps. */
+TEST(openblas_adapter_math_matches_dense_references) {
+    const auto* blas = lora::cpu::blas();
+    if (std::getenv("RAD_TEST_REQUIRE_LORA_BLAS")) REQUIRE(blas != nullptr);
+    if (!blas) return;
+    constexpr int rows = 12, cols = 11, rank = 10, keep = 3;
+    std::vector<float> B(rows * rank), A(rank * cols);
+    const float diagonal[] = {5, -4, 4, 2, 1};
+    for (int i = 0; i < 5; ++i) {
+        B[i * rank + i] = 1;
+        A[i * cols + i] = diagonal[i];
+    }
+    // These two signed factors cancel, and the remaining ranks are zero.
+    B[7 * rank + 5] = 1;
+    B[7 * rank + 6] = 1;
+    A[5 * cols + 7] = 3;
+    A[6 * cols + 7] = -3;
+    double energy = 0, retained = 0;
+    REQUIRE(lora::cpu::energy(*blas, B, A, rows, rank, cols, &energy));
+    CHECK_NEAR(energy, 62.0, 1e-10);
+    std::vector<float> b, a;
+    REQUIRE(lora::cpu::compress(*blas, B, A, rows, cols, rank, keep, &b, &a, &retained));
+    CHECK_NEAR(retained, 57.0 / 62.0, 1e-6);
+    const auto delta = mul(b, a, rows, keep, cols, 1.0);
+    for (int row = 0; row < rows; ++row)
+        for (int col = 0; col < cols; ++col)
+            CHECK_NEAR(delta.d[(size_t)row * cols + col],
+                       row == col && row < keep ? diagonal[row] : 0.0f, 1e-5);
+
+    constexpr int a_rows = 2, a_cols = 3, b_rows = 3, b_cols = 2, sketch = 4, r2 = 2;
+    const float w1[] = {1, -2, 3, 4, 1, -1};
+    const float w2a[] = {1, 2, 0, -1, 4, 1};
+    const float w2b[] = {1, 2, -1, 3};
+    float w2[b_rows * b_cols] = {};
+    for (int i = 0; i < b_rows; ++i)
+        for (int j = 0; j < b_cols; ++j)
+            for (int r = 0; r < r2; ++r)
+                w2[i * b_cols + j] += w2a[i * r2 + r] * w2b[r * b_cols + j];
+    float input[(a_rows*b_rows + a_cols*b_cols) * sketch] = {};
+    for (size_t i = 0; i < std::size(input); ++i) input[i] = (int)(i % 7) - 3;
+    for (bool transpose : {false, true}) {
+        const int n = transpose ? a_cols * b_cols : a_rows * b_rows;
+        const int k = transpose ? a_rows * b_rows : a_cols * b_cols;
+        for (bool factored : {false, true}) {
+            std::vector<float> output((size_t)n * sketch);
+            REQUIRE(lora::cpu::apply_lokr(*blas, transpose, input, output.data(), sketch,
+                                         a_rows, a_cols, b_rows, b_cols, r2,
+                                         w1, factored ? nullptr : w2, w2a, w2b));
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < sketch; ++j) {
+                    float expected = 0;
+                    for (int h = 0; h < k; ++h) {
+                        const int row = transpose ? h : i;
+                        const int col = transpose ? i : h;
+                        expected += w1[(row / b_rows) * a_cols + col / b_cols] *
+                                    w2[(row % b_rows) * b_cols + col % b_cols] * input[h * sketch + j];
+                    }
+                    CHECK_NEAR(output[i * sketch + j], expected, 1e-5);
+                }
+        }
+    }
+}
+
 TEST(truncation_is_exact_within_the_rank_and_honest_past_it) {
     const int64_t N = 96, K = 80;
     std::vector<float> D((size_t)(N * K));
