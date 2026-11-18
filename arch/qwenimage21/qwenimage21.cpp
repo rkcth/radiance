@@ -76,6 +76,16 @@ enum { kMaxLanes = 16 };
  * rounding (the driver's bound, core/gen/driver.cpp). */
 static inline int64_t ref_tokens_max() { return (int64_t)kRefArea / 256 * 11 / 10 + 64; }
 
+/* Every output side is a multiple of 32, so attainable areas are multiples of four
+ * latent tokens. Keep the model's original bounds when the operator supplies none. */
+static int64_t image_tokens(int64_t pixels) {
+    return pixels > 0 ? std::min<int64_t>(kMaxImageTokens, pixels / 1024 * 4) : kMaxImageTokens;
+}
+
+static int64_t reference_count(int64_t refs) {
+    return refs > 0 ? std::min<int64_t>(refs, kMaxRefs) : kMaxRefs;
+}
+
 static const char* kSysPrompt = "Comprehend and analyze the provided prompt.";
 
 
@@ -120,6 +130,8 @@ enum : int {
 struct Model {
     Names nm{""};
     Geom  gt{}, gd{};          /* the language model's and the DiT's geometry, per rank */
+    int64_t max_image_tokens = kMaxImageTokens;
+    int64_t max_refs = kMaxRefs;
     int64_t max_ref_rows = 0;  /* every reference picture's latent tokens together */
     bool  media = false;
     VisionTower vit{};
@@ -426,8 +438,8 @@ static int declare_encoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     v.scope = "venc";
     v.down = true;
     v.first_group = kGrpVaeEnc;
-    /* The largest picture the encoder reads: a repainted one at the largest output size. */
-    v.base_px = (int64_t)kMaxImageTokens * 256;
+    /* Repaint inputs match the output. References keep their own resize area. */
+    v.base_px = std::max(m.max_image_tokens, ref_tokens_max()) * 256;
     const int64_t base = rad_meta_geti(meta, "vae.base_dim", 96);
     const std::vector<double> mult = meta_list(meta, "vae.dim_mult");
     const std::vector<double> td = meta_list(meta, "vae.temperal_downsample");
@@ -474,16 +486,16 @@ static int declare_encoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                       { m.enc_q.buf }, { m.b_reflat, m.b_encz });
     /* A repainted picture's latent and its mask, into every lane its images run in. */
     m.op_lstore_lat = rw(b, RAD_OP(b, "lane_store",
-                                   RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kMaxImageTokens),
+                                   RAD_PARAMS(RAD_RANGE("M", 1, m.max_image_tokens),
                                               RAD_INT("n", zd),
-                                              RAD_INT("stride", (int64_t)kMaxImageTokens),
+                                              RAD_INT("stride", m.max_image_tokens),
                                               RAD_STR("dtype", "bf16")),
                                    RAD_NOWEIGHTS),
                          { m.b_encz, m.b_inp }, { m.b_inp });
     m.op_lstore_mask = rw(b, RAD_OP(b, "lane_store",
-                                    RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kMaxImageTokens),
+                                    RAD_PARAMS(RAD_RANGE("M", 1, m.max_image_tokens),
                                                RAD_INT("n", 1),
-                                               RAD_INT("stride", (int64_t)kMaxImageTokens),
+                                               RAD_INT("stride", m.max_image_tokens),
                                                RAD_STR("dtype", "f32")),
                                     RAD_NOWEIGHTS),
                           { m.b_mask }, { m.b_mask });
@@ -497,7 +509,7 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     v.scope = "vdec";
     v.down = false;
     v.first_group = kGrpVaeDec;
-    v.base_px = kMaxImageTokens;
+    v.base_px = m.max_image_tokens;
     const int64_t base = rad_meta_geti(meta, "vae.decoder_base_dim", 144);
     const std::vector<double> mult = meta_list(meta, "vae.dim_mult");
     const std::vector<double> td = meta_list(meta, "vae.temperal_downsample");
@@ -541,10 +553,10 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     }
     x = v.norm(x, true, "vae.decoder.norm_out", 4);
     m.dec_out = v.conv(x, cout, 3, 1, 1, "same", "vae.decoder.conv_out");
-    m.b_img = decl_b(b, nm.f("image_out"), RAD_U8, { (int64_t)kMaxImageTokens * 256 * cout },
+    m.b_img = decl_b(b, nm.f("image_out"), RAD_U8, { m.max_image_tokens * 256 * cout },
                      RAD_BUF_PERSIST);
     m.op_rgba = rw(b, RAD_OP(b, "to_rgba8",
-                             RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kMaxImageTokens * 256),
+                             RAD_PARAMS(RAD_RANGE("M", 1, m.max_image_tokens * 256),
                                         RAD_INT("n", cout), RAD_STR("dtype", "bf16")),
                              RAD_NOWEIGHTS),
                    { m.dec_out.buf }, { m.b_img });
@@ -556,11 +568,11 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     }
     /* The bands, gathered. A band is ceil(H / world) latent rows, and the split is taken only where
      * a band plus its two halos is smaller than the whole, so H > 2 * halo, which bounds W and
-     * thus the largest band: under kMaxImageTokens / world + kMaxImageTokens / (2 * halo)
+     * thus the largest band: under m.max_image_tokens / world + m.max_image_tokens / (2 * halo)
      * tokens. */
     const int world = m.gt.world;
     if (world > 1) {
-        const int64_t bpx = (kMaxImageTokens / world + kMaxImageTokens / (2 * v.halo) + 1) * 256;
+        const int64_t bpx = (m.max_image_tokens / world + m.max_image_tokens / (2 * v.halo) + 1) * 256;
         m.b_rgbaf = decl_b(b, nm.f("vdec.bands"), RAD_BF16, { world * bpx, cout });
         m.op_bands = rw(b, RAD_OP(b, "all_gather",
                                    RAD_PARAMS(RAD_INT("world_size", world),
@@ -569,7 +581,7 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                    RAD_NOWEIGHTS),
                          { m.dec_out.buf }, { m.b_rgbaf });
         m.op_rgba_bands = rw(b, RAD_OP(b, "to_rgba8",
-                                   RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kMaxImageTokens * 256),
+                                   RAD_PARAMS(RAD_RANGE("M", 1, m.max_image_tokens * 256),
                                               RAD_INT("n", cout), RAD_STR("dtype", "bf16")),
                                    RAD_NOWEIGHTS),
                          { m.b_rgbaf }, { m.b_img });
@@ -628,13 +640,13 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                      { m.b_txt }, { m.b_h });
     m.op_randn = rw(b, RAD_OP(b, "randn_lanes",
                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", C),
-                                         RAD_INT("stride", (int64_t)kMaxImageTokens),
+                                         RAD_INT("stride", m.max_image_tokens),
                                          RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS),
                     { m.b_state }, { m.b_state });
     m.op_lgather = rw(b, RAD_OP(b, "lane_gather",
                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", C),
-                                           RAD_INT("stride", (int64_t)kMaxImageTokens),
+                                           RAD_INT("stride", m.max_image_tokens),
                                            RAD_STR("dtype", "bf16")),
                                 RAD_NOWEIGHTS),
                       { m.b_state }, { m.b_lat });
@@ -820,7 +832,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                       C, D, T, m.a_hm.x, m.b_v, &m.w_pout, gx);
     m.op_euler = rw(b, RAD_OP(b, "flow_euler",
                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", C),
-                                         RAD_INT("stride", (int64_t)kMaxImageTokens),
+                                         RAD_INT("stride", m.max_image_tokens),
                                          RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS),
                     { m.b_v, m.b_inp, m.b_mask, m.b_state, m.b_prev }, { m.b_state, m.b_prev });
@@ -834,6 +846,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
+    m.max_image_tokens = image_tokens(ctx->gen_max_pixels);
+    m.max_refs = reference_count(ctx->gen_max_refs);
+    if (m.max_image_tokens == 0) {
+        fprintf(stderr, "radiance: qwenimage21: --image-gen-max-pixels must fit a 32x32 image\n");
+        return RAD_E_INVAL;
+    }
     RAD_ARCH_TRY(check_format(meta));
     RAD_ARCH_TRY(geom_from(m.gt, meta, ctx, "bf16", RAD_BF16));
     Names& nm = m.nm;
@@ -917,14 +935,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the per-image state, a lane an image, and what the passes hand each other */
     const int64_t C = rad_meta_geti(meta, "transformer.in_channels", 64);
-    const int64_t lane_rows = (int64_t)kMaxLanes * kMaxImageTokens;
+    const int64_t lane_rows = (int64_t)kMaxLanes * m.max_image_tokens;
     m.b_state = decl_b(b, nm.f("lat_state"), RAD_BF16, { lane_rows, C }, RAD_BUF_PERSIST);
     m.b_prev  = decl_b(b, nm.f("lat_preview"), RAD_BF16, { lane_rows, C }, RAD_BUF_PERSIST);
     m.b_inp   = decl_b(b, nm.f("lat_repaint"), RAD_BF16, { lane_rows, C }, RAD_BUF_PERSIST);
     m.b_mask  = decl_b(b, nm.f("lat_mask"), RAD_F32, { lane_rows, 1 }, RAD_BUF_PERSIST);
-    m.max_ref_rows = (int64_t)kMaxRefs * ref_tokens_max();
+    m.max_ref_rows = m.max_refs * ref_tokens_max();
     m.b_reflat = decl_b(b, nm.f("ref_lat"), RAD_BF16, { m.max_ref_rows, C }, RAD_BUF_PERSIST);
-    m.b_encz   = decl_b(b, nm.f("enc_lat"), RAD_BF16, { (int64_t)kMaxImageTokens, C });
+    m.b_encz   = decl_b(b, nm.f("enc_lat"), RAD_BF16, { m.max_image_tokens, C });
     m.C = C;
 
     /* ---- in issue order: the tower, the language model, the encoder, the DiT, the decoder.
@@ -974,11 +992,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.size_multiple = 32;
         d.pixel_channels = rad_meta_geti(meta, "vae.out_channels", 4);
         d.slot_rows = 4;
-        d.max_tokens = kMaxImageTokens;
-        d.max_refs = kMaxRefs;
+        d.max_tokens = m.max_image_tokens;
+        d.max_refs = m.max_refs;
         d.ref_area = kRefArea;
-        d.default_width = 2048;
-        d.default_height = 2048;
+        const int64_t side = (int64_t)(std::sqrt(std::min<int64_t>(m.max_image_tokens, 16384)) / 2) * 32;
+        d.default_width = side;
+        d.default_height = side;
         d.default_steps = sig.empty() ? 40 : (int64_t)sig.size();
         d.n_sigmas = (int32_t)sig.size();
         d.sigmas = sig.empty() ? nullptr : sig.data();
@@ -1215,15 +1234,19 @@ static void step(RadCtx* c, const RadBatch* batch) {
             const int64_t n = (int64_t)(ph / 16) * (pw / 16);
             const RadOperand pcu = praw(G->px_cu + 2 * i, RAD_I32, 2);
             if (i < n_ref) {
+                if (n > ref_tokens_max() || n > m.max_ref_rows - lat_row) {
+                    rad_step_fail(c, "qwenimage21: reference pixels exceed the declared latent buffer");
+                    return;
+                }
                 step_encode(c, m, px, ph, pw, pcu, m.b_reflat, lat_row);
                 lat_row += n;
             } else {
                 step_encode(c, m, px, ph, pw, pcu, m.b_encz, 0);
                 RAD_ISSUE_N(c, m.op_lstore_lat, n, brows(m.b_encz, n),
-                            praw(G->lane, RAD_I32, G->n_lane), brows(m.b_inp, kMaxLanes * (int64_t)kMaxImageTokens));
+                            praw(G->lane, RAD_I32, G->n_lane), brows(m.b_inp, kMaxLanes * m.max_image_tokens));
                 RAD_ISSUE_N(c, m.op_lstore_mask, n, praw2(G->inp_mask, RAD_F32, n, 1),
                             praw(G->lane, RAD_I32, G->n_lane),
-                            brows(m.b_mask, kMaxLanes * (int64_t)kMaxImageTokens));
+                            brows(m.b_mask, kMaxLanes * m.max_image_tokens));
             }
         }
         /* 4. the modulation at t = 0, which every conditioning row reads */
@@ -1254,7 +1277,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const int64_t N = batch->n_tok, S = batch->n_seq;
         const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
         const RadOperand lanes = praw(G->lane, RAD_I32, S);
-        const int64_t L = (int64_t)kMaxLanes * kMaxImageTokens;
+        const int64_t L = (int64_t)kMaxLanes * m.max_image_tokens;
         step_temb(c, m, G->sigma, S);
         RAD_ISSUE_N(c, m.op_randn, N, praw(G->flags, RAD_I32, S), praw(G->seed, RAD_U32, 2 * S),
                     lanes, cu, brows(m.b_state, L));
@@ -1275,7 +1298,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     case RAD_GEN_PASS_DECODE: {
         const int64_t H = G->dec_height / 16, W = G->dec_width / 16, n = H * W;
         const rad_buf src = G->dec_preview ? m.b_prev : m.b_state;
-        RAD_ISSUE_N(c, m.op_dec_aff, n, brow_slice(src, (int64_t)G->dec_lane * kMaxImageTokens, n, C),
+        RAD_ISSUE_N(c, m.op_dec_aff, n, brow_slice(src, (int64_t)G->dec_lane * m.max_image_tokens, n, C),
                     brows(m.b_decin, n));
         const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, 2);
         const int64_t npx = (int64_t)G->dec_height * G->dec_width, ch = m.dec_out.ch;
@@ -1309,12 +1332,21 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }
 
 /* ================================================================== the probe */
-/* The rows a pass carries (one image at the largest size with guidance, so two entries) and the
- * vision patches of ten reference pictures at 1024 x 1024 of area. */
+/* The denoiser can carry two copies of an image for guidance. With reduced output sizes
+ * also leave room for the reference conditioning and prompt, within the original row budget. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
-    out->gen_rows = 2 * (int64_t)kMaxImageTokens;
-    out->gen_patches = (int64_t)kMaxRefs * (kRefArea / 256) * 11 / 10;
+    const int64_t tokens = image_tokens(out->gen_max_pixels);
+    if (tokens == 0) return RAD_E_INVAL;
+    const int64_t refs = reference_count(out->gen_max_refs);
+    const int64_t conditioning_rows = std::min<int64_t>(
+        2 * kMaxImageTokens, refs * ref_tokens_max() + 1024);
+    out->gen_rows = std::max(2 * tokens, conditioning_rows);
+    const int64_t merge = rad_meta_geti(meta, "vision_config.spatial_merge_size", 2);
+    if (merge < 1 || merge > 16) return RAD_E_INVAL;
+    const int64_t group = merge * merge;
+    const int64_t patches = refs * (kRefArea / 256) * 11 / 10;
+    out->gen_patches = (patches + group - 1) / group * group;
     return RAD_OK;
 }
 
