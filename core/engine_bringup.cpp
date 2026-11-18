@@ -1092,8 +1092,9 @@ int Engine::declare() {
     }
     /* An image generator sizes the step itself (RadArchProbe::gen_rows): a denoise pass carries all
      * of an image's latent rows (twice with guidance), and a conditioning pass encodes every
-     * reference picture of a request. Operator-given values are kept. No drafting (no tokens) and
-     * no prefix cache (a conditioning is read only by its own request). */
+     * reference picture of a request. Operator-given sizes are kept except where a single image
+     * needs room for both guidance branches. No drafting (no tokens) and no prefix cache (a
+     * conditioning is read only by its own request). */
     {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
@@ -1172,7 +1173,13 @@ int Engine::declare() {
             }
             if (!cfg_.given.count("--max-num-seqs")) {
                 cfg_.max_seqs = 16;
-                decide("--max-num-seqs", "16", "an image generator: images in one pass");
+                decide("--max-num-seqs", "16", "an image generator: entries in one denoising pass");
+            } else if (cfg_.max_seqs == 1) {
+                /* These are denoising batch entries, not independent image requests. Keep
+                 * room for both branches of one guided image in the graph and the KV plan. */
+                cfg_.max_seqs = 2;
+                decide("--max-num-seqs", "2",
+                       "an image generator: one guided image takes two batch entries");
             }
             if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
                 cfg_.max_ctx = pb.gen_rows;

@@ -136,6 +136,39 @@ TEST(a_col_shard_takes_a_byte_range_of_every_row) {
     CHECK(why.find("whole bytes") != std::string::npos);
 }
 
+TEST(rotated_w4a8_column_shards_keep_codes_scales_and_zeros_together) {
+    RadEncoding e;
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_copy_str(e.transform, "fwht128");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F16, 1, 128);
+    rad_enc_add_plane(&e, "zero", RAD_U8, 1, 128);
+
+    // A 512-column projection splits into two 256-column ranks. Each rank must load
+    // its two scale and zero groups along with the corresponding packed nibbles.
+    const WeightInfo w = decl(e, { 0, 1, 2 }, 8, 512, RAD_SHARD_COL, 2);
+    const int64_t bytes_per_rank[] = { 128, 4, 2 };
+    for (int rank = 0; rank < 2; ++rank) {
+        PlaneShare s[RAD_ENC_MAX_PLANES];
+        REQUIRE_EQ(share(w, 8, 512, 2, rank, s), RAD_OK);
+        for (int plane = 0; plane < 3; ++plane) {
+            REQUIRE_EQ(s[plane].rects.size(), (size_t)1);
+            CHECK_EQ(s[plane].rects[0].rows, (int64_t)8);
+            CHECK_EQ(s[plane].rects[0].byte0, rank * bytes_per_rank[plane]);
+            CHECK_EQ(s[plane].rects[0].bytes, bytes_per_rank[plane]);
+            CHECK_EQ(s[plane].row_bytes, 2 * bytes_per_rank[plane]);
+        }
+    }
+
+    // Both ranks would receive 192 columns, which cuts the middle rotation group.
+    const WeightInfo misaligned = decl(e, { 0, 1, 2 }, 8, 384, RAD_SHARD_COL, 2);
+    for (int rank = 0; rank < 2; ++rank) {
+        PlaneShare s[RAD_ENC_MAX_PLANES];
+        CHECK_EQ(share(misaligned, 8, 384, 2, rank, s), RAD_E_SHAPE);
+    }
+}
+
 /* A cut that splits a scale block belongs to neither rank, and is refused. */
 TEST(a_shard_that_splits_a_block_is_refused) {
     const RadEncoding e = fp8_block();

@@ -45,6 +45,7 @@
 #include "rad_encoding.h"
 #include "rad_philox.h"
 #include "rad_sample.h"
+#include "rad_unipc_math.h"
 #include "rad_yarn.h"
 
 #include <dlfcn.h>
@@ -69,6 +70,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -5748,13 +5750,36 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
 }
 
 
+struct WpaColumnSlice {
+    const Planes& weight;
+    int64_t full_k;
+    int64_t col0;
+    std::vector<uint16_t>& output;
+};
+
+// Copy every row's matching packed code, scale and zero-point bytes before device relayout.
+static Planes wpa_slice_columns(const WpaColumnSlice& slice, int64_t N, int64_t K) {
+    Planes p;
+    p.enc = slice.weight.enc;
+    p.size(N, K);
+    for (int plane = 0; plane < p.enc.n_planes; ++plane) {
+        const int64_t source_bytes = slice.weight.row_bytes(plane);
+        const int64_t shard_bytes = p.row_bytes(plane);
+        const int64_t offset = source_bytes * slice.col0 / slice.full_k;
+        for (int64_t n = 0; n < N; ++n)
+            std::memcpy(p.data[plane].data() + n * shard_bytes,
+                        slice.weight.data[plane].data() + n * source_bytes + offset, shard_bytes);
+    }
+    return p;
+}
+
 /* The 4/5-bit asymmetric x int8 prefill GEMM against the planes' meaning: u4/u5 codes, an f16
  * scale and a u8 zero per 128 of K, an int8 activation with an f32 scale per (row, 128), parts
  * side by side. */
 static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
-                            int64_t pb2 = 0, uint32_t zdt = RAD_U8, int64_t arm = 0) {
+                            int64_t pb2 = 0, uint32_t zdt = RAD_U8, int64_t arm = 0,
+                            const WpaColumnSlice* slice = nullptr) {
     const char* row = bits == 4 ? "gemm_w4a8i8_tiled" : "gemm_w5a8i8_tiled";
-    if (!sel(row)) return;
     const PartCut cut(N, pb1, pb2);
     const int parts = cut.parts;
     char nm[160];
@@ -5763,7 +5788,7 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
-    const Planes p = asym_planes(bits, N, K, zdt);
+    const Planes p = slice ? wpa_slice_columns(*slice, N, K) : asym_planes(bits, N, K, zdt);
     const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
     const int64_t rb = p.row_bytes(ic);
     std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
@@ -5777,11 +5802,14 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
     const int64_t PK = parts * K, PG = parts * G;
     std::vector<uint8_t> ha((size_t)(M * PK));
     std::vector<float> av((size_t)(M * PK)), as((size_t)(M * PG));
+    const int64_t full_width = slice ? slice->full_k : PK;
+    const int64_t col0 = slice ? slice->col0 : 0;
     for (int64_t i = 0; i < M; ++i) {
         for (int64_t c = 0; c < PG; ++c)
-            as[(size_t)(i * PG + c)] = 0.002f * (float)(1 + st_mix32((uint32_t)(i * PG + c) ^ 0xa5u) % 97);
+            as[(size_t)(i * PG + c)] = 0.002f * (float)(1 +
+                st_mix32((uint32_t)(i * (full_width / 128) + col0 / 128 + c) ^ 0xa5u) % 97);
         for (int64_t k = 0; k < PK; ++k) {
-            const int q8 = (int)(st_mix32((uint32_t)(i * PK + k) ^ 0x3cu) % 255u) - 127;
+            const int q8 = (int)(st_mix32((uint32_t)(i * full_width + col0 + k) ^ 0x3cu) % 255u) - 127;
             ha[(size_t)(i * PK + k)] = (uint8_t)(int8_t)q8;
             av[(size_t)(i * PK + k)] = (float)q8;
         }
@@ -5819,7 +5847,10 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
     }
     const int rc = r->launch(&a, (RadStream) nullptr);
     if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "rc=" + std::to_string(rc)); return; }
-    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+    if (st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+        ok(nm, false, "could not read the projection output");
+        return;
+    }
     const int64_t nstep = N > 96 ? N / 96 : 1;
     double num = 0, den = 0;
     for (int64_t i = 0; i < M; i += (M > 64 ? 3 : 1))
@@ -5858,6 +5889,54 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
         std::printf("        %s\n", d);
     }
     ok(nm, rel < 1e-2, d);
+    if (slice) slice->output = std::move(hy);
+}
+
+static void h3_w4a8_projection_shapes(const Plugin& pl) {
+    // H3's default TP2 dense QKV, sparse QKV/gate or FFN gate/up, attention output and FFN down.
+    const int64_t shapes[][2] = { {10752, 5376}, {14336, 5376}, {5376, 3584}, {5376, 7168} };
+    for (const auto& shape : shapes) {
+        wpa8i8_numeric(pl, 4, 70, shape[0], shape[1]);
+        dfree_all();
+    }
+}
+
+static void h3_w4a8_reduce_columns(const Plugin& pl, const std::vector<int>& devs,
+                                   const std::vector<uint16_t>& left,
+                                   const std::vector<uint16_t>& right);
+
+static void h3_w4a8_column_parity(const Plugin& pl, const std::vector<int>& devs) {
+    const char* name = "h3_w4a8_column_parity";
+    if (devs.size() < 2) { skip(name, "needs two RDNA4 cards"); return; }
+    constexpr int64_t M = 70, N = 5376;
+    // The attention output and FFN down projections are H3's column-parallel linears.
+    for (int64_t full_k : { 7168, 14336 }) {
+        const auto weight = asym_planes(4, N, full_k);
+        std::vector<uint16_t> output[3];
+        for (int i = 0; i < 3; ++i) {
+            if (st_set_device(devs[i == 2 ? 1 : 0]) != hipSuccess) {
+                ok(name, false, "could not select the projection device");
+                return;
+            }
+            const WpaColumnSlice slice{weight, full_k, i == 2 ? full_k / 2 : 0, output[i]};
+            wpa8i8_numeric(pl, 4, M, N, i == 0 ? full_k : full_k / 2, 0, 0, RAD_U8, 0, &slice);
+            dfree_all();
+            if (output[i].empty()) return; // The projection helper has already reported a failure.
+        }
+        double diff_sq = 0, full_sq = 0;
+        for (size_t i = 0; i < output[0].size(); ++i) {
+            const double full = h_bf16(output[0][i]);
+            const double summed = h_bf16(rad_f32_to_bf16(h_bf16(output[1][i]) + h_bf16(output[2][i])));
+            diff_sq += (full - summed) * (full - summed);
+            full_sq += full * full;
+        }
+        // Each rank rounds its projection to BF16 before reduction, unlike the single GEMM.
+        const double rel = std::sqrt(diff_sq / full_sq);
+        const auto detail = fmt("N=%lld K=%lld host-summed shards rel_l2 %.3e", (long long)N,
+                                (long long)full_k, rel);
+        ok(detail.c_str(), rel < 1e-2);
+        h3_w4a8_reduce_columns(pl, devs, output[1], output[2]);
+    }
 }
 
 
@@ -10222,19 +10301,21 @@ void tile_offsets(const std::vector<int64_t>& sy, const std::vector<int64_t>& sx
 void vtile_plan_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "vtile_plan");
     if (!r) { ok("vtile_plan", false, "row absent"); return; }
-    const int64_t gs[][2] = { { 640, 320 }, { 128, 96 }, { 96, 768 }, { 320, 560 } };
+    const int64_t gs[][3] = { { 1, 640, 320 }, { 1, 128, 96 }, { 1, 96, 768 },
+                              { 1, 320, 560 }, { 17, 640, 320 } };
     for (const auto& g : gs) {
-        const int64_t H = g[0], W = g[1];
+        const int64_t frames = g[0], H = g[1], W = g[2];
         std::vector<int64_t> sy, sx, oy, ox;
         split_axis(H / 16, 16, 4, &sy, &oy);
         split_axis(W / 16, 16, 4, &sx, &ox);
         const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size(), M = nh * nw;
         void* dy = dalloc((size_t)(M * 22) * 4);
-        const std::string nm = fmt("vtile_plan %lld x %lld in %lld x %lld tiles", (long long)H,
-                                   (long long)W, (long long)nh, (long long)nw);
+        const std::string nm = fmt("vtile_plan %lld x %lld x %lld in %lld x %lld tiles",
+                                   (long long)frames, (long long)H, (long long)W,
+                                   (long long)nh, (long long)nw);
         /* M rides the band's bound (m.tiles), as the engine binds it -- never this call's tile
          * count; the tile count comes from geom and y's rows. */
-        const int rc = launch(r, { TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+        const int rc = launch(r, { TI32({ 3 }, { (int32_t)frames, (int32_t)H, (int32_t)W }),
                                    T(dy, RAD_I32, { M, 22 }) },
                               { PI("M", 33), PI("tile", 16), PI("overlap", 4), PI("ratio", 16) });
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
@@ -10250,7 +10331,9 @@ void vtile_plan_cases(const Plugin& pl) {
                 w[3] = (int32_t)tw;
                 for (int L = 0; L < 6; ++L) {
                     const int64_t d = (int64_t)1 << std::min(L, 4);
-                    w[4 + 3 * L] = 1;
+                    const int64_t time[] = { frames, frames, (frames + 1) / 2, (frames + 3) / 4,
+                                             (frames + 3) / 4, (frames + 3) / 4 };
+                    w[4 + 3 * L] = (int32_t)time[L];
                     w[5 + 3 * L] = (int32_t)(th / d);
                     w[6 + 3 * L] = (int32_t)(tw / d);
                 }
@@ -10321,23 +10404,47 @@ void vtile_crop_cases(const Plugin& pl) {
 void vtile_join_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "vtile_join");
     if (!r) { ok("vtile_join", false, "row absent"); return; }
-    const int64_t gs[][5] = { { 6, 9, 4, 1, 5 }, { 3, 3, 4, 2, 1 }, { 1, 20, 16, 4, 3 },
-                              { 20, 35, 16, 4, 48 } };
+    if (const RadKernelInfo* crop = find(pl, "vtile_crop")) {
+        constexpr int64_t frames = 5, side = 6, tile = 4, overlap = 2, channels = 3;
+        constexpr int64_t canvas_rows = frames * side * side, tile_rows = frames * tile * tile;
+        std::vector<float> input(canvas_rows * channels);
+        for (size_t i = 0; i < input.size(); ++i) input[i] = (float)i;
+        void* source = up_f32(input);
+        void* tiled = dalloc(4 * tile_rows * channels * sizeof(float));
+        void* output = dalloc(canvas_rows * channels * sizeof(float));
+        const auto geom = TI32({ 3 }, { frames, side, side });
+        int rc = launch(crop, { T(source, RAD_F32, { canvas_rows, channels }), geom,
+                                T(tiled, RAD_F32, { 4 * tile_rows, channels }) },
+                        { PI("M", 4 * tile_rows), PI("tile", tile), PI("overlap", overlap),
+                          PI("ratio", 1), PS("dtype", "f32") });
+        if (rc == RAD_OK)
+            rc = launch(r, { T(tiled, RAD_F32, { 4 * tile_rows, channels }), geom,
+                              T(output, RAD_F32, { canvas_rows, channels }) },
+                        { PI("M", canvas_rows), PI("tile", tile), PI("overlap", overlap),
+                          PI("n", channels), PS("dtype", "f32") });
+        const bool exact = rc == RAD_OK && differ(down_f32(output, input.size()), input) == 0;
+        ok("vtile_crop and vtile_join preserve temporal planes", exact,
+           exact ? "" : "five-frame round trip differs");
+    } else {
+        ok("vtile_crop and vtile_join preserve temporal planes", false, "crop row absent");
+    }
+    const int64_t gs[][6] = { { 1, 6, 9, 4, 1, 5 }, { 1, 3, 3, 4, 2, 1 },
+                              { 3, 1, 20, 16, 4, 3 }, { 3, 20, 35, 16, 4, 48 } };
     for (const auto& g : gs) {
-        const int64_t H = g[0], W = g[1], tile = g[2], ov = g[3], n = g[4];
+        const int64_t frames = g[0], H = g[1], W = g[2], tile = g[3], ov = g[4], n = g[5];
         std::vector<int64_t> sy, sx, oy, ox, off;
         split_axis(H, tile, ov, &sy, &oy);
         split_axis(W, tile, ov, &sx, &ox);
         const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
         tile_offsets(sy, sx, H, W, tile, &off);
-        const int64_t Sm = off.back(), M = H * W;
+        const int64_t Sm = frames * off.back(), M = frames * H * W;
         std::vector<float> x = randv((size_t)(Sm * n), 2.0f);
         void* dx = up_bf16(x);
         void* dy = dalloc((size_t)(M * n) * 2);
-        const std::string nm = fmt("vtile_join %lld x %lld bf16 tile %lld", (long long)H,
-                                   (long long)W, (long long)tile);
+        const std::string nm = fmt("vtile_join %lld x %lld x %lld bf16 tile %lld",
+                                   (long long)frames, (long long)H, (long long)W, (long long)tile);
         /* M rides the band's bound, as the engine binds it; the canvas rows come from y. */
-        const int rc = launch(r, { T(dx, RAD_BF16, { Sm, n }), TI32({ 3 }, { 1, (int32_t)H, (int32_t)W }),
+        const int rc = launch(r, { T(dx, RAD_BF16, { Sm, n }), TI32({ 3 }, { (int32_t)frames, (int32_t)H, (int32_t)W }),
                                    T(dy, RAD_BF16, { M, n }) },
                               { PI("M", 320 * 320), PI("tile", tile), PI("overlap", ov), PI("n", n),
                                 PS("dtype", "bf16") });
@@ -10346,13 +10453,15 @@ void vtile_join_cases(const Plugin& pl) {
         auto rd = [](float v) { return bfr(v); };
         auto wb = [&](int64_t p, int64_t e) { return rd((float)p / (float)e); };
         auto wa = [&](int64_t p, int64_t e) { return rd(1.0f - rd((float)p / (float)e)); };
-        auto Tv = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
-            return x[(size_t)((off[(size_t)(i * nw + j)] +
-                               ly * std::min(tile, W - sx[(size_t)j]) + lx) * n + c)];
+        auto Tv = [&](int64_t frame, int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+            const int64_t h = std::min(tile, H - sy[(size_t)i]);
+            const int64_t w = std::min(tile, W - sx[(size_t)j]);
+            const int64_t row = frames * off[(size_t)(i * nw + j)] + (frame * h + ly) * w + lx;
+            return x[(size_t)(row * n + c)];
         };
         std::vector<float> want((size_t)(M * n));
         for (int64_t rr = 0; rr < M; ++rr) {
-            const int64_t Y = rr / W, X = rr % W;
+            const int64_t frame = rr / (H * W), Y = (rr / W) % H, X = rr % W;
             int64_t i = 0, j = 0;
             while (i + 1 < nh && Y >= sy[(size_t)(i + 1)]) ++i;
             while (j + 1 < nw && X >= sx[(size_t)(j + 1)]) ++j;
@@ -10360,12 +10469,12 @@ void vtile_join_cases(const Plugin& pl) {
             const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0;
             const int64_t eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
             for (int64_t c = 0; c < n; ++c) {
-                float v = Tv(i, j, ly, lx, c);
+                float v = Tv(frame, i, j, ly, lx, c);
                 if (ly < ev)
-                    v = rd(rd(Tv(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                    v = rd(rd(Tv(frame, i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
                            rd(v * wb(ly, ev)));
                 if (lx < eh)
-                    v = rd(rd(Tv(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                    v = rd(rd(Tv(frame, i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
                            rd(v * wb(lx, eh)));
                 want[(size_t)(rr * n + c)] = v;
             }
@@ -10570,6 +10679,246 @@ void flow_rm_cases(const Plugin& pl) {
         bad += differ(down_f32(dx0, wantx0.size()), wantx0);
         ok((nm + " exact, both INOUT gaps untouched").c_str(), bad == 0,
            fmt("%lld values differ", (long long)bad));
+    }
+}
+
+void flow_unipc_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "flow_unipc_step_f32");
+    if (!r) { ok("flow_unipc_step_f32", false, "row absent"); return; }
+    const int64_t M = 19, n = 48, xld = n + 5, hld = 3 * n + 11;
+    // First prediction, a corrected prediction using all history, and terminal x0.
+    const std::vector<std::vector<float>> coefficients = {
+        { .9f, 0, 0, 0, 0, .8f, .2f, 0 },
+        { .72f, .8f, .2f, -.01f, .06f, .5f, .5f, -.1f },
+        { .36f, .5f, .5f, -.06f, .2f, 0, 1, 0 },
+    };
+    for (const bool bf : { false, true }) {
+        std::vector<float> x = randv(M * xld, 2.0f), history(M * hld, 15.0f);
+        std::vector<float> v = randv(M * n, 1.0f);
+        for (int64_t row = 0; row < M; ++row)
+            std::fill_n(history.begin() + row * hld, 3 * n, 0.0f);
+        void* dx = up_f32(x);
+        void* dh = up_f32(history);
+        void* dv = bf ? up_bf16(v) : up_f32(v);
+        RadTensor tx = T(dx, RAD_F32, { M, n }); tx.stride[0] = xld;
+        RadTensor th = T(dh, RAD_F32, { M, 3 * n }); th.stride[0] = hld;
+        const std::string name = fmt("flow_unipc_step_f32 %s velocity", bf ? "bf16" : "f32");
+        for (const auto& c : coefficients) {
+            const int rc = launch(r, { T(dv, bf ? RAD_BF16 : RAD_F32, { M, n }),
+                                       T(up_f32(c), RAD_F32, { rad_unipc::COUNT }), th, tx },
+                                  { PI("M", M), PI("n", n), PS("dtype", "f32") });
+            if (rc != RAD_OK) { ok(name.c_str(), false, "rc " + std::to_string(rc)); break; }
+            for (int64_t row = 0; row < M; ++row) {
+                for (int64_t col = 0; col < n; ++col) {
+                    float& sample = x[row * xld + col];
+                    float* h = history.data() + row * hld + col;
+                    sample = rad_unipc::advance(c.data(), sample, v[row * n + col],
+                                                h[0], h[n], h[2 * n]);
+                }
+            }
+            const int64_t bad = differ(down_f32(dx, x.size()), x) +
+                                differ(down_f32(dh, history.size()), history);
+            ok((name + ", sample and history including pitch gaps").c_str(), bad == 0,
+               fmt("%lld values differ", (long long)bad));
+        }
+    }
+}
+
+void umt5_attention_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "attn_umt5_bf16");
+    if (!r) { ok("attn_umt5_bf16", false, "row absent"); return; }
+    constexpr int64_t heads = 2, width = 128, pitch = 131;
+    for (const int64_t rows : {3, 512}) {
+        std::vector<float> q(rows * pitch), k(q), v(q), bias(32 * heads);
+        std::vector<float> initial(q), want(q);
+        for (int64_t row = 0; row < rows; ++row) {
+            initial[row * pitch + width] = 21.0f;
+            want[row * pitch + width] = 21.0f;
+        }
+        // Move the non-zero dot products into the second half of each head.
+        for (int64_t head = 0; head < heads; ++head) {
+            const int64_t col = head * 64 + 37;
+            if (rows == 3) {
+                q[col] = 1.0f; q[pitch + col] = .5f;
+                k[col] = .75f; k[pitch + col] = .25f;
+                v[col] = head == 0 ? 1.0f : 3.0f;
+                v[pitch + col] = head == 0 ? 3.0f : 1.0f;
+                v[2 * pitch + col] = 16.0f;
+                bias[17 * heads + head] = head == 0 ? .75f : -.125f;
+                bias[heads + head] = head == 0 ? -.125f : .75f;
+                want[col] = head == 0 ? 2.125f : 2.3125f;
+                want[pitch + col] = head == 0 ? 1.9375f : 2.46875f;
+                want[2 * pitch + col] = 16.0f;
+            } else {
+                // A uniform 512-row softmax averages one nonzero value exactly.
+                v[(rows - 1) * pitch + col] = 2.0f;
+                for (int64_t row = 0; row < rows; ++row)
+                    want[row * pitch + col] = 1.0f / 256.0f;
+            }
+        }
+        const std::vector<int32_t> cu = rows == 3 ? std::vector<int32_t>{0, 2, 3}
+                                                 : std::vector<int32_t>{0, 512};
+        auto pitched = [&](void* p) {
+            RadTensor t = T(p, RAD_BF16, {rows, width});
+            t.stride[0] = pitch;
+            return t;
+        };
+        void* dst = up_bf16(initial);
+        const int rc = launch(r, {pitched(up_bf16(q)), pitched(up_bf16(k)), pitched(up_bf16(v)),
+                                  T(up_i32(cu), RAD_I32, {(int64_t)cu.size()}),
+                                  T(up_bf16(bias), RAD_BF16, {32, heads}), pitched(dst)},
+                              {PI("M", rows), PI("heads", heads), PS("dtype", "bf16")});
+        const std::string name = fmt("attn_umt5_bf16 %lld rows, including pitch gaps", (long long)rows);
+        if (rc != RAD_OK) { ok(name.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const int64_t bad = differ(down_bf16(dst, want.size()), want);
+        ok(name.c_str(), bad == 0, fmt("%lld values differ", (long long)bad));
+    }
+}
+
+void wan_rotary_cases(const Plugin& pl) {
+    const auto* table = find(pl, "wan_rope_table_f32");
+    const auto* rotate = find(pl, "wan_rope_bf16");
+    if (!table || !rotate) { ok("Wan rotary", false, "row absent"); return; }
+    constexpr int64_t rows = 12, width = 128, pitch = 131;
+    auto pitched = [&](void* ptr, uint32_t dtype) {
+        RadTensor t = T(ptr, dtype, {rows, width});
+        t.stride[0] = pitch;
+        return t;
+    };
+    std::vector<float> pad(rows * pitch, 21.0f);
+    void* dc = up_f32(pad);
+    const auto coeff = pitched(dc, RAD_F32);
+    const int prep = launch(table, {T(up_i32({2, 4, 6}), RAD_I32, {3}), coeff},
+                            {PI("M", rows), PS("dtype", "f32")});
+    if (prep != RAD_OK) { ok("Wan rotary table", false, fmt("rc %d", prep)); return; }
+    const auto cs = down_f32(dc, pad.size());
+    constexpr int64_t row = 11 * pitch;
+    ok("Wan rotary table uses 22/21/21 pairs on time/height/width",
+       cs[row] == static_cast<float>(std::cos(1.0)) &&
+       cs[row + 44] == static_cast<float>(std::cos(1.0)) &&
+       cs[row + 86] == static_cast<float>(std::cos(2.0)) && cs[row + width] == 21.0f);
+
+    std::vector<float> q(pad), k(pad);
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < width; c += 2) {
+            q[r * pitch + c] = 1.0f; q[r * pitch + c + 1] = 0.0f;
+            k[r * pitch + c] = 0.0f; k[r * pitch + c + 1] = 1.0f;
+        }
+    void* dq = up_bf16(q);
+    void* dk = up_bf16(k);
+    const int used = launch(rotate, {pitched(dq, RAD_BF16), pitched(dk, RAD_BF16), coeff},
+                            {PI("M", rows), PI("heads", 1), PS("dtype", "bf16")});
+    if (used != RAD_OK) { ok("Wan apply rotary", false, fmt("rc %d", used)); return; }
+    q = down_bf16(dq, q.size());
+    k = down_bf16(dk, k.size());
+    ok("Wan rotary turns adjacent BF16 pairs and preserves pitched tails",
+       q[0] == 1.0f && q[1] == 0.0f && q[row + 44] == .5390625f && q[row + 45] == .83984375f &&
+       k[row + 86] == -.91015625f && k[row + 87] == -.416015625f &&
+       q[row + width] == 21.0f && k[row + width] == 21.0f);
+    const auto* rotate_f32 = find(pl, "wan_rope_f32");
+    if (!rotate_f32) { ok("Wan F32 rotary", false, "row absent"); return; }
+    std::vector<float> f32(rows * pitch, 0.0f);
+    f32[row + 86] = 1.0f;
+    void* fq = up_f32(f32);
+    void* fk = up_f32(f32);
+    const int full = launch(rotate_f32, {pitched(fq, RAD_F32), pitched(fk, RAD_F32), coeff},
+                            {PI("M", rows), PI("heads", 1), PS("dtype", "f32")});
+    f32 = down_f32(fq, f32.size());
+    ok("Wan rotary can keep the normalized query and key in FP32",
+       full == RAD_OK && f32[row + 86] == cs[row + 86] && f32[row + 87] == cs[row + 87]);
+}
+
+void wan_modulation_cases(const Plugin& pl) {
+    const auto* norm = find(pl, "wan_mod_norm");
+    const auto* residual = find(pl, "wan_gated_add");
+    if (!norm || !residual) { ok("Wan modulation", false, "row absent"); return; }
+    void* x = up_f32({1, -1, 1, -1});
+    const auto state = T(x, RAD_F32, {2, 2});
+    const auto time = T(up_f32({1, 1, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0,
+                               2, 2, 1, 1, 3, 4, 0, 0, 0, 0, 0, 0}), RAD_F32, {2, 12});
+    const auto w = T(up_f32({0, 0, 0, 0, .5f, -.5f, 0, 0, 0, 0, 0, 0}), RAD_F32, {1, 6, 2});
+    const auto cut = T(up_i32({1}), RAD_I32, {1});
+    void* y = dalloc(4 * sizeof(uint16_t));
+    const int ns = launch(norm, {state, time, w, cut, T(y, RAD_BF16, {2, 2})},
+                          {PI("M", 2), PI("n", 2), PI("group", 0), PI("round_norm", 1),
+                           PS("dtype", "bf16")});
+    ok("Wan modulation selects timestep zero for the first-frame rows",
+       ns == RAD_OK && down_bf16(y, 4) == std::vector<float>{2, 0, 4, 0});
+    std::vector<float> u = {.25f, .5f, .25f, .5f};
+    const auto update = T(up_bf16(u), RAD_BF16, {2, 2});
+    const int rs = launch(residual, {state, update, time, w, cut},
+                          {PI("M", 2), PI("n", 2), PI("gate", 2), PS("dtype", "f32")});
+    ok("Wan gated residual updates keep FP32 state",
+       rs == RAD_OK && down_f32(x, 4) == std::vector<float>{1.375f, -.25f, 1.875f, .75f});
+}
+
+void wan_vae_spatial_cases(const Plugin& pl) {
+    const auto* frame_cu = find(pl, "wan_vae_frame_cu");
+    const auto* norm = find(pl, "l2norm_chan_bf16");
+    if (!frame_cu || !norm) { ok("Wan VAE spatial ops", false, "row absent"); return; }
+    void* offsets = dalloc(3 * sizeof(int32_t));
+    int rc = launch(frame_cu, {T(up_i32({2, 2, 3}), RAD_I32, {3}), T(offsets, RAD_I32, {3})},
+                    {PI("M", 3)});
+    ok("Wan VAE frame offsets delimit spatial planes",
+       rc == RAD_OK && down_i32(offsets, 3) == std::vector<int32_t>{0, 6, 12});
+    void* out = dalloc(8 * sizeof(uint16_t));
+    std::vector<float> x = {6, 1, 0, 0, 0, 0, 0, 0};
+    std::vector<float> gain(8, 1.0f);
+    rc = launch(norm, {T(up_bf16(x), RAD_BF16, {1, 8}),
+                       T(up_bf16(gain), RAD_BF16, {8, 1, 1, 1}),
+                       T(out, RAD_BF16, {1, 8})},
+                {PI("M", 1), PI("n", 8), PI("round_length", 1), PS("act", "none"), PS("dtype", "bf16")});
+    ok("Wan VAE normalization rounds the length before dividing",
+       rc == RAD_OK && down_bf16(out, 8) == std::vector<float>{2.78125f, 0.46484375f, 0, 0, 0, 0, 0, 0});
+}
+
+void wan_vae_time_cases(const Plugin& pl) {
+    const auto* h = find(pl, "wan_vae_history_bf16");
+    const auto* u = find(pl, "wan_vae_expand_bf16");
+    if (!h || !u) { ok("Wan VAE temporal ops", false, "row absent"); return; }
+    std::vector<float> x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    std::vector<float> filled(8, 33.0f);
+    void* input = up_bf16(x);
+    void* cache = up_bf16(filled);
+    void* out = dalloc(12 * sizeof(uint16_t));
+    auto history = T(cache, RAD_BF16, {4, 2});
+    int rc = launch(h, {T(input, RAD_BF16, {2, 2}), history, T(out, RAD_BF16, {2, 6})},
+                    {PI("M", 2), PI("temporal", 1), PI("reset", 1), PS("dtype", "bf16")});
+    ok("Wan VAE resets temporal history to two zero frames before its first convolution",
+       rc == RAD_OK && down_bf16(out, 12) == std::vector<float>{0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4});
+    void* volume = dalloc(16 * sizeof(uint16_t));
+    rc = launch(h, {T(static_cast<char*>(input) + 4 * sizeof(uint16_t), RAD_BF16, {4, 2}),
+                    history, T(volume, RAD_BF16, {8, 2})},
+                    {PI("M", 4), PI("temporal", 0), PI("reset", 0), PS("dtype", "bf16")});
+    ok("Wan VAE regular causal volume prepends the history in frame order",
+       rc == RAD_OK && down_bf16(volume, 16) ==
+       std::vector<float>{0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    std::vector<float> packed = {1, 2, 3, 4};
+    void* shortcut = up_bf16(packed);
+    const auto geom = T(up_i32({1, 1, 1}), RAD_I32, {3});
+    rc = launch(u, {T(shortcut, RAD_BF16, {1, 4}), geom, T(out, RAD_BF16, {4, 1})},
+                    {PI("M", 1), PI("cin", 4), PI("cout", 1), PI("st", 2), PI("s", 2),
+                     PI("drop", 1), PI("temporal", 0), PS("dtype", "bf16")});
+    ok("Wan VAE shortcut drops only the first expanded temporal plane",
+       rc == RAD_OK && down_bf16(out, 4) == std::vector<float>{3, 3, 4, 4});
+}
+
+void wan_unpatch_cases(const Plugin& pl) {
+    const auto* r = find(pl, "wan_unpatch");
+    if (!r) { ok("wan_unpatch", false, "row absent"); return; }
+    std::vector<float> x(4 * 8);
+    std::iota(x.begin(), x.end(), 0.0f);
+    const std::vector<float> wanted = {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+                                      16, 17, 18, 19, 24, 25, 26, 27, 20, 21, 22, 23, 28, 29, 30, 31};
+    void* dst = dalloc(wanted.size() * sizeof(float));
+    const auto dims = T(up_i32({2, 2, 4}), RAD_I32, {3});
+    for (bool bf16 : {true, false}) {
+        auto src = bf16 ? T(up_bf16(x), RAD_BF16, {4, 8}) : T(up_f32(x), RAD_F32, {4, 8});
+        const int rc = launch(r, {src, dims, T(dst, RAD_F32, {16, 2})},
+                              {PI("M", 4), PI("n", 2), PS("dtype", bf16 ? "bf16" : "f32")});
+        const std::string name = fmt("wan_unpatch %s source, two frames", bf16 ? "bf16" : "f32");
+        ok(name.c_str(), rc == RAD_OK && differ(down_f32(dst, wanted.size()), wanted) == 0,
+           fmt("rc %d", rc));
     }
 }
 
@@ -10954,14 +11303,14 @@ void attn_dense_h80_cases(const Plugin& pl) {
     check("attn_dense_h80_bf16 16 heads over two images", down_bf16(dout, want.size()), want, 2e-2);
 }
 
-/* One wide head over every pixel, 384 and 512. */
-void attn_wide_cases(const Plugin& pl) {
-    for (const int64_t hd : { 384, 512 }) {
+/* One wide head over every pixel within each spatial plane. */
+void attn_wide_cases(const Plugin& pl, std::initializer_list<int> widths) {
+    for (const int64_t hd : widths) {
         const std::string row = fmt("attn_dense_h%lld_bf16", (long long)hd);
         const RadKernelInfo* r = find(pl, row.c_str());
         if (!r) { ok(row.c_str(), false, "row absent"); continue; }
         const int64_t N = 300;
-        const std::vector<int32_t> cu = { 0, (int32_t)N };
+        const std::vector<int32_t> cu = { 0, 139, (int32_t)N };
         std::vector<float> qkv = randv((size_t)(N * 3 * hd), 1.0f);
         for (float& x : qkv) x = bfr(x);
         void* d = up_bf16(qkv);
@@ -10971,7 +11320,7 @@ void attn_wide_cases(const Plugin& pl) {
             return t;
         };
         void* dout = dalloc((size_t)(N * hd) * 2);
-        const int rc = launch(r, { col(0), col(1), col(2), T(up_i32(cu), RAD_I32, { 2 }),
+        const int rc = launch(r, { col(0), col(1), col(2), T(up_i32(cu), RAD_I32, { 3 }),
                                    T(dout, RAD_BF16, { N, hd }) },
                               { PI("M", N), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
                                 PS("dtype", "bf16") });
@@ -10984,8 +11333,10 @@ void attn_wide_cases(const Plugin& pl) {
                 v[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + 2 * hd + t)];
             }
         std::vector<float> want((size_t)(N * hd));
-        host_attn(q, k, v, hd, hd, 1, 1, hd, 0, N, 0, N, false, &want);
-        check(row + " one head over 300 rows", down_bf16(dout, want.size()), want, 2e-2);
+        for (size_t segment = 1; segment < cu.size(); ++segment)
+            host_attn(q, k, v, hd, hd, 1, 1, hd, cu[segment - 1], cu[segment],
+                      cu[segment - 1], cu[segment], false, &want);
+        check(row + " one head per spatial plane", down_bf16(dout, want.size()), want, 2e-2);
     }
 }
 
@@ -12226,6 +12577,57 @@ void conv3d_cases(const Plugin& pl) {
     }
 }
 
+void conv3d_plain_case(const Plugin& pl, bool rgb, int32_t frames) {
+    const char* name = rgb ? "conv3d_ndhwc_rgb" : "conv3d_ndhwc_pointwise";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const Vol v{ frames, 2, 5 };
+    const int64_t m = v.T * v.H * v.W, cin = rgb ? 3 : 48, cout = 5;
+    const int64_t taps = rgb ? 27 : 1, k = rgb ? 3 : 1;
+    const int64_t ldx = cin + 3, ldy = cout + 2;
+    std::vector<float> x(m * cin), weights(cout * cin * taps), bias(cout), residual(m * cout);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = ((int)(i % 7) - 3) / 16.f;
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = ((int)(i % 11) - 5) / 32.f;
+    for (size_t i = 0; i < bias.size(); ++i) bias[i] = ((int)i - 2) / 64.f;
+    for (size_t i = 0; i < residual.size(); ++i) residual[i] = ((int)(i % 5) - 2) / 8.f;
+    void* dx = up_rows(x, m, cin, ldx, m);
+    void* dw = up_f32(weights);
+    void* db = up_f32(bias);
+    void* dy = up_rows(residual, m + 1, cout, ldy, m);
+    if (!dx || !dw || !db || !dy) { ok(name, false, "hipMalloc failed"); return; }
+    const auto dst = pitched(dy, RAD_BF16, m + 1, cout, ldy);
+    const int rc = launch(r, { pitched(dx, RAD_BF16, m, cin, ldx),
+                               T(dw, RAD_F32, { cout, cin, k, k, k }), T(db, RAD_F32, { cout }),
+                               TI32({ 3 }, { frames, (int32_t)v.H, (int32_t)v.W }), dst, dst },
+                          { PI("M", m), PI("cin", cin), PI("cout", cout), PI("k", k), PI("kt", k),
+                            PS("dtype", "bf16"), PI("causal", rgb), PI("reflect", rgb) });
+    if (rc != RAD_OK) { ok(name, false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> tap_major(weights.size());
+    for (int64_t o = 0; o < cout; ++o)
+        for (int64_t c = 0; c < cin; ++c)
+            for (int64_t t = 0; t < taps; ++t)
+                tap_major[(o * taps + t) * cin + c] = weights[(o * cin + c) * taps + t];
+    const auto result = down_u16(dy, (m + 1) * ldy);
+    std::vector<float> want(m * cout), got(want.size());
+    for (int64_t row = 0; row < m; ++row) {
+        if (rgb) {
+            conv3d_row(x, cin, tap_major, bias, &residual[row * cout], v, v, 1, 1,
+                       1, 0, 1, cout, row, &want[row * cout]);
+        }
+        for (int64_t o = 0; o < cout; ++o) {
+            const int64_t idx = row * cout + o;
+            if (!rgb) {
+                float sum = 0.f;
+                for (int64_t c = 0; c < cin; ++c) sum += x[row * cin + c] * weights[o * cin + c];
+                want[idx] = bfr(bfr(sum + bias[o]) + residual[idx]);
+            }
+            got[idx] = h_bf16(result[row * ldy + o]);
+        }
+    }
+    check(fmt("%s, %d frames, pitched rows with in-place residual", name, frames), got, want, 0.f);
+    ok(name, marks_moved(result, m + 1, cout, ldy, m) == 0, "padding changed");
+}
+
 /* ------------------------------------------------------------------ group_norm */
 /* libref's group_norm: the statistics in f64, rstd = 1 / sqrt(var + eps) in f32, the rest in f32
  * and one rounding, to bf16 when `bf`. */
@@ -13114,6 +13516,33 @@ void timestep_f32_case(const Plugin& pl) {
     }
 }
 
+void timestep_f64_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "timestep_embed_f64");
+    if (!r) { ok("timestep_embed_f64", false, "row absent"); return; }
+    constexpr int64_t rows = 2, n = 256, pitch = 263;
+    std::vector<float> t = {0.0f, 999.0f}, initial(rows * pitch, 21.0f);
+    void* dy = up_f32(initial);
+    RadTensor out = T(dy, RAD_F32, {rows, n});
+    out.stride[0] = pitch;
+    const int rc = launch(r, {T(up_f32(t), RAD_F32, {rows}), out},
+                          {PI("M", rows), PI("n", n), PF("max_period", 10000.0), PS("dtype", "f32")});
+    if (rc != RAD_OK) { ok("timestep_embed_f64", false, "rc " + std::to_string(rc)); return; }
+    const auto result = down_f32(dy, initial.size());
+    bool exact = result[pitch + 3] == 0x1.68de3cp-1f &&
+                 result[pitch + 63] == -0x1.077d74p-2f &&
+                 result[pitch + 131] == 0x1.6b349ap-1f &&
+                 result[pitch + 191] == -0x1.eec282p-1f;
+    for (int64_t i = 0; i < n / 2; ++i)
+        exact = exact && result[i] == 1.0f && result[n / 2 + i] == 0.0f;
+    for (int64_t row = 0; row < rows; ++row)
+        for (int64_t i = n; i < pitch; ++i) exact = exact && result[row * pitch + i] == 21.0f;
+    ok("timestep_embed_f64 matches pinned Wan values and preserves padding", exact);
+    out.stride[0] = n - 1;
+    const int rejected = launch(r, {T(up_f32(t), RAD_F32, {rows}), out},
+                                {PI("M", rows), PI("n", n), PF("max_period", 10000.0), PS("dtype", "f32")});
+    ok("timestep_embed_f64 rejects overlapping rows", rejected == RAD_E_STRIDE);
+}
+
 /* The curve form: y[m] lerps the [G, n] f32 table at clamp01(max(t[m], clamp_min)) * (G - 1),
  * clamping the lower row index to G - 2 -- the device mirror of comfy's adaln curve sampling. */
 void timestep_curve_case(const Plugin& pl) {
@@ -13775,6 +14204,29 @@ void attn_long_case(const Plugin& pl, const char* name, int64_t hd, int64_t nh,
 
 /* ---- SDXL's: CLIP-L's activation and the k-diffusion sampler, against a host port of libref's
  * arithmetic (libref/ref_gen.cpp). */
+void gelu_umt5_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "gelu_umt5_bf16");
+    if (!r) { ok("gelu_umt5_bf16", false, "row absent"); return; }
+    // Pinned Wan GELU.forward evaluated on PyTorch with BF16 inputs.
+    std::vector<float> input = {-4, -3.125f, -2.5f, -1.75f, -1.25f, -.875f, -.375f, 0,
+                                21, 21, 21, 21, 21, 21, 21, 21,
+                                .125f, .625f, 1.25f, 2.5f, 3.125f, 4, 0, 0};
+    auto want = input;
+    const float first[] = {-0.0f, -0.0f, -.0146484375f, -.07177734375f, -.134765625f,
+                           -.16796875f, -.1328125f, 0};
+    const float second[] = {.06884765625f, .458984375f, 1.109375f, 2.484375f, 3.125f, 4, 0, 0};
+    std::copy_n(first, 8, want.begin());
+    std::copy_n(second, 8, want.begin() + 16);
+    void* dst = up_bf16(input);
+    RadTensor x = T(up_bf16(input), RAD_BF16, {2, 8});
+    RadTensor y = T(dst, RAD_BF16, {2, 8});
+    x.stride[0] = y.stride[0] = 16;
+    const int rc = launch(r, {x, y}, {PI("M", 2), PI("n", 8), PS("dtype", "bf16")});
+    const bool exact = rc == RAD_OK && differ(down_bf16(dst, want.size()), want) == 0;
+    ok("gelu_umt5_bf16 matches the pinned fixture and preserves row padding", exact,
+       fmt("rc=%d", rc));
+}
+
 void gelu_quick_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "gelu_quick_bf16");
     if (!r) { ok("gelu_quick_bf16", false, "row absent"); return; }
@@ -27914,6 +28366,7 @@ struct ArPattern {
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<std::vector<float>> out;
+    const std::vector<uint16_t>* bf16_input = nullptr; // Optional real partial projection input.
 };
 
 static float ar_pattern_value(int rank, int64_t i) {
@@ -27993,10 +28446,14 @@ static void ar_pattern_worker(ArPattern* t) {
     for (size_t k = 0; t->rc_init == RAD_OK && t->rc_launch != RAD_E_NOMEM &&
                        k < t->sizes.size(); ++k) {
         const int64_t n = t->sizes[k];
-        for (int64_t i = 0; i < n; ++i) {
-            const float v = ar_value(t->coded_pattern, t->rank, i);
-            if (bf) { const uint16_t b = h_to_bf16(v); std::memcpy(&h[(size_t)i * 2], &b, 2); }
-            else    std::memcpy(&h[(size_t)i * 4], &v, 4);
+        if (t->bf16_input) {
+            std::memcpy(h.data(), t->bf16_input->data(), (size_t)n * sizeof(uint16_t));
+        } else {
+            for (int64_t i = 0; i < n; ++i) {
+                const float v = ar_value(t->coded_pattern, t->rank, i);
+                if (bf) { const uint16_t b = h_to_bf16(v); std::memcpy(&h[(size_t)i * 2], &b, 2); }
+                else    std::memcpy(&h[(size_t)i * 4], &v, 4);
+            }
         }
         copy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
         const bool oop = (int)k == t->out_of_place;
@@ -28051,6 +28508,41 @@ static void ar_pattern_run(std::vector<ArPattern>& t, const std::vector<int>& de
     }
     for (std::thread& x : th) x.join();
     for (ArPattern& x : t) x.shared = nullptr;
+}
+
+static void h3_w4a8_reduce_columns(const Plugin& pl, const std::vector<int>& devs,
+                                   const std::vector<uint16_t>& left,
+                                   const std::vector<uint16_t>& right) {
+    const char* name = "H3 W4A8 shards through exact BF16 lane all-reduce";
+    const auto* row = find(pl, "ar_oneshot_2rank_exact_lane");
+    if (!row) { ok(name, false, "kernel row absent"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards"); return; }
+    if (left.size() != right.size()) { ok(name, false, "different shard output sizes"); return; }
+
+    std::vector<ArPattern> ranks(2);
+    ranks[0].bf16_input = &left;
+    ranks[1].bf16_input = &right;
+    for (auto& rank : ranks) {
+        rank.row = row;
+        rank.dtype = "bf16";
+        rank.overlap = 1;
+        rank.sizes = { (int64_t)left.size() };
+    }
+    ar_pattern_run(ranks, devs);
+    for (auto& rank : ranks) if (rank.inst) row->fini(rank.inst);
+    for (const auto& rank : ranks) {
+        if (rank.rc_init != RAD_OK || rank.rc_launch != RAD_OK || rank.out.size() != 1 ||
+            rank.out[0].size() != left.size()) {
+            ok(name, false, fmt("rank %d init/launch %d/%d", rank.rank, rank.rc_init, rank.rc_launch));
+            return;
+        }
+    }
+    size_t bad = 0;
+    for (size_t i = 0; i < left.size(); ++i) {
+        const uint16_t want = h_to_bf16(h_bf16(left[i]) + h_bf16(right[i]));
+        for (const auto& rank : ranks) bad += h_to_bf16(rank.out[0][i]) != want;
+    }
+    ok(name, bad == 0, fmt("%zu elements differed from the host BF16 sum", bad));
 }
 
 /* One run on a fresh instance per rank, every size checked against the fold. False when init
@@ -30749,6 +31241,15 @@ static void device_phase(const Plugin& pl) {
     if (devs.empty()) { skip("device phase", "no gfx1200/gfx1201 device"); return; }
     st_set_device(devs[0]);
 
+    if (g_case && sel("h3_w4a8_projection_shapes")) {
+        h3_w4a8_projection_shapes(pl);
+        return;
+    }
+    if (g_case && sel("h3_w4a8_column_parity")) {
+        h3_w4a8_column_parity(pl, devs);
+        return;
+    }
+
     if (!g_case) std::printf("\ndevice smoke tests (device %d)\n", devs[0]);
 
     ngram_ahead_case(pl);
@@ -32972,10 +33473,22 @@ static void device_phase(const Plugin& pl) {
     if (sel("rms_mod_bf16")) vid::rms_mod_cases(pl, false);
     if (sel("flow_x0_step_f32")) vid::flow_x0_cases(pl);
     if (sel("flow_res_multistep_f32")) vid::flow_rm_cases(pl);
+    if (sel("flow_unipc_step_f32")) vid::flow_unipc_cases(pl);
+    if (sel("attn_umt5_bf16")) vid::umt5_attention_cases(pl);
     if (sel("grid_pos3")) vid::grid_pos3_cases(pl);
+    if (sel("wan_rope_table_f32") || sel("wan_rope_bf16") || sel("wan_rope_f32")) vid::wan_rotary_cases(pl);
+    if (sel("wan_mod_norm") || sel("wan_gated_add")) vid::wan_modulation_cases(pl);
+    if (sel("wan_unpatch")) vid::wan_unpatch_cases(pl);
+    if (sel("wan_vae_frame_cu")) vid::wan_vae_spatial_cases(pl);
+    if (sel("wan_vae_history_bf16") || sel("wan_vae_expand_bf16")) vid::wan_vae_time_cases(pl);
     if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
     /* A video latent upscaler's ops, at its source and target sizes. */
     if (sel("conv3d_ndhwc_bf16")) ups::conv3d_cases(pl);
+    if (sel("conv3d_ndhwc_rgb")) {
+        ups::conv3d_plain_case(pl, true, 1);
+        ups::conv3d_plain_case(pl, true, 4);
+    }
+    if (sel("conv3d_ndhwc_pointwise")) ups::conv3d_plain_case(pl, false, 3);
     if (sel("group_norm")) ups::group_norm_cases(pl);
     if (sel("tconv_dw_bf16")) ups::tconv_dw_cases(pl);
     if (sel("resize_bilinear")) ups::resize_bilinear_cases(pl);
@@ -32991,7 +33504,8 @@ static void device_phase(const Plugin& pl) {
     if (sel("attn_cross_h64_bf16")) g3::attn_cross_cases(pl, 64);
     if (sel("attn_dense_gqa")) g3::attn_dense_gqa_cases(pl);
     if (sel("attn_dense_h80_bf16")) g3::attn_dense_h80_cases(pl);
-    if (sel("attn_dense_h384_bf16") || sel("attn_dense_h512_bf16")) g3::attn_wide_cases(pl);
+    if (sel("attn_dense_h384_bf16") || sel("attn_dense_h512_bf16")) g3::attn_wide_cases(pl, {384, 512});
+    if (sel("attn_dense_h640_bf16") || sel("attn_dense_h1024_bf16")) g3::attn_wide_cases(pl, {640, 1024});
     if (sel("rms_mod_bf16")) g3::rms_mod_forms(pl);
     if (sel("timestep_embed_bf16")) g3::timestep_round_cases(pl);
     /* LTX-2's. */
@@ -33026,8 +33540,10 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_bf16")) vg::norm_f32_rows_cases(pl, false);
     if (sel("layernorm_bf16")) vg::norm_f32_rows_cases(pl, true);
     if (sel("timestep_embed_f32")) { vg::timestep_f32_case(pl); vg::timestep_curve_case(pl); }
+    if (sel("timestep_embed_f64")) vg::timestep_f64_case(pl);
     if (sel("randn_lanes_f32")) vg::randn_f32_case(pl);
     if (sel("gelu_quick_bf16")) vg::gelu_quick_cases(pl);
+    if (sel("gelu_umt5_bf16")) vg::gelu_umt5_cases(pl);
     if (sel("kd_input_bf16") || sel("kd_step_bf16")) vg::kd_cases(pl);
     if (sel("interleave2_bf16")) vg::interleave2_f32_case(pl);
     if (sel("chan_affine_f32")) vg::chan_affine_cases(pl, "chan_affine_f32");
@@ -33550,6 +34066,8 @@ static void device_phase(const Plugin& pl) {
             wpa8i8_numeric(pl, bits, 100, 2560, 1280, 1536, 0, RAD_U8, arm);
         }
         if (bits == 4) {
+            dfree_all();
+            h3_w4a8_projection_shapes(pl);
             /* An int4 W4A16 release imported with a u4 zero plane and no rotation: five groups
              * a row, so each zero row ends in a pad nibble; then the delta net's qkv|z, the MLP's
              * gate|up and down at a prefill chunk. */

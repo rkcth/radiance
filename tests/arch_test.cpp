@@ -14033,6 +14033,187 @@ MetaKV krea2_meta() {
 
 }  /* namespace */
 
+TEST(krea2_reduces_the_denoiser_and_output_buffers_for_a_pixel_limit) {
+    MetaKV mk = krea2_meta();
+    RadArchProbe probe{};
+    probe.gen_max_pixels = 512 * 512;
+    REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
+    CHECK_EQ(probe.gen_rows, 2 * (1024 + 512));
+
+    RadBuilder b;
+    RadBuildCtx ctx = qimg_ctx(0, 1);
+    ctx.gen_max_pixels = probe.gen_max_pixels;
+    ctx.max_tok = probe.gen_rows;
+    REQUIRE_EQ(krea2::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.generator.max_tokens, 1024);
+    CHECK_EQ(b.generator.default_width, 512);
+    CHECK_EQ(b.generator.default_height, 512);
+    CHECK_EQ(b.generator.max_refs, 0);
+    REQUIRE(b.generator.image_out > 0);
+    CHECK_EQ(b.bufs[b.generator.image_out - 1].d.shape[0], 512 * 512 * 3);
+}
+
+TEST(krea2_reference_encoder_uses_the_single_frame_qwen_image_vae) {
+    MetaKV mk = krea2_meta();
+    mk.set("pipeline.krea_reference_encoder", "1").set("vae.dim_mult", "1 2 4 4");
+    RadBuilder b;
+    RadBuildCtx ctx = qimg_ctx(0, 1);
+    ctx.gen_max_pixels = 256 * 256;
+    REQUIRE_EQ(krea2::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& encoder = krea2::g_model[0].enc;
+    REQUIRE(!encoder.ops.empty());
+    const auto& encoded = encoder.ops.back().y;
+    CHECK_EQ(encoded.lvl, 3);
+    CHECK_EQ(encoded.ch, 32);
+    CHECK_EQ(encoder.px_at(encoded.lvl), 32 * 32);
+    int spatial_downsamples = 0;
+    for (const auto& op : encoder.ops)
+        if (op.stride == 2) ++spatial_downsamples;
+    CHECK_EQ(spatial_downsamples, 3);
+    CHECK_EQ(b.generator.max_refs, 0);
+}
+
+TEST(krea2_reference_conditioning_declares_the_vision_tower_and_deepstack) {
+    MetaKV mk = krea2_meta();
+    mk.set("pipeline.krea_reference_encoder", "1").set("vae.dim_mult", "1 2 4 4")
+      .set("vision_config.depth", "3").set("vision_config.hidden_size", "256")
+      .set("vision_config.intermediate_size", "512").set("vision_config.num_heads", "4")
+      .set("vision_config.patch_size", "16").set("vision_config.temporal_patch_size", "2")
+      .set("vision_config.spatial_merge_size", "2").set("vision_config.num_position_embeddings", "2304")
+      .set("vision_config.out_hidden_size", "256")
+      .set("vision_config.deepstack_visual_indexes", "0 1 2");
+
+    RadArchProbe probe{};
+    probe.gen_max_pixels = 256 * 256;
+    REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
+    CHECK_EQ(probe.gen_patches, 2304);
+    CHECK_EQ(probe.gen_rows, 2 * (256 + 1024 + 256));
+
+    RadBuilder b;
+    RadBuildCtx ctx = qimg_ctx(0, 1);
+    ctx.max_enc_patches = probe.gen_patches;
+    ctx.gen_max_pixels = probe.gen_max_pixels;
+    ctx.max_tok = probe.gen_rows;
+    REQUIRE_EQ(krea2::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& model = krea2::g_model[0];
+    CHECK(model.vision.on);
+    CHECK_EQ(model.vision.n_ds, 3);
+    CHECK_EQ(b.encoder.max_patches, 2304);
+    CHECK_EQ(b.generator.cond_rows, 1280);
+    CHECK(model.op_vision_embed != 0);
+    for (int i = 0; i < model.vision.n_ds; ++i) CHECK(model.op_deepstack[i] != 0);
+    std::set<std::string> sources;
+    for (const auto& mapping : b.maps)
+        sources.insert(mapping.src.begin(), mapping.src.end());
+    CHECK(sources.count("visual.patch_embed.proj.weight"));
+    CHECK(sources.count("visual.deepstack_merger_list.2.linear_fc2.weight"));
+    CHECK_EQ(b.generator.max_refs, 1);
+    auto k = gen_pass(b, RAD_GEN_PASS_COND, 12);
+    int32_t segments[] = {0, 12, 16};
+    int32_t px_shape[] = {0, 32, 32}, px_bounds[] = {0, 4};
+    uint16_t pixels[32 * 32 * 3]{};
+    k->g.rows = 16;
+    k->g.seg_h = segments;
+    k->g.n_px = 1;
+    k->g.px = pixels;
+    k->g.px_h = px_shape;
+    k->g.px_cu = px_bounds;
+    std::vector<uint16_t> patches(4 * b.encoder.patch_dim);
+    int32_t coords[16]{}, enc_bounds[] = {0, 4}, media_rows[] = {2};
+    k->b.enc_n_patch = 4;
+    k->b.enc_pixels = patches.data();
+    k->b.enc_coord = coords;
+    k->b.enc_n_seg = 1;
+    k->b.enc_cu = enc_bounds;
+    k->b.enc_max_seg = 4;
+    k->b.n_mm_rows = 1;
+    k->b.mm_rows = media_rows;
+    RadCtx c{ .b = &b, .batch = &k->b, .rank = 0, .world = 1 };
+    krea2::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    CHECK_EQ(count_issued(issued_ops(b, c), "s2d_avg_add"), 1);
+    CHECK_EQ(count_issued(issued_ops(b, c), "lane_store"), 2);
+
+    auto step = gen_pass(b, RAD_GEN_PASS_DENOISE, 20);
+    int32_t mode_cu[] = {0, 12, 16, 20}, img_cu[] = {0, 4}, img_rows[] = {16, 17, 18, 19};
+    float positions[80]{}, bias[] = {-INFINITY}, sigmas[] = {0.5f, 0.0f, 0.5f};
+    step->g.mode_cu = mode_cu;
+    step->g.mode_sigma = sigmas;
+    step->g.ref_log_bias = bias;
+    step->g.rope_f = positions;
+    step->g.n_img = 4;
+    step->g.img_cu = img_cu;
+    step->g.img_rows = img_rows;
+    RadCtx denoise{ .b = &b, .batch = &step->b, .rank = 0, .world = 1 };
+    krea2::step(&denoise, &step->b);
+    CHECK(denoise.step_fail.empty());
+    CHECK_LINT(b, &denoise);
+    CHECK_EQ(count_issued(issued_ops(b, denoise), "attn_dense_ref"), 1);
+
+    probe.gen_max_refs = 2;
+    REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
+    CHECK_EQ(probe.gen_patches, 4608);
+    CHECK_EQ(probe.gen_rows, 2 * (256 + 1600 + 2 * 256));
+    ctx.gen_max_refs = probe.gen_max_refs;
+    ctx.max_enc_patches = probe.gen_patches;
+    ctx.max_tok = probe.gen_rows;
+    RadBuilder two;
+    REQUIRE_EQ(krea2::declare(&two, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(two.generator.max_refs, 2);
+    CHECK_EQ(two.generator.cond_rows, 1600 + 2 * 256);
+    CHECK_EQ(two.encoder.max_patches, 4608);
+
+    auto pair = gen_pass(two, RAD_GEN_PASS_COND, 12);
+    int32_t pair_segments[] = {0, 12, 16, 18};
+    int32_t pair_shapes[] = {0, 32, 32, 1024, 16, 32};
+    int32_t pair_bounds[] = {0, 4, 0, 2};
+    std::vector<uint16_t> pair_pixels((1024 + 512) * 3);
+    pair->g.rows = 18;
+    pair->g.seg_h = pair_segments;
+    pair->g.n_px = 2;
+    pair->g.px = pair_pixels.data();
+    pair->g.px_h = pair_shapes;
+    pair->g.px_cu = pair_bounds;
+    RadCtx pair_ctx{ .b = &two, .batch = &pair->b, .rank = 0, .world = 1 };
+    krea2::step(&pair_ctx, &pair->b);
+    CHECK(pair_ctx.step_fail.empty());
+    CHECK_LINT(two, &pair_ctx);
+    CHECK_EQ(count_issued(issued_ops(two, pair_ctx), "s2d_avg_add"), 2);
+    CHECK_EQ(count_issued(issued_ops(two, pair_ctx), "lane_store"), 3);
+
+    probe.gen_max_refs = 3;
+    CHECK_EQ(krea2::probe(mk.meta(), &probe), RAD_E_INVAL);
+}
+
+TEST(krea2_target_buffers_cover_standalone_batches_with_reference_support) {
+    MetaKV mk = krea2_meta();
+    mk.set("pipeline.krea_reference_encoder", "1").set("vae.dim_mult", "1 2 4 4")
+      .set("vision_config.depth", "3").set("vision_config.hidden_size", "256")
+      .set("vision_config.intermediate_size", "512").set("vision_config.num_heads", "4")
+      .set("vision_config.patch_size", "16").set("vision_config.temporal_patch_size", "2")
+      .set("vision_config.spatial_merge_size", "2").set("vision_config.num_position_embeddings", "2304")
+      .set("vision_config.out_hidden_size", "256").set("vision_config.deepstack_visual_indexes", "0 1 2");
+    RadArchProbe probe{};
+    probe.gen_max_pixels = 1024 * 1024;
+    REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
+    for (const int entries : {2, 4}) {
+        RadBuilder b;
+        RadBuildCtx ctx = qimg_ctx(0, 1);
+        ctx.max_seqs = entries;
+        ctx.max_tok = probe.gen_rows;
+        ctx.max_enc_patches = probe.gen_patches;
+        ctx.gen_max_pixels = probe.gen_max_pixels;
+        REQUIRE_EQ(krea2::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const auto* latent = find_b(b, "dit.lat");
+        const auto* velocity = find_b(b, "dit.v");
+        REQUIRE(latent && velocity);
+        CHECK_EQ(latent->d.shape[0], entries * 4096);
+        CHECK_EQ(velocity->d.shape[0], entries * 4096);
+    }
+}
+
+
 /* An IQ8R container (every quantised linear at one scale a 256 of K): where the rotating twins are
  * served a DiT block's two modulated norms write the int8 codes in their own pass
  * (rms_mod_had_quant_i8g at the weights' group) and every attention's output gate writes the out

@@ -502,6 +502,12 @@ typedef struct RadGenBatch {
     /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
      * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
+    /* ---- appended in ABI 42 (Krea 2 reference attention) */
+    /* DENOISE: one natural-log bias a sequence on target queries to reference keys.
+     * Negative infinity isolates the reference queries instead (registered outfill).
+     * mode_sigma has three values a sequence, one per span in mode_cu. */
+    const float*   ref_log_bias;
+    const float*   mode_sigma;
 } RadGenBatch;
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
@@ -677,7 +683,9 @@ typedef struct RadVideoGenBatch {
     /* ---- VSTEP */
     int32_t         step;          /* from 0; the first draws the lane's noise */
     /* f32 [16]: the video's timestep, sigma and next sigma, then the soundtrack's; from [6] the
-     * res_multistep scalars of the video, then of the soundtrack (`sampler`, below). */
+     * res_multistep scalars of the video, then of the soundtrack (`sampler`, below).
+     * For UniPC, the timestep is Wan's unnormalised integer timestep as f32.
+     * Eight flow_unipc_step coefficients start at RAD_VIDEO_UNIPC_COEFF_OFFSET. */
     const float*    sched;
     const float*    pos;           /* f32 [3, n_tok]: RAD_VPOS_STEP */
     /* u32 [2, 2]: the video's noise seed and the soundtrack's, low word first (VSTEP, VUPSCALE and
@@ -724,7 +732,8 @@ typedef struct RadVideoGenBatch {
      * (k-diffusion's res_multistep at eta 0), which keeps the previous step's estimate. Its scalars
      * are sched[6..10] for the video and sched[11..15] for the soundtrack: sigma, r = next sigma /
      * sigma, the weights hb1 and hb2 of this step's estimate and the previous one, and the order,
-     * 1 where there is no previous estimate on the same grid. */
+     * 1 where there is no previous estimate on the same grid. RAD_SAMPLER_UNIPC uses
+     * the coefficients at RAD_VIDEO_UNIPC_COEFF_OFFSET and a three-plane history. */
     int32_t         sampler;
     /* VENCODE: f32 [enc_frames, enc_height, enc_width, 3] RGB in 0..255, the frames padded to
      * whole clips by repeating the last (rad_arch_encode_geom's entry 23). AENCODE: f32
@@ -752,7 +761,8 @@ typedef struct RadVideoGenBatch {
     const int32_t*  mod_cu;
 } RadVideoGenBatch;
 
-enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1 };
+enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1, RAD_SAMPLER_UNIPC = 2 };
+enum { RAD_VIDEO_UNIPC_COEFF_OFFSET = 6 };
 
 /* What a shape generator's pass carries beside the step batch's own fields (rad_builder.h,
  * RadShapeGenDecl, describes the passes). Every pass is one request's, in lane `lane`:

@@ -644,7 +644,8 @@ HttpResponse Front::forward(HttpRequest q) {
     }
     /* A dashboard read is not a use of the model: it does not bring one back, and it does not
      * keep one that nobody asks anything of from going idle. */
-    if (dashboard_read(q)) {
+    const bool validation = q.method == "POST" && path_canonical(q.path) == "/v1/loras/validate";
+    if (dashboard_read(q) || validation) {
         Entry* r = nullptr;
         std::shared_ptr<void> hold;
         {

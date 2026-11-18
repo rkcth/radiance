@@ -17,6 +17,15 @@ int SlotTable::size() const {
     return (int)slots_.size();
 }
 
+bool SlotTable::all_held() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const Slot& slot : slots_) {
+        const auto ref = refs_.find(slot.uid);
+        if (!slot.uid || ref == refs_.end() || ref->second == 0) return false;
+    }
+    return !slots_.empty();
+}
+
 int SlotTable::reserve(const std::string& name, int* slot, bool* cooling, std::string* err) {
     std::lock_guard<std::mutex> lk(mu_);
     *slot = -1;

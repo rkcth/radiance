@@ -14,6 +14,7 @@
 
 #include "util/json.h"
 
+#include <algorithm>
 #include <fstream>
 #include <string>
 
@@ -125,6 +126,34 @@ TEST(pack_golden_fl2va) { check_case("fl2va"); }
 TEST(pack_golden_ref2va_all) { check_case("ref2va_all"); }
 TEST(pack_golden_chain) { check_case("chain"); }
 TEST(pack_golden_no_text) { check_case("no_text"); }
+
+TEST(pack_frame_zero_guide_with_character_photo) {
+    const Ref2VAGeom canvas{ 37, 26, 48, 207 };  /* 124 frames at 768 x 416 */
+    const int64_t video_rows = 37 * 13 * 24;
+    constexpr int text_rows = 512;
+    constexpr int photo_rows = 64;
+    Ref2VAPack pack;
+    REQUIRE_EQ(ref2va_build(text_rows, canvas, { { 0, 37, 0 } },
+                             { { kR2VRefImage, 16, 16, 1, 0 } }, &pack), 0);
+    REQUIRE_EQ(pack.segs.size(), 5u);
+    CHECK_EQ(pack.rows, text_rows + 2 * video_rows + photo_rows + 414);
+    const Ref2VASeg& guide = pack.segs[1];
+    const Ref2VASeg& photo = pack.segs[2];
+    const Ref2VASeg& output = pack.segs.back();
+    CHECK_EQ(guide.kind, kR2VCond);
+    CHECK_EQ(guide.update, 0);
+    CHECK_EQ(guide.end - guide.start, video_rows);
+    CHECK_EQ(photo.kind, kR2VRefImg);
+    CHECK_EQ(photo.end - photo.start, photo_rows);
+    CHECK_EQ(output.kind, kR2VVideo);
+    CHECK_EQ(output.update, 1);
+    CHECK_EQ(output.end - output.start, video_rows);
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto start = pack.pos.begin() + axis * pack.rows;
+        CHECK(std::equal(start + guide.start, start + guide.end, start + output.start));
+    }
+    CHECK(pack.pos[photo.start] < pack.pos[guide.start]);
+}
 
 TEST(pack_rejects_negative_dims) {
     Ref2VAPack p;

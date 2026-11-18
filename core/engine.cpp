@@ -3556,6 +3556,12 @@ int Engine::run_server() {
             for (const auto& [n, w] : u) uses.push_back({ n, w });
             return gen_lora_acquire(uses, slot, hold, note, e);
         };
+        o.gen_lora_validate = [this](const std::vector<std::pair<std::string, double>>& choices,
+                                     std::string* err) {
+            std::vector<LoraUse> uses;
+            for (const auto& [name, weight] : choices) uses.push_back({name, weight});
+            return gen_lora_validate(uses, err);
+        };
         o.gen_lora_names = [this] { return gen_lora_names(); };
         o.lora_load = [this](const std::string& n, const std::string& d, std::string* e) {
             return lora_load(n, d, e);
@@ -3877,9 +3883,11 @@ int Engine::run_server() {
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
     } image_bridge;
-    if (!img_gen_ && (cfg_.image_gen_max_pixels > 0 || cfg_.image_gen_max_refs > 0))
-        RAD_WARN("--image-gen-max-pixels / --image-gen-max-refs: this model makes no images; "
-                 "ignored");
+    if (!img_gen_ && cfg_.image_gen_max_refs > 0)
+        RAD_WARN("--image-gen-max-refs: this model makes no images; ignored");
+    if (!img_gen_ && cfg_.image_gen_max_pixels > 0 &&
+        (!vid_gen_ || ranks_[0]->program.video_gen.max_area > cfg_.image_gen_max_pixels))
+        RAD_WARN("--image-gen-max-pixels: the selected model does not use this limit; ignored");
     if (img_gen_) {
         const Program& pg = ranks_[0]->program;
         const RadGeneratorDecl& gd = pg.generator;
@@ -3907,7 +3915,8 @@ int Engine::run_server() {
         in.max_tokens = gd.max_tokens;
         /* Edits need the conditioning network to read pictures, unless only the generator's
          * own encoder reads them. */
-        in.refs_encoder_only = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP;
+        in.refs_encoder_only = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP && in.tmpl_image.empty();
+        in.refs_fit_output = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP && !in.refs_encoder_only;
         in.max_refs = mm_proc || in.refs_encoder_only ? gd.max_refs : 0;
         in.ref_shrink_only = gd.ref_shrink_only != 0;
         in.ref_area = gd.ref_area;
@@ -4094,7 +4103,9 @@ int Engine::run_server() {
         in.shift_audio = vd.shift_audio;
         in.upscale_max = vd.upscale_max;
         in.upscale_refine = vd.upscale_refine;
-        in.step_evals = vd.sched_kind == 1;
+        in.step_evals = vd.sched_kind != 0;
+        in.unipc_only = vd.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC;
+        in.guidance_cfg_only = vd.guidance == RAD_VIDEO_GUIDANCE_CFG;
         in.guidance = vd.guidance != 0;
         for (int i = 0; i < 8; ++i) in.guidance_default[i] = vd.guidance_default[i];
         in.default_negative = pg.vgen_str.default_negative;

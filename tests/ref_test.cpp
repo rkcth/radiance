@@ -19,6 +19,7 @@
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
 #include "rad_planes.h"
+#include "rad_umt5_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1290,7 +1291,7 @@ TEST(op_vocabulary) {
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa", "grid_embed_cpe", "grid_embed_pad", "window_order",
-        "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
+        "attn_paged", "attn_dense", "attn_dense_ref", "attn_umt5", "kv_store", "kv_store_streamed", "rope", "rope_table",
         "attn_paged_sink",
         "qk_norm_rope", "qsa_block_key",
         /* libr4d's row-form names, served by the base op's row. */
@@ -1311,9 +1312,9 @@ TEST(op_vocabulary) {
         "sample_argmax", "sample_merge_topk", "sample_logprobs",
         /* The image generator's (arch/qwenimage21): a DiT's modulation and gates, the per-lane
          * sampler state, the VAE's convolutions and shortcuts, attention over a cached prefix. */
-        "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
+        "ln_mod", "gate_add", "timestep_embed", "timestep_embed_f64", "gather_rows2", "lane_gather", "lane_store",
         "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "im2col_nhwc", "l2norm_chan",
-        "d2s_add", "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
+        "d2s_add", "s2d_avg_add", "to_rgba8", "gelu_tanh", "gelu_umt5", "scatter_add_rows", "attn_prefix_self",
         /* SDXL's (arch/sdxl): CLIP-L's activation and the k-diffusion sampler over a
          * discrete-time denoiser. */
         "gelu_quick", "kd_input", "kd_step",
@@ -1329,9 +1330,10 @@ TEST(op_vocabulary) {
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
-        "rms_mod", "flow_x0_step", "flow_res_multistep", "patch_unfold",
+        "rms_mod", "flow_x0_step", "flow_res_multistep", "flow_unipc_step", "patch_unfold",
         "vtile_gather",
-        "vtile_stitch", "grid_pos3", "snake_aa",
+        "vtile_stitch", "grid_pos3", "wan_rope_table", "wan_rope", "wan_mod_norm", "wan_gated_add",
+        "wan_unpatch", "wan_vae_frame_cu", "wan_vae_history", "wan_vae_expand", "snake_aa",
         /* Its step-distilled form's video sparse attention: the tile selection and the
          * block-sparse attention over it. */
         "vsa_select", "attn_vsa",
@@ -3518,6 +3520,72 @@ TEST(op_attn_dense) {
     CHECK_NEAR(o.at(1), w0 / sum, 1e-6);
     CHECK_NEAR(o.at(2), w0 / sum, 1e-6);
     CHECK_NEAR(o.at(3), 1.0f / sum, 1e-6);
+}
+
+TEST(op_attn_umt5_preserves_direction_and_packed_sequence_boundaries) {
+    constexpr int64_t width = 128, pitch = 131;
+    T q(RAD_BF16, {3, pitch}), k(RAD_BF16, {3, pitch}), v(RAD_BF16, {3, pitch});
+    T cu(RAD_I32, {3}), bias(RAD_BF16, {32, 2}), out(RAD_BF16, {3, pitch});
+    for (T* matrix : { &q, &k, &v, &out }) matrix->t.shape[1] = width;
+    auto put = [](T& t, int64_t off, float value) {
+        st_dt(t.t.dtype, t.t.data, off, value);
+    };
+    for (int h = 0; h < 2; ++h) {
+        const int64_t col = h * 64;
+        put(q, col, 1.0f); put(q, pitch + col, .5f);
+        put(k, col, .75f); put(k, pitch + col, .25f);
+        put(v, col, h == 0 ? 1.0f : 3.0f);
+        put(v, pitch + col, h == 0 ? 3.0f : 1.0f);
+        put(v, 2 * pitch + col, 16.0f);
+    }
+    put(bias, 17 * 2, .75f); put(bias, 1 * 2, -.125f);
+    put(bias, 17 * 2 + 1, -.125f); put(bias, 1 * 2 + 1, .75f);
+    put(out, pitch - 1, 21.0f);
+    cu.n({0, 2, 3});
+    A a; a.t(q).t(k).t(v).t(cu).t(bias).t(out).i("M", 3).i("heads", 2).s("dtype", "bf16");
+    CHECK_OK(run("attn_umt5", a));
+    // The pinned UMT5 attention expression in PyTorch BF16, no qk scaling.
+    CHECK_EQ(out.at(0), 2.125f);
+    CHECK_EQ(out.at(pitch), 1.9375f);
+    CHECK_EQ(out.at(64), 2.3125f);
+    CHECK_EQ(out.at(pitch + 64), 2.46875f);
+    CHECK_EQ(out.at(2 * pitch), 16.0f);
+    CHECK_EQ(out.at(pitch - 1), 21.0f);
+    cu.n({0, 0, 3});
+    CHECK_EQ(run("attn_umt5", a), RAD_E_SHAPE);
+}
+
+TEST(umt5_relative_buckets_match_the_reference_distance_thresholds) {
+    const int starts[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 23, 32, 46, 64, 91 };
+    for (int i = 1; i < 16; ++i) {
+        CHECK_EQ(rad_umt5::bucket(-starts[i]), i);
+        CHECK_EQ(rad_umt5::bucket(starts[i]), 16 + i);
+        CHECK_EQ(rad_umt5::bucket(1 - starts[i]), i - 1);
+    }
+    CHECK_EQ(rad_umt5::bucket(-511), 15);
+    CHECK_EQ(rad_umt5::bucket(511), 31);
+}
+
+TEST(op_attn_dense_ref_boost_and_registered_outfill) {
+    T q(RAD_F32, {3, 1, 1}); q.f({0, 0, 0});
+    T k(RAD_F32, {3, 1, 1}); k.f({0, 0, 0});
+    T v(RAD_F32, {3, 1, 1}); v.f({0, 6, 0});
+    T cu(RAD_I32, {2}); cu.n({0, 3});
+    T modes(RAD_I32, {4}); modes.n({0, 1, 2, 3});
+    T bias(RAD_F32, {1});
+    T out(RAD_F32, {3, 1, 1});
+    A a; a.t(q).t(k).t(v).t(cu).t(out).t(modes).t(bias)
+          .i("M", 3).i("head_dim", 1).i("gqa", 1).i("causal", 0).s("dtype", "f32");
+    bias.f({std::log(4.0f)});
+    CHECK_OK(run("attn_dense_ref", a));
+    CHECK_NEAR(out.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(1), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(2), 4.0f, 1e-6);
+    bias.f({-INFINITY});
+    CHECK_OK(run("attn_dense_ref", a));
+    CHECK_NEAR(out.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(1), 6.0f, 1e-6);
+    CHECK_NEAR(out.at(2), 2.0f, 1e-6);
 }
 
 /* The window is two-sided when the attention is: with window 2 a key one position away on either
@@ -6750,6 +6818,28 @@ TEST(timestep_embed_is_cos_then_sin_of_the_scaled_time) {
     CHECK_NEAR(y3.at(2), std::cos(1.0), 1e-6);   CHECK_NEAR(y3.at(3), std::sin(1.0), 1e-6);
 }
 
+TEST(timestep_embed_f64_matches_pinned_wan_sinusoidal_embedding) {
+    T t(RAD_F32, {2}); t.f({0, 999});
+    T y(RAD_F32, {2, 256});
+    A a; a.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_OK(run("timestep_embed_f64", a));
+    for (int i = 0; i < 128; ++i) {
+        CHECK_EQ(y.at(i), 1.0f);
+        CHECK_EQ(y.at(128 + i), 0.0f);
+    }
+    // Wan's FP64 sinusoidal_embedding_1d, then narrowed to FP32 for the MLP.
+    CHECK_EQ(y.at(256 + 3), 0x1.68de3cp-1f);
+    CHECK_EQ(y.at(256 + 63), -0x1.077d74p-2f);
+    CHECK_EQ(y.at(256 + 131), 0x1.6b349ap-1f);
+    CHECK_EQ(y.at(256 + 191), -0x1.eec282p-1f);
+    y.t.stride[0] = 255;
+    A overlap; overlap.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", overlap), RAD_E_STRIDE);
+    T wrong_rank(RAD_F32, {1, 2, 256});
+    A rank; rank.t(t).t(wrong_rank).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", rank), RAD_E_SHAPE);
+}
+
 /* gather_rows2: idx >= 0 reads a, idx < 0 reads b[-1 - idx], and a row past either source is
  * zeros. */
 TEST(gather_rows2_reads_two_sources_by_the_index_sign) {
@@ -7173,6 +7263,20 @@ TEST(gelu_tanh_is_the_tanh_approximation) {
     }
 }
 
+TEST(gelu_umt5_preserves_wan_bf16_rounding) {
+    const std::vector<float> input = {-4, -3.125f, -2.5f, -1.75f, -1.25f, -.875f, -.375f, 0,
+                                      .125f, .625f, 1.25f, 2.5f, 3.125f, 4};
+    // Official Wan GELU.forward on PyTorch 2.8.0 with BF16 input.
+    const std::vector<float> expected = {-0.0f, -0.0f, -.0146484375f, -.07177734375f, -.134765625f,
+                                         -.16796875f, -.1328125f, 0, .06884765625f, .458984375f,
+                                         1.109375f, 2.484375f, 3.125f, 4};
+    T x(RAD_BF16, {2, 7}); x.f(input);
+    T y(RAD_BF16, {2, 7});
+    A a; a.t(x).t(y).i("M", 2).i("n", 7).s("dtype", "bf16");
+    CHECK_OK(run("gelu_umt5", a));
+    for (size_t i = 0; i < expected.size(); ++i) CHECK_EQ(y.at(i), expected[i]);
+}
+
 /* scatter_add_rows adds into the indexed rows, skips a negative index, and refuses an index past
  * the destination before writing anything. */
 TEST(scatter_add_rows_accumulates_skips_and_refuses) {
@@ -7443,6 +7547,62 @@ TEST(flow_x0_step_blends_toward_the_clean_estimate_in_f32_steps) {
     CHECK_EQ(x.at(1), -2.275f);
 }
 
+TEST(flow_unipc_step_updates_two_inout_views_and_refuses_overlapping_rows) {
+    T v(RAD_BF16, { 2, 1 }), coeff(RAD_F32, { 8 });
+    T history(RAD_F32, { 2, 5 }), x(RAD_F32, { 2, 2 });
+    history.t.shape[1] = 3;
+    x.t.shape[1] = 1;
+    x.f({ 1, 9, 1, 9 });
+    history.f({ 0, 0, 0, 8, 8, 0, 0, 0, 8, 8 });
+    auto step = [&] {
+        A a;
+        a.t(v).t(coeff).t(history).t(x).i("M", 2).i("n", 1).s("dtype", "f32");
+        return run("flow_unipc_step", a);
+    };
+    v.f({ .5f, .5f });
+    coeff.f({ .5f, 0, 0, 0, 0, .5f, .5f, 0 });
+    CHECK_OK(step());
+    CHECK_EQ(x.at(0), .875f);
+    CHECK_EQ(history.at(0), 1.0f);
+    CHECK_EQ(history.at(1), .75f);
+    v.f({ 1, 1 });
+    coeff.f({ .25f, .5f, .5f, 0, .25f, .25f, .75f, -.125f });
+    CHECK_OK(step());
+    for (int row = 0; row < 2; ++row) {
+        CHECK_EQ(x.at(2 * row), .6640625f);
+        CHECK_EQ(x.at(2 * row + 1), 9.0f);
+        CHECK_EQ(history.at(5 * row), .84375f);
+        CHECK_EQ(history.at(5 * row + 1), .625f);
+        CHECK_EQ(history.at(5 * row + 2), .75f);
+        CHECK_EQ(history.at(5 * row + 3), 8.0f);
+        CHECK_EQ(history.at(5 * row + 4), 8.0f);
+    }
+    history.t.stride[0] = 2;
+    CHECK_EQ(step(), RAD_E_STRIDE);
+    history.t.rank = 3;
+    CHECK_EQ(step(), RAD_E_SHAPE);
+}
+
+TEST(flow_unipc_step_blends_classifier_free_guidance_before_updating_history) {
+    T v(RAD_F32, {1, 1}), coeff(RAD_F32, {8}), history(RAD_F32, {1, 3});
+    T x(RAD_F32, {1, 1}), negative(RAD_F32, {1, 1}), guidance(RAD_F32, {1});
+    v.f({1.0f});
+    negative.f({.5f});
+    guidance.f({3.0f});
+    coeff.f({.5f, 0, 0, 0, 0, .5f, .5f, 0});
+    history.f({0, 0, 0});
+    x.f({3.0f});
+    A incomplete;
+    incomplete.t(v).t(coeff).t(history).t(x).t(negative).i("M", 1).i("n", 1).s("dtype", "f32");
+    CHECK_EQ(run("flow_unipc_step", incomplete), RAD_E_INVAL);
+    A guided;
+    guided.t(v).t(coeff).t(history).t(x).t(negative).t(guidance)
+        .i("M", 1).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("flow_unipc_step", guided));
+    CHECK_EQ(x.at(0), 2.5f);
+    CHECK_EQ(history.at(1), 2.0f);
+}
+
 /* patch_unfold: patch rows (f, i, j) of columns (c, a, b, d) dealt to voxel rows (t, yy, xx) and
  * denormalised, f32(f32(x mul[c]) + add[c]) with the lists in f32. Two 1 x 2 x 2 patches side by
  * side (geom (1, 1, 2)), x[p][col] = 100 p + col: voxel row (yy, xx) reads patch xx / 2 at column
@@ -7608,6 +7768,132 @@ TEST(vtile_stitch_blends_down_then_across_and_carries_the_overlap) {
     CHECK(s2.prev.mem == before);
 }
 
+TEST(wan_rotary_resets_the_frequency_ladder_on_each_axis) {
+    T geom(RAD_I32, {3}); geom.n({2, 4, 6});
+    T table(RAD_F32, {12, 128});
+    A make; make.t(geom).t(table).i("M", 12).s("dtype", "f32");
+    CHECK_OK(run("wan_rope_table", make));
+    // Row 11 is patch (1, 1, 2). Pair zero of each axis has frequency 1.
+    CHECK_EQ(table.at(11 * 128), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 44), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 86), static_cast<float>(std::cos(2.0)));
+    CHECK_NEAR(table.at(11 * 128 + 2), std::cos(std::pow(10000.0, -1.0 / 22.0)), 1e-7);
+    CHECK_NEAR(table.at(11 * 128 + 46), std::cos(std::pow(10000.0, -1.0 / 21.0)), 1e-7);
+
+    std::vector<float> qv(12 * 128), kv(qv);
+    for (size_t i = 0; i < qv.size(); i += 2) { qv[i] = 1.0f; kv[i + 1] = 1.0f; }
+    T q(RAD_BF16, {12, 128}); q.f(qv);
+    T k(RAD_BF16, {12, 128}); k.f(kv);
+    A rotate; rotate.t(q).t(k).t(table).i("M", 12).i("heads", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_rope", rotate));
+    CHECK_EQ(q.at(0), 1.0f); CHECK_EQ(q.at(1), 0.0f);
+    CHECK_EQ(q.at(11 * 128 + 44), .5390625f);
+    CHECK_EQ(q.at(11 * 128 + 45), .83984375f);
+    CHECK_EQ(k.at(11 * 128 + 86), -.91015625f);
+    CHECK_EQ(k.at(11 * 128 + 87), -.416015625f);
+}
+
+TEST(wan_unpatch_preserves_spatial_order_and_emits_float_velocity) {
+    T geom(RAD_I32, {3}); geom.n({2, 2, 4});
+    T x(RAD_BF16, {4, 8}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                               16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31});
+    T y(RAD_F32, {16, 2});
+    A a; a.t(x).t(geom).t(y).i("M", 4).i("n", 2).s("dtype", "bf16");
+    CHECK_OK(run("wan_unpatch", a));
+    const float expected[] = {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+                              16, 17, 18, 19, 24, 25, 26, 27, 20, 21, 22, 23, 28, 29, 30, 31};
+    for (int i = 0; i < 32; ++i) CHECK_EQ(y.at(i), expected[i]);
+    geom.n({2, 3, 4});
+    CHECK_EQ(run("wan_unpatch", a), RAD_E_SHAPE);
+}
+
+TEST(wan_block_modulation_and_gates_select_the_first_frame_row) {
+    T x(RAD_F32, {2, 2}); x.f({1, -1, 1, -1});
+    T time(RAD_F32, {2, 12}); time.f({1, 1, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0,
+                                      2, 2, 1, 1, 3, 4, 0, 0, 0, 0, 0, 0});
+    T table(RAD_F32, {1, 6, 2}); table.f({0, 0, 0, 0, .5f, -.5f, 0, 0, 0, 0, 0, 0});
+    T split(RAD_I32, {1}); split.n({1});
+    T bf(RAD_BF16, {2, 2});
+    A norm; norm.t(x).t(time).t(table).t(split).t(bf).i("M", 2).i("n", 2)
+        .i("group", 0).d("eps", 1e-6).i("round_norm", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_mod_norm", norm));
+    CHECK_EQ(bf.at(0), 2.0f); CHECK_EQ(bf.at(1), 0.0f);
+    CHECK_EQ(bf.at(2), 4.0f); CHECK_EQ(bf.at(3), 0.0f);
+    T update(RAD_BF16, {2, 2}); update.f({.25f, .5f, .25f, .5f});
+    A gated; gated.t(x).t(update).t(time).t(table).t(split).i("M", 2).i("n", 2)
+        .i("gate", 2).s("dtype", "f32");
+    CHECK_OK(run("wan_gated_add", gated));
+    CHECK_EQ(x.at(0), 1.375f); CHECK_EQ(x.at(1), -.25f);
+    CHECK_EQ(x.at(2), 1.875f); CHECK_EQ(x.at(3), .75f);
+
+    T head_time(RAD_F32, {1, 2}); head_time.f({1, 2});
+    T head_table(RAD_F32, {1, 2, 2}); head_table.f({3, 4, 5, 6});
+    T state(RAD_F32, {1, 2}); state.f({3, 3});
+    T head(RAD_F32, {1, 2});
+    A out; out.t(state).t(head_time).t(head_table).tnull().t(head).i("M", 1).i("n", 2)
+        .i("group", -1).s("dtype", "f32");
+    CHECK_OK(run("wan_mod_norm", out));
+    CHECK_EQ(head.at(0), 4.0f); CHECK_EQ(head.at(1), 6.0f);
+}
+
+TEST(wan_vae_frame_cu_separates_each_spatial_plane) {
+    T dims(RAD_I32, {3}); dims.n({2, 2, 3});
+    T offsets(RAD_I32, {3});
+    A a; a.t(dims).t(offsets).i("M", 3);
+    CHECK_OK(run("wan_vae_frame_cu", a));
+    const auto* cu = static_cast<const int32_t*>(offsets.t.data);
+    CHECK_EQ(cu[0], 0); CHECK_EQ(cu[1], 6); CHECK_EQ(cu[2], 12);
+}
+
+TEST(wan_vae_norm_rounds_length_before_division) {
+    T x(RAD_BF16, {1, 8}); x.f({6, 1, 0, 0, 0, 0, 0, 0});
+    T gain(RAD_BF16, {8, 1, 1, 1}); gain.f(std::vector<float>(8, 1.0f));
+    T y(RAD_BF16, {1, 8});
+    A a; a.t(x).t(gain).t(y).i("M", 1).i("n", 8).i("round_length", 1)
+        .s("act", "none").s("dtype", "bf16");
+    CHECK_OK(run("l2norm_chan", a));
+    CHECK_EQ(y.at(0), 2.78125f); CHECK_EQ(y.at(1), 0.46484375f);
+}
+
+TEST(wan_vae_decoder_history_tracks_short_and_long_chunks) {
+    T x(RAD_BF16, {2, 2}); x.f({1, 2, 3, 4});
+    T history(RAD_BF16, {4, 2}); history.f({33, 33, 33, 33, 33, 33, 33, 33});
+    T windows(RAD_BF16, {2, 6});
+    A reset; reset.t(x).t(history).t(windows).i("M", 2).i("temporal", 1).i("reset", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_history", reset));
+    const float expected_windows[] = {0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4};
+    for (int i = 0; i < 12; ++i) CHECK_EQ(windows.at(i), expected_windows[i]);
+    CHECK_EQ(history.at(0), 0.0f); CHECK_EQ(history.at(4), 1.0f);
+
+    T next(RAD_BF16, {4, 2}); next.f({5, 6, 7, 8, 9, 10, 11, 12});
+    T volume(RAD_BF16, {8, 2});
+    A reuse; reuse.t(next).t(history).t(volume).i("M", 4).i("temporal", 0).i("reset", 0).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_history", reuse));
+    for (int i = 0; i < 4; ++i) CHECK_EQ(volume.at(i), 0.0f);
+    for (int i = 4; i < 16; ++i) CHECK_EQ(volume.at(i), static_cast<float>(i - 3));
+    for (int i = 0; i < 8; ++i) CHECK_EQ(history.at(i), static_cast<float>(i + 5));
+}
+
+TEST(wan_vae_temporal_shuffle_and_shortcut_keep_reference_order) {
+    T grid(RAD_I32, {3}); grid.n({2, 1, 2});
+    T x(RAD_BF16, {4, 4}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    T y(RAD_BF16, {8, 2});
+    A shuffle; shuffle.t(x).t(grid).t(y).i("M", 4).i("cin", 4).i("cout", 2)
+        .i("st", 2).i("s", 1).i("drop", 0).i("temporal", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_expand", shuffle));
+    const float expected[] = {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15};
+    for (int i = 0; i < 16; ++i) CHECK_EQ(y.at(i), expected[i]);
+
+    T shortcut_grid(RAD_I32, {3}); shortcut_grid.n({1, 1, 1});
+    T input(RAD_BF16, {1, 4}); input.f({1, 2, 3, 4});
+    T cropped(RAD_BF16, {4, 1});
+    A shortcut; shortcut.t(input).t(shortcut_grid).t(cropped).i("M", 1).i("cin", 4).i("cout", 1)
+        .i("st", 2).i("s", 2).i("drop", 1).i("temporal", 0).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_expand", shortcut));
+    CHECK_EQ(cropped.at(0), 3.0f); CHECK_EQ(cropped.at(1), 3.0f);
+    CHECK_EQ(cropped.at(2), 4.0f); CHECK_EQ(cropped.at(3), 4.0f);
+}
+
 /* grid_pos3: token (t, i, j) of each `period`-row tile at scale (2 (c + 0.5) / n - 1) per axis, in
  * f32 steps, the period's last rows (registers) at 0. Tiles of 2 x 3 x 4 every 26 rows, scale 2,
  * into a [3, 30] view of a [3, 32] plane: rows 30 and 31 of each component are not written.
@@ -7663,6 +7949,20 @@ TEST(vtile_plan_plans_one_frame_the_way_vae_py_splits_it) {
                                1, 16, 12,   1, 8, 6,   1, 8, 6 };
     for (int i = 0; i < 22; ++i) CHECK_EQ(y1.iat(i), lone[i]);
 
+    /* A padded temporal clip uses the same spatial plan and two causal temporal downsamplers. */
+    T clip(RAD_I32, {3}); clip.n({17, 640, 320});
+    T yc(RAD_I32, {6, 22});
+    A ac; ac.t(clip).t(yc).i("M", 6).i("tile", 16).i("overlap", 4).i("ratio", 16);
+    CHECK_OK(run("vtile_plan", ac));
+    const int64_t temporal[6] = { 17, 17, 9, 5, 5, 5 };
+    for (int64_t tile = 0; tile < 6; ++tile)
+        for (int entry = 0; entry < 22; ++entry) {
+            const int64_t index = tile * 22 + entry;
+            const int64_t expected = entry >= 4 && (entry - 4) % 3 == 0
+                ? temporal[(entry - 4) / 3] : y.iat(index);
+            CHECK_EQ(yc.iat(index), expected);
+        }
+
     /* A 96 x 768 px plane: one short row band (6 latents) and 48 latents a row, split at 0, 10,
      * 21, 32 -- the slack of 4 going to the overlaps one at a time round-robin (6, 5, 5),
      * so the last column still runs the full 16 latents to the plane's edge. A short band only
@@ -7702,6 +8002,31 @@ TEST(vtile_plan_plans_one_frame_the_way_vae_py_splits_it) {
     T ys(RAD_I32, {5, 22});
     A g; g.t(geom).t(ys).i("M", 33).i("tile", 16).i("overlap", 4).i("ratio", 16);
     CHECK_EQ(run("vtile_plan", g), RAD_E_SHAPE);
+}
+
+TEST(vtile_round_trip_keeps_temporal_planes_separate) {
+    constexpr int64_t frames = 5, side = 6, tile = 4, overlap = 2, channels = 3;
+    constexpr int64_t canvas_rows = frames * side * side;
+    constexpr int64_t tile_rows = frames * tile * tile;
+    T geom(RAD_I32, {3}); geom.n({frames, side, side});
+    T pixels(RAD_F32, {canvas_rows, channels});
+    std::vector<float> data(canvas_rows * channels);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = (float)i;
+    pixels.f(data);
+    T tiled(RAD_F32, {4 * tile_rows, channels});
+    A crop;
+    crop.t(pixels).t(geom).t(tiled).i("M", 4 * tile_rows).i("tile", tile)
+        .i("overlap", overlap).i("ratio", 1);
+    CHECK_OK(run("vtile_crop", crop));
+    /* The second tile starts at x = 2 and holds all five frames contiguously. */
+    CHECK_EQ(tiled.at(tile_rows * channels), 2 * channels);
+    CHECK_EQ(tiled.at((tile_rows + tile * tile) * channels), (side * side + 2) * channels);
+    T result(RAD_F32, {canvas_rows, channels});
+    A join;
+    join.t(tiled).t(geom).t(result).i("M", canvas_rows).i("tile", tile)
+        .i("overlap", overlap).i("n", channels).s("dtype", "f32");
+    CHECK_OK(run("vtile_join", join));
+    for (size_t i = 0; i < data.size(); ++i) CHECK_EQ(result.at((int64_t)i), data[i]);
 }
 
 /* A 20 x 20 px plane in ratio 4, tiles of 3 latents (12 px) with overlap 1: each axis splits at
@@ -7833,6 +8158,23 @@ TEST(vtile_join_blends_raw_neighbours_down_then_across) {
     CHECK_EQ(qx(3, 5), 16.0f);   CHECK_EQ(qx(3, 6), 18.0f);   /* left fully at lx = 0; half up at 1 */
     CHECK_EQ(qx(5, 2), 8.0f);    CHECK_EQ(qx(5, 3), 12.0f);   /* fully left at lx = 0, half at 1 */
     CHECK_EQ(qx(0, 8), 4.0f);    CHECK_EQ(qx(4, 2), 8.0f);    /* past every blend: own or fully left */
+
+    /* A second plane with distinct tile moments must blend only its own neighbours. */
+    T temporal_geom(RAD_I32, {3}); temporal_geom.n({2, 6, 6});
+    T temporal_tiles(RAD_BF16, {128, 1});
+    std::vector<float> tile_values(128);
+    for (int tile = 0; tile < 4; ++tile)
+        for (int frame = 0; frame < 2; ++frame)
+            std::fill_n(tile_values.begin() + (tile * 2 + frame) * 16, 16,
+                        base[tile] * (frame + 1));
+    temporal_tiles.f(tile_values);
+    T temporal_canvas(RAD_BF16, {72, 1});
+    A temporal;
+    temporal.t(temporal_tiles).t(temporal_geom).t(temporal_canvas).i("M", 72)
+        .i("tile", 4).i("overlap", 2).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("vtile_join", temporal));
+    CHECK_EQ(temporal_canvas.at(3 * 6 + 3), 18.0f);
+    CHECK_EQ(temporal_canvas.at(36 + 3 * 6 + 3), 36.0f);
 
     /* A canvas below one tile is a lone tile: the join is the copy. */
     T g1(RAD_I32, {3}); g1.n({1, 3, 3});
@@ -10520,6 +10862,10 @@ std::vector<Geo> geometries() {
                                          .i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
+        /* One sequence with text, reference and target rows, split evenly by mode_cu. */
+        G("attn_dense_ref", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 0)
+                                    .s("dtype", "f32")),
+        G("attn_umt5", "M", 6, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
         /* One-row segments, so M is also the segment count (n_seq, the description's hint for
          * cu_seqlens). The real grids are op_sam_attn_*'s. */
         G("sam_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("grid_h", 1)
@@ -10623,6 +10969,8 @@ std::vector<Geo> geometries() {
         G("gate_add", "M", 4, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).d("scale", 1000.0)
                                     .d("max_period", 10000.0).d("clamp_min", 0.3).s("dtype", "f32")),
+        G("timestep_embed_f64", "M", 3, a.i("M", R).i("n", 8).d("max_period", 10000.0)
+                                        .s("dtype", "f32")),
         /* The curve form: the same op over a precomputed table instead of the sinusoid. */
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).i("curve", 5).d("clamp_min", 0.3)
                                     .s("dtype", "f32")),
@@ -10645,6 +10993,7 @@ std::vector<Geo> geometries() {
         G("s2d_avg_add", "M", 16, a.i("M", R).i("cin", 2).i("cout", 4).i("ft", 1).s("dtype", "bf16")),
         G("to_rgba8", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("gelu_tanh", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("gelu_umt5", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("gelu_quick", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("scatter_add_rows", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("attn_prefix_self", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
@@ -10717,6 +11066,7 @@ std::vector<Geo> geometries() {
         G("rms_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).i("gated", 1).s("dtype", "bf16")),
         G("flow_x0_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("flow_res_multistep", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("flow_unipc_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("patch_unfold", "M", 32, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
                                    .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
         G("vtile_gather", "M", 60, a.i("M", R).i("n", 8).i("tile", 2).i("overlap", 1)
@@ -10728,6 +11078,15 @@ std::vector<Geo> geometries() {
                                     .s("std", "0.229 0.224 0.225")),
         G("grid_pos3", "M", 40, a.i("M", R).i("T", 2).i("H", 3).i("W", 4).i("period", 27)
                                 .d("scale", 1.0)),
+        G("wan_rope_table", "M", 16, a.i("M", R).s("dtype", "f32")),
+        G("wan_rope", "M", 8, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
+        G("wan_mod_norm", "M", 4, a.i("M", R).i("n", 8).i("group", 3).s("dtype", "bf16")),
+        G("wan_gated_add", "M", 4, a.i("M", R).i("n", 8).i("gate", 5).s("dtype", "f32")),
+        G("wan_unpatch", "M", 16, a.i("M", R).i("n", 2).s("dtype", "bf16")),
+        G("wan_vae_frame_cu", "M", 3, a.i("M", R)),
+        G("wan_vae_history", "M", 4, a.i("M", R).i("temporal", 1).i("reset", 0).s("dtype", "bf16")),
+        G("wan_vae_expand", "M", 8, a.i("M", R).i("cin", 8).i("cout", 8).i("st", 2)
+                                       .i("s", 2).i("drop", 1).i("temporal", 0).s("dtype", "bf16")),
         G("snake_aa", "M", 8, a.i("M", R).i("n", 8).i("ratio", 2).i("k", 12).s("dtype", "f32")),
         /* A 3 x 3 x 3 grid in boxes of 2 and two dense segments of its 27 rows; attn_vsa at
          * k = 1, the one selection its description draws. */

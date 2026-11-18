@@ -459,7 +459,7 @@ AVX_KERNEL(vtile_stitch) {
  * The plan, the cut and the blend of vae.py's `tiled_encode` (libref's section comment). */
 
 /* ------------------------------------------------------------------ vtile_plan */
-/* The plan one frame's encode runs over (libref): geom = (clip, H, W) the frame's extent in
+/* The plan one volume's encode runs over (libref): geom = (clip, H, W) the volume's extent in
  * pixels, split by split_tiles_axis over the spatial axes in latent units; row t of y (i32
  * [M, 22]) the tile's first pixel, its pixel extent, and the six level volumes. */
 /* The tile count comes from G; the ranged `M` is a ceiling only (band_rows). */
@@ -470,6 +470,7 @@ AVX_KERNEL(vtile_plan) {
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(G) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(at(G, 0), 1);
     const int64_t H = at(G, 1), W = at(G, 2);
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
@@ -479,6 +480,7 @@ AVX_KERNEL(vtile_plan) {
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
     const int64_t M = band_rows(nh * nw, band);
     if (M <= 0 || rows_of(Y, 22) < M) return RAD_E_SHAPE;
+    const int64_t half = 1 + (frames - 1) / 2, quarter = 1 + (frames - 1) / 4;
     const int64_t* psy = sy.data(), *psx = sx.data();
     AVX_PARALLEL_FOR_IF(M >= AVX_PAR_MIN)
     for (int64_t t = 0; t < M; ++t) {
@@ -487,16 +489,16 @@ AVX_KERNEL(vtile_plan) {
         const int64_t tw = std::min(tile, W / ratio - psx[(size_t)j]) * ratio;
         const int64_t yb = rowoff(Y, t, 22), ys = laststride(Y);
         const int64_t v[22] = { psy[(size_t)i] * ratio, psx[(size_t)j] * ratio, th, tw,
-                                1, th, tw,   1, th / 2, tw / 2,   1, th / 4, tw / 4,
-                                1, th / 8, tw / 8,   1, th / 16, tw / 16,   1, th / 16, tw / 16 };
+                                frames, th, tw, frames, th / 2, tw / 2, half, th / 4, tw / 4,
+                                quarter, th / 8, tw / 8, quarter, th / 16, tw / 16,
+                                quarter, th / 16, tw / 16 };
         for (int64_t c = 0; c < 22; ++c) st_int_dt(Y->dtype, Y->data, yb + c * ys, v[c]);
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ vtile_crop */
-/* One frame's pixel plane cut into the plan's tiles (libref): y f32 [M, 3] holds the tiles'
- * pixels tile-major, M the tiles' pixel count. Only the row the tile stands on is read. */
+/* The frames cut into the plan's spatial tiles (libref). All frames of each tile are contiguous. */
 AVX_KERNEL(vtile_crop) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *G = &a->t[1], *Y = &a->t[2];
@@ -504,7 +506,9 @@ AVX_KERNEL(vtile_crop) {
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(G) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(at(G, 0), 1);
     const int64_t H = at(G, 1), W = at(G, 2);
+    const int64_t plane = H * W;
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
         !split_tiles_axis(H / ratio, tile, overlap, &sy, &oy) ||
@@ -519,17 +523,24 @@ AVX_KERNEL(vtile_crop) {
                 off[(size_t)(i * nw + j)] +
                 th * std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
     }
-    const int64_t M = band_rows(off.back(), band);
-    if (M <= 0 || rows_of(X, 3) < H * W || rows_of(Y, 3) < M) return RAD_E_SHAPE;
+    if (plane > rows_of(X, 3) / frames || off.back() > INT64_MAX / frames)
+        return RAD_E_SHAPE;
+    const int64_t M = band_rows(frames * off.back(), band);
+    if (M <= 0 || rows_of(Y, 3) < M) return RAD_E_SHAPE;
     const int64_t* psy = sy.data(), *psx = sx.data(), *poff = off.data();
     AVX_PARALLEL_FOR_IF(M * 3 >= AVX_PAR_MIN)
     for (int64_t r = 0; r < M; ++r) {
+        const int64_t tile_row = r / frames;
         const int64_t t =
-            (int64_t)(std::upper_bound(poff, poff + nh * nw + 1, r) - poff) - 1;
+            (int64_t)(std::upper_bound(poff, poff + nh * nw + 1, tile_row) - poff) - 1;
         const int64_t i = t / nw, j = t % nw;
         const int64_t tw = std::min(tile, W / ratio - psx[(size_t)j]) * ratio;
-        const int64_t k = r - poff[t];
-        const int64_t src = (psy[(size_t)i] * ratio + k / tw) * W + psx[(size_t)j] * ratio + k % tw;
+        const int64_t tile_plane = std::min(tile, H / ratio - psy[(size_t)i]) * ratio * tw;
+        const int64_t k = r - frames * poff[t];
+        const int64_t spatial_row = k % tile_plane;
+        const int64_t src = (k / tile_plane) * plane +
+                            (psy[(size_t)i] * ratio + spatial_row / tw) * W +
+                            psx[(size_t)j] * ratio + spatial_row % tw;
         const int64_t xb = rowoff(X, src, 3), yb = rowoff(Y, r, 3), xs = laststride(X);
         const int64_t ys = laststride(Y);
         for (int64_t c = 0; c < 3; ++c) stt(Y, yb + c * ys, ldt(X, xb + c * xs));
@@ -538,8 +549,8 @@ AVX_KERNEL(vtile_crop) {
 }
 
 /* ------------------------------------------------------------------ vtile_join */
-/* The tiles' moments blended into one latent plane (libref): unblended neighbours, the top blend
- * before the left one, every product and sum rounded to x's dtype. */
+/* Blend tiles into each frame of the latent volume (libref), using unblended neighbours in that
+ * frame and rounding every product and sum to x's dtype. */
 AVX_KERNEL(vtile_join) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *G = &a->t[1], *Y = &a->t[2];
@@ -547,13 +558,16 @@ AVX_KERNEL(vtile_join) {
     const int64_t overlap = p_int(a, "overlap", 0), n = p_int(a, "n", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || numel(G) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(at(G, 0), 1);
     const int64_t H = at(G, 1), W = at(G, 2);
+    const int64_t plane = H * W;
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || !split_tiles_axis(H, tile, overlap, &sy, &oy) ||
         !split_tiles_axis(W, tile, overlap, &sx, &ox))
         return RAD_E_SHAPE;
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
-    const int64_t M = band_rows(H * W, band);
+    if (plane > INT64_MAX / frames) return RAD_E_SHAPE;
+    const int64_t M = band_rows(frames * plane, band);
     std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
     for (int64_t i = 0; i < nh; ++i) {
         const int64_t th = std::min(tile, H - sy[(size_t)i]);
@@ -561,7 +575,8 @@ AVX_KERNEL(vtile_join) {
             off[(size_t)(i * nw + j + 1)] =
                 off[(size_t)(i * nw + j)] + th * std::min(tile, W - sx[(size_t)j]);
     }
-    if (M <= 0 || rows_of(X, n) < off.back() || rows_of(Y, n) < M) return RAD_E_SHAPE;
+    if (M <= 0 || off.back() > rows_of(X, n) / frames || rows_of(Y, n) < M)
+        return RAD_E_SHAPE;
     /* The owner tile of every canvas row and column. */
     std::vector<int64_t> own_y((size_t)H), own_x((size_t)W);
     for (int64_t Yp = 0, i = 0; Yp < H; ++Yp) {
@@ -579,24 +594,26 @@ AVX_KERNEL(vtile_join) {
     const int64_t* psy = sy.data(), *psx = sx.data(), *poff = off.data();
     const int64_t* pown_y = own_y.data(), *pown_x = own_x.data();
     const int64_t xs = laststride(X), ys = laststride(Y);
-    auto T = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
-        const int64_t row = poff[i * nw + j] + ly * std::min(tile, W - psx[(size_t)j]) + lx;
+    auto fetch = [&](int64_t frame, int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+        const int64_t height = std::min(tile, H - psy[(size_t)i]);
+        const int64_t width = std::min(tile, W - psx[(size_t)j]);
+        const int64_t row = frames * poff[i * nw + j] + (frame * height + ly) * width + lx;
         return ldt(X, rowoff(X, row, n) + c * xs);
     };
     AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
     for (int64_t r = 0; r < M; ++r) {
-        const int64_t Yp = r / W, X0 = r % W;
+        const int64_t frame = r / plane, Yp = (r % plane) / W, X0 = r % W;
         const int64_t i = pown_y[Yp], j = pown_x[X0];
         const int64_t ly = Yp - psy[(size_t)i], lx = X0 - psx[(size_t)j];
         const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0, eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
         const int64_t yb = rowoff(Y, r, n);
         for (int64_t c = 0; c < n; ++c) {
-            float v = T(i, j, ly, lx, c);
+            float v = fetch(frame, i, j, ly, lx, c);
             if (ly < ev)
-                v = rd(rd(T(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                v = rd(rd(fetch(frame, i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
                        rd(v * wb(ly, ev)));
             if (lx < eh)
-                v = rd(rd(T(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                v = rd(rd(fetch(frame, i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
                        rd(v * wb(lx, eh)));
             stt(Y, yb + c * ys, v);
         }

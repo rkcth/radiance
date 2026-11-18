@@ -13,6 +13,8 @@
 #include "ref_common.h"
 #include "ref_ops.h"
 #include "rad_philox.h"
+#include "rad_wan_dit.h"
+#include "rad_wan_vae.h"
 
 #include <algorithm>
 #include <vector>
@@ -153,6 +155,216 @@ int ref_patch_fold(const RadArgs* a, RadStream) {
                     ldt(x, xb + c * xs) * mul[(size_t)c] + add[(size_t)c]);
         }
     }
+    return RAD_OK;
+}
+
+int ref_wan_rope_table(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *grid = &a->t[0], *table = &a->t[1];
+    RAD_REF_TRY(check_grid(grid));
+    const auto* dims = static_cast<const int32_t*>(grid->data);
+    int64_t height, width, rows;
+    if (!latent_grid(dims, height, width, rows)) return RAD_E_SHAPE;
+    RAD_REF_TRY(check_matrix(table, RAD_F32, rows, head_width));
+    auto* out = static_cast<float*>(table->data);
+    double inv[pairs];
+    for (int pair = 0; pair < pairs; ++pair) {
+        const int axis = pair_axis(pair);
+        const int count = axis == 0 ? time_pairs : spatial_pairs;
+        inv[pair] = 1.0 / std::pow(10000.0, (double)pair_in_axis(pair, axis) / count);
+    }
+    REF_PAR_FOR(rows * head_width)
+    for (int64_t row = 0; row < rows; ++row)
+        for (int pair = 0; pair < pairs; ++pair) {
+            const double angle = coordinate(row, pair_axis(pair), height, width) * inv[pair];
+            float* dst = out + row * table->stride[0] + 2 * pair;
+            dst[0] = static_cast<float>(std::cos(angle));
+            dst[1] = static_cast<float>(std::sin(angle));
+        }
+    return RAD_OK;
+}
+
+int ref_wan_rope(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *table = &a->t[2];
+    const int64_t rows = q->shape[0], heads = p_int(a, "heads", 0);
+    if (heads < 1 || heads > 128) return RAD_E_SHAPE;
+    if (q->dtype != RAD_F32 && q->dtype != RAD_BF16) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(q, q->dtype, rows, heads * head_width));
+    RAD_REF_TRY(check_matrix(k, q->dtype, rows, heads * head_width));
+    RAD_REF_TRY(check_matrix(table, RAD_F32, rows, head_width));
+    REF_PAR_FOR(rows * heads * head_width)
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto* cs = static_cast<const float*>(table->data) + row * table->stride[0];
+        for (const RadTensor* x : {q, k})
+            for (int64_t h = 0; h < heads; ++h)
+                for (int i = 0; i < head_width; i += 2) {
+                    const int64_t off = row * x->stride[0] + h * head_width + i;
+                    const float re = ldt(x, off), im = ldt(x, off + 1);
+                    stt(x, off, re * cs[i] - im * cs[i + 1]);
+                    stt(x, off + 1, im * cs[i] + re * cs[i + 1]);
+                }
+    }
+    return RAD_OK;
+}
+
+int ref_wan_mod_norm(const RadArgs* a, RadStream) {
+    if (!have(a, 3) || !t_in(a, 4)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *x = &a->t[0], *time = &a->t[1], *table = &a->t[2];
+    const RadTensor *split = t_in(a, 3), *y = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), rows = x->shape[0];
+    const int64_t group = p_int(a, "group", 0);
+    const bool head = group == -1, round = p_int(a, "round_norm", 0) != 0;
+    const float eps = p_f32(a, "eps", 1e-6f);
+    if (n < 1 || n > 4096 || (group != -1 && group != 0 && group != 3) ||
+        !(eps > 0) || !std::isfinite(eps)) return RAD_E_SHAPE;
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(x, RAD_F32, rows, n));
+    RAD_REF_TRY(check_matrix(y, y->dtype, rows, n));
+    RAD_REF_TRY(check_modulation(time, table, split, n, head));
+    const int64_t first = split ? ldi(split, 0) : rows;
+    if (first < 0 || first > rows) return RAD_E_SHAPE;
+    const int64_t shift_row = head ? 0 : group;
+    const int64_t scale_row = head ? 0 : group + 1;
+    const auto* weights = static_cast<const float*>(table->data) + shift_row * n;
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        const auto* row = static_cast<const float*>(x->data) + r * x->stride[0];
+        const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+        float mean = 0.0f, variance = 0.0f;
+        for (int64_t c = 0; c < n; ++c) mean += row[c];
+        mean /= static_cast<float>(n);
+        for (int64_t c = 0; c < n; ++c) {
+            const float centered = row[c] - mean;
+            variance += centered * centered;
+        }
+        const float inverse = 1.0f / std::sqrt(variance / static_cast<float>(n) + eps);
+        for (int64_t c = 0; c < n; ++c) {
+            const float norm = (row[c] - mean) * inverse;
+            const float scale = weights[n + c] + mod[scale_row * n + c];
+            const float shift = weights[c] + mod[shift_row * n + c];
+            stt(y, r * y->stride[0] + c, (round ? round_dt(RAD_BF16, norm) : norm) * (1.0f + scale) + shift);
+        }
+    }
+    return RAD_OK;
+}
+
+int ref_wan_gated_add(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *x = &a->t[0], *update = &a->t[1];
+    const RadTensor *time = t_in(a, 2), *table = t_in(a, 3), *split = t_in(a, 4);
+    const int64_t n = p_int(a, "n", 0), rows = x->shape[0], gate = p_int(a, "gate", -1);
+    const bool gated = gate != -1;
+    if (n < 1 || n > 4096 || (gated && gate != 2 && gate != 5)) return RAD_E_SHAPE;
+    if (gated ? (!time || !table) : (time || table || split)) return RAD_E_INVAL;
+    RAD_REF_TRY(check_matrix(x, RAD_F32, rows, n));
+    RAD_REF_TRY(check_matrix(update, RAD_BF16, rows, n));
+    if (gated) RAD_REF_TRY(check_modulation(time, table, split, n, false));
+    const int64_t first = split ? ldi(split, 0) : rows;
+    if (first < 0 || first > rows) return RAD_E_SHAPE;
+    auto* state = static_cast<float*>(x->data);
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < n; ++c) {
+            float value = ldt(update, r * update->stride[0] + c);
+            if (gated) {
+                const int64_t off = gate * n + c;
+                const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+                value *= static_cast<const float*>(table->data)[off] + mod[off];
+            }
+            state[r * x->stride[0] + c] += value;
+        }
+    return RAD_OK;
+}
+
+int ref_wan_vae_frame_cu(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *geom = &a->t[0], *y = &a->t[1];
+    RAD_REF_TRY(rad_wan_dit::check_grid(geom));
+    if (y->dtype != RAD_I32) return RAD_E_DTYPE;
+    if (y->rank != 1 || y->shape[0] < 2 || y->shape[0] > rad_wan_vae::max_chunk_frames + 1)
+        return RAD_E_SHAPE;
+    if (y->stride[0] != 1) return RAD_E_STRIDE;
+    int64_t plane = 0;
+    if (!rad_wan_vae::frame_plane(static_cast<const int32_t*>(geom->data), y->shape[0], plane))
+        return RAD_E_SHAPE;
+    auto* cu = static_cast<int32_t*>(y->data);
+    for (int32_t i = 0; i < y->shape[0]; ++i) cu[i] = static_cast<int32_t>(i * plane);
+    return RAD_OK;
+}
+
+int ref_wan_vae_history(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *history = &a->t[1], *out = &a->t[2];
+    const int64_t mode = p_int(a, "temporal", 0), reset = p_int(a, "reset", 0);
+    if ((mode != 0 && mode != 1) || (reset != 0 && reset != 1)) return RAD_E_INVAL;
+    int64_t plane, frames;
+    RAD_REF_TRY(rad_wan_vae::check_history(x, history, out, mode != 0, plane, frames));
+    const int64_t channels = x->shape[1];
+    const auto* src = static_cast<const uint16_t*>(x->data);
+    auto* cache = static_cast<uint16_t*>(history->data);
+    auto* dest = static_cast<uint16_t*>(out->data);
+    REF_PAR_FOR(plane * channels)
+    for (int64_t i = 0; i < plane * channels; ++i) {
+        const int64_t pixel = i / channels, c = i % channels;
+        if (mode)
+            rad_wan_vae::history_cell<true>(src, cache, dest, pixel, c, plane, frames,
+                                            x->stride[0], history->stride[0], out->stride[0], reset != 0);
+        else
+            rad_wan_vae::history_cell<false>(src, cache, dest, pixel, c, plane, frames,
+                                             x->stride[0], history->stride[0], out->stride[0], reset != 0);
+    }
+    return RAD_OK;
+}
+
+int ref_wan_vae_expand(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *geom = &a->t[1], *out = &a->t[2];
+    const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
+    const int64_t st = p_int(a, "st", 1), s = p_int(a, "s", 1), drop = p_int(a, "drop", 0);
+    const int64_t mode = p_int(a, "temporal", 0);
+    if (mode != 0 && mode != 1) return RAD_E_INVAL;
+    RAD_REF_TRY(rad_wan_dit::check_grid(geom));
+    RAD_REF_TRY(rad_wan_vae::check_expand(x, out, cin, cout, st, s, drop, mode != 0));
+    const auto* dims = static_cast<const int32_t*>(geom->data);
+    const int64_t rows = out->shape[0];
+    if (!rad_wan_vae::check_expand_grid(dims, x->shape[0], rows, st, s, drop))
+        return RAD_E_SHAPE;
+    const auto* input = static_cast<const uint16_t*>(x->data);
+    auto* output = static_cast<uint16_t*>(out->data);
+    REF_PAR_FOR(rows * cout)
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < cout; ++c) {
+            const int64_t at = rad_wan_vae::expand_offset(r, c, dims[1], dims[2], cin, cout,
+                                                          st, s, drop, mode != 0, x->stride[0]);
+            output[r * out->stride[0] + c] = input[at];
+        }
+    return RAD_OK;
+}
+
+int ref_wan_unpatch(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    using namespace rad_wan_dit;
+    const RadTensor *src = &a->t[0], *grid = &a->t[1], *dst = &a->t[2];
+    const int64_t channels = p_int(a, "n", 0);
+    RAD_REF_TRY(check_grid(grid));
+    if (channels < 1 || channels > 1024) return RAD_E_SHAPE;
+    const auto* dims = static_cast<const int32_t*>(grid->data);
+    int64_t height, width, rows;
+    if (!latent_grid(dims, height, width, rows)) return RAD_E_SHAPE;
+    if (src->dtype != RAD_F32 && src->dtype != RAD_BF16) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(src, src->dtype, rows, 4 * channels));
+    RAD_REF_TRY(check_matrix(dst, RAD_F32, 4 * rows, channels));
+    auto* out = static_cast<float*>(dst->data);
+    REF_PAR_FOR(4 * rows * channels)
+    for (int64_t row = 0; row < 4 * rows; ++row)
+        for (int64_t c = 0; c < channels; ++c)
+            out[row * dst->stride[0] + c] =
+                ldt(src, unpack_offset(row, c, height, width, channels, src->stride[0]));
     return RAD_OK;
 }
 
@@ -715,14 +927,14 @@ int ref_cond_aug(const RadArgs* a, RadStream) {
  * parameters. */
 
 /* ------------------------------------------------------------------ vtile_plan */
-/* The tiles of one frame of `geom` = (clip, H, W) pixels: split_tiles_axis over each spatial axis
+/* The tiles of a volume with `geom` = (clip, H, W) pixels: split_tiles_axis over each spatial axis
  * in latent units (`tile` a side, `overlap` the least blend, `ratio` pixels a latent), numbered
  * row-major. Row t of y (i32 [M, 22]):
  *
  *   [0] [1]     the tile's first pixel (y0, x0)
  *   [2] [3]     its pixel extent (th, tw): `tile` x ratio, except a lone short tile
- *   3 L + 4..6  level L's volume (1, th / 2^min(L, 4), tw / 2^min(L, 4)), L = 0..5: venc_geom's
- *               level layout for one frame (levels 4 and 5 share a size)
+ *   3 L + 4..6  level L's volume (time[L], th / 2^min(L, 4), tw / 2^min(L, 4)), L = 0..5
+ *               as in venc_geom. Levels 4 and 5 share a size.
  *
  * `M` is the band's bound, a ceiling only (band_rows); y must hold the tiles. */
 int ref_vtile_plan(const RadArgs* a, RadStream) {
@@ -732,6 +944,7 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(ldi(geom, 0), 1);
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
@@ -741,6 +954,7 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
     const int64_t M = band_rows(nh * nw, band);
     if (M <= 0 || rows_of(y, 22) < M) return RAD_E_SHAPE;
+    const int64_t half = 1 + (frames - 1) / 2, quarter = 1 + (frames - 1) / 4;
     REF_PAR_FOR(M)
     for (int64_t t = 0; t < M; ++t) {
         const int64_t i = t / nw, j = t % nw;
@@ -748,17 +962,18 @@ int ref_vtile_plan(const RadArgs* a, RadStream) {
         const int64_t tw = std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
         const int64_t yb = rowoff(y, t, 22), ys = laststride(y);
         const int64_t v[22] = { sy[(size_t)i] * ratio, sx[(size_t)j] * ratio, th, tw,
-                                1, th, tw,   1, th / 2, tw / 2,   1, th / 4, tw / 4,
-                                1, th / 8, tw / 8,   1, th / 16, tw / 16,   1, th / 16, tw / 16 };
+                                frames, th, tw, frames, th / 2, tw / 2, half, th / 4, tw / 4,
+                                quarter, th / 8, tw / 8, quarter, th / 16, tw / 16,
+                                quarter, th / 16, tw / 16 };
         for (int64_t c = 0; c < 22; ++c) st_int(y->dtype, y->data, yb + c * ys, v[c]);
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ vtile_crop */
-/* One frame's pixel plane cut into vtile_plan's tiles: x f32 [>= H W, 3] is the plane (pixel
- * (Y, X) at row Y W + X), geom = (clip, H, W) in pixels; y f32 [M, 3] holds the tiles' pixels
- * tile-major, each tile's rows in plane order. The tiles overlap, so y is larger than x and a
+/* A pixel volume cut into vtile_plan's spatial tiles: x f32 [>= clip H W, 3] in frame, row and
+ * column order; geom = (clip, H, W) in pixels. y f32 [M, 3] holds each tile's full pixel volume in
+ * frame, row and column order. The tiles overlap, so y is larger than x and a
  * buffer of its own. `M` is a ceiling only (band_rows). */
 int ref_vtile_crop(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
@@ -767,7 +982,9 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
     const int64_t overlap = p_int(a, "overlap", 0), ratio = p_int(a, "ratio", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || ratio <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(ldi(geom, 0), 1);
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
+    const int64_t plane = H * W;
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || H % ratio || W % ratio ||
         !split_tiles_axis(H / ratio, tile, overlap, &sy, &oy) ||
@@ -782,15 +999,22 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
                 off[(size_t)(i * nw + j)] +
                 th * std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
     }
-    const int64_t M = band_rows(off.back(), band);
-    if (M <= 0 || rows_of(x, 3) < H * W || rows_of(y, 3) < M) return RAD_E_SHAPE;
+    if (plane > rows_of(x, 3) / frames || off.back() > INT64_MAX / frames)
+        return RAD_E_SHAPE;
+    const int64_t M = band_rows(frames * off.back(), band);
+    if (M <= 0 || rows_of(y, 3) < M) return RAD_E_SHAPE;
     REF_PAR_FOR(M * 3)
     for (int64_t r = 0; r < M; ++r) {
-        const int64_t t = (int64_t)(std::upper_bound(off.begin(), off.end(), r) - off.begin()) - 1;
+        const int64_t tile_row = r / frames;
+        const int64_t t = (int64_t)(std::upper_bound(off.begin(), off.end(), tile_row) - off.begin()) - 1;
         const int64_t i = t / nw, j = t % nw;
         const int64_t tw = std::min(tile, W / ratio - sx[(size_t)j]) * ratio;
-        const int64_t k = r - off[(size_t)t];
-        const int64_t src = (sy[(size_t)i] * ratio + k / tw) * W + sx[(size_t)j] * ratio + k % tw;
+        const int64_t tile_plane = std::min(tile, H / ratio - sy[(size_t)i]) * ratio * tw;
+        const int64_t k = r - frames * off[(size_t)t];
+        const int64_t spatial_row = k % tile_plane;
+        const int64_t src = (k / tile_plane) * plane +
+                            (sy[(size_t)i] * ratio + spatial_row / tw) * W +
+                            sx[(size_t)j] * ratio + spatial_row % tw;
         const int64_t xb = rowoff(x, src, 3), yb = rowoff(y, r, 3), xs = laststride(x);
         const int64_t ys = laststride(y);
         for (int64_t c = 0; c < 3; ++c) stt(y, yb + c * ys, ldt(x, xb + c * xs));
@@ -799,11 +1023,12 @@ int ref_vtile_crop(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ vtile_join */
-/* The tiles' moments blended into one latent plane, as vae.py's `tiled_encode` does: x holds the
+/* The tiles' moments blended into a latent volume, as vae.py's `tiled_encode` does: x holds the
  * tiles' n-channel moments tile-major (vtile_crop's layout at latent extent), geom = (clip, lat_h,
- * lat_w) in latents, and y f32 or bf16 [M, n] is the canvas, M = lat_h lat_w. Position (Y, X)
+ * lat_w) in latents, and y f32 or bf16 [M, n] is the canvas, M = clip lat_h lat_w. Position (Y, X)
  * belongs to the tile (i, j) whose range [start, next start) holds it, at (ly, lx) within it;
- * T(i, j, ly, lx) is that tile's value. The neighbours are read unblended and the top blend comes
+ * T(i, j, ly, lx) is that tile's value at the current frame. The neighbours are read unblended
+ * from the current frame, and the top blend comes
  * before the left one; every product and sum rounds to x's dtype (`rd`), with
  * wa(p, e) = rd(1 - rd(p / e)) and wb(p, e) = rd(p / e):
  *
@@ -821,13 +1046,16 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
     const int64_t overlap = p_int(a, "overlap", 0), n = p_int(a, "n", 0);
     if (tile <= 0 || overlap < 0 || overlap >= tile || n <= 0 || numel(geom) < 3)
         return RAD_E_SHAPE;
+    const int64_t frames = std::max<int64_t>(ldi(geom, 0), 1);
     const int64_t H = ldi(geom, 1), W = ldi(geom, 2);
+    const int64_t plane = H * W;
     std::vector<int64_t> sy, sx, oy, ox;
     if (H <= 0 || W <= 0 || !split_tiles_axis(H, tile, overlap, &sy, &oy) ||
         !split_tiles_axis(W, tile, overlap, &sx, &ox))
         return RAD_E_SHAPE;
     const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size();
-    const int64_t M = band_rows(H * W, band);
+    if (plane > INT64_MAX / frames) return RAD_E_SHAPE;
+    const int64_t M = band_rows(frames * plane, band);
     std::vector<int64_t> off((size_t)(nh * nw + 1), 0);
     for (int64_t i = 0; i < nh; ++i) {
         const int64_t th = std::min(tile, H - sy[(size_t)i]);
@@ -835,7 +1063,8 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
             off[(size_t)(i * nw + j + 1)] =
                 off[(size_t)(i * nw + j)] + th * std::min(tile, W - sx[(size_t)j]);
     }
-    if (M <= 0 || rows_of(x, n) < off.back() || rows_of(y, n) < M) return RAD_E_SHAPE;
+    if (M <= 0 || off.back() > rows_of(x, n) / frames || rows_of(y, n) < M)
+        return RAD_E_SHAPE;
     /* The owner tile of every canvas row and column. */
     std::vector<int64_t> own_y((size_t)H), own_x((size_t)W);
     for (int64_t Y = 0, i = 0; Y < H; ++Y) {
@@ -850,25 +1079,27 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
     auto rd = [dt](float v) { return round_dt(dt, v); };
     auto wb = [&](int64_t p, int64_t e) { return rd((float)p / (float)e); };
     auto wa = [&](int64_t p, int64_t e) { return rd(1.0f - rd((float)p / (float)e)); };
-    auto T = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
-        const int64_t row = off[(size_t)(i * nw + j)] + ly * std::min(tile, W - sx[(size_t)j]) + lx;
+    auto fetch = [&](int64_t frame, int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t c) {
+        const int64_t height = std::min(tile, H - sy[(size_t)i]);
+        const int64_t width = std::min(tile, W - sx[(size_t)j]);
+        const int64_t row = frames * off[(size_t)(i * nw + j)] + (frame * height + ly) * width + lx;
         return ldt(x, rowoff(x, row, n) + c * laststride(x));
     };
     const int64_t ys = laststride(y);
     REF_PAR_FOR(M * n)
     for (int64_t r = 0; r < M; ++r) {
-        const int64_t Y = r / W, X = r % W;
+        const int64_t frame = r / plane, Y = (r % plane) / W, X = r % W;
         const int64_t i = own_y[(size_t)Y], j = own_x[(size_t)X];
         const int64_t ly = Y - sy[(size_t)i], lx = X - sx[(size_t)j];
         const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] : 0, eh = j > 0 ? ox[(size_t)(j - 1)] : 0;
         const int64_t yb = rowoff(y, r, n);
         for (int64_t c = 0; c < n; ++c) {
-            float v = T(i, j, ly, lx, c);
+            float v = fetch(frame, i, j, ly, lx, c);
             if (ly < ev)
-                v = rd(rd(T(i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
+                v = rd(rd(fetch(frame, i - 1, j, ly + tile - ev, lx, c) * wa(ly, ev)) +
                        rd(v * wb(ly, ev)));
             if (lx < eh)
-                v = rd(rd(T(i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
+                v = rd(rd(fetch(frame, i, j - 1, ly, lx + tile - eh, c) * wa(lx, eh)) +
                        rd(v * wb(lx, eh)));
             stt(y, yb + c * ys, v);
         }

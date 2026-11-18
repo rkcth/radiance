@@ -11,6 +11,7 @@
 #include "server_fakes.h"
 
 #include "mm/media.h"
+#include "mm/imaging.h"
 
 namespace {
 
@@ -440,6 +441,94 @@ TEST(a_streamed_generation_sends_previews_then_the_image) {
     CHECK(ev[2].contains("usage"));
     CHECK(!ev[2].contains("partial_image_index"));
     CHECK_EQ(s.f->srv->in_flight(), (int64_t)0);
+}
+
+TEST(an_admitted_image_waits_for_the_previous_adapter_slot) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    FakeImageGen image;
+    int attempts = 0;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto&, int32_t* slot, std::shared_ptr<void>* hold,
+                                 std::string*, std::string*) {
+            if (++attempts == 1) return RAD_E_FULL;
+            *slot = 0;
+            *hold = std::make_shared<int>(0);
+            return RAD_OK;
+        };
+    }});
+    const auto result = f.post("/v1/images/generations",
+        R"({"prompt":"a cup","size":"64x64","loras":["turbo"]})");
+    CHECK_EQ(result.status, 200);
+    CHECK_EQ(attempts, 2);
+    CHECK_EQ(f.srv->in_flight(), 0);
+}
+
+TEST(adapter_validation_uses_the_selected_model_without_generating_or_holding_a_slot) {
+    int validations = 0;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
+        o.api_key = "fixture";
+        o.gen_lora_validate = [&](const auto& choices, std::string* why) {
+            ++validations;
+            if (choices.front().first != "turbo") {
+                *why = "unmatched adapter";
+                return RAD_E_NOTFOUND;
+            }
+            CHECK_EQ(choices.front().second, 0.6);
+            return RAD_OK;
+        };
+    }});
+    auto validate = [&](const char* model, const json& adapters) {
+        return f.post("/v1/loras/validate", json{{"model", model}, {"loras", adapters}}.dump());
+    };
+    CHECK_EQ(validate("missing", {"turbo"}).status, 404);
+    CHECK_EQ(validate("test-model", json::array()).status, 400);
+    CHECK_EQ(validations, 0);
+    const auto answer = validate("test-model", {{"turbo", 0.6}});
+    REQUIRE_EQ(answer.status, 200);
+    CHECK_EQ(json::parse(answer.body)["compatibility"].get<std::string>(), std::string("compatible"));
+    CHECK_EQ(validate("test-model", {"unknown"}).status, 404);
+    CHECK_EQ(validations, 2);
+    CHECK_EQ(f.srv->in_flight(), 0);
+}
+
+TEST(krea_outfill_scales_the_long_edge_and_preserves_the_source_in_the_canvas) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    const json request = { {"prompt", "A portrait in a studio"}, {"size", "1024x1024"},
+                           {"image", data_url(png(48, 64, 255, 255))},
+                           {"outfill", { {"horizontal", "right"} }} };
+    const HttpResponse response = s.post("/v1/images/edits", request);
+    REQUIRE_EQ(response.status, 200);
+    CHECK_EQ(s.last().outfill.x, 256);
+    CHECK_EQ(s.last().outfill.y, 0);
+    CHECK_EQ(s.last().outfill.w, 768);
+    CHECK_EQ(s.last().outfill.h, 1024);
+    REQUIRE_EQ(s.last().refs.size(), (size_t)1);
+    CHECK_EQ(s.last().refs[0].w, 336);
+    CHECK_EQ(s.last().refs[0].h, 448);
+    CHECK(s.img.frames.empty());
+    const json answer = json::parse(response.body);
+    std::vector<uint8_t> png_bytes;
+    REQUIRE(base64_decode(answer["data"][0]["b64_json"].get<std::string>(), &png_bytes));
+    mm::FrameRGBA result;
+    std::string why;
+    REQUIRE_EQ(mm::decode_image_rgba(png_bytes.data(), png_bytes.size(), 1024 * 1024, &result, &why),
+               RAD_OK);
+    const auto red = [&](int x, int y) { return (int)result.rgba[((size_t)y * 1024 + x) * 4]; };
+    CHECK_EQ(red(10, 100), 0);
+    CHECK_EQ(red(256, 100), 0);
+    CHECK_EQ(red(272, 100), 100);
+    CHECK_EQ(red(288, 100), 200);
+    json other = request;
+    other["size"] = "768x768";
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
+    other = request;
+    other["ref_boost"] = 4.0;
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
 }
 
 TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {

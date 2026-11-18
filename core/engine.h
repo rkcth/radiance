@@ -320,16 +320,36 @@ public:
 private:
     /* A generator's adapter files by name (--lora, POST /v1/load_lora_adapter, --lora-dir), opened
      * once and kept mapped; compositions read them when a combination is put in a slot. */
-    int gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
-                      std::string* err);
     int gen_lora_start();
+    int gen_lora_validate(const std::vector<LoraUse>& uses, std::string* err);
+    int gen_lora_request(const std::vector<LoraUse>& uses, int32_t* slot, std::shared_ptr<void>* hold,
+                         std::string* note, std::string* err, bool validate_only);
+    struct LoraReplacement {
+        rad_buf buffer;
+        std::vector<uint16_t> values;
+    };
+    using LoraReplacements = std::vector<std::vector<LoraReplacement>>;
+    int gen_lora_prepare_replacements(const std::map<std::string, lora::Composite>& modules,
+                                      const std::map<std::string, std::vector<float>>& deltas,
+                                      LoraReplacements* replacements, std::string* err) const;
     /* Every rank's packed bytes into `slot` of its pools, each rank on a stream of its own. */
     int lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
-                  std::string* err);
+                  std::string* err, const LoraReplacements* replacements = nullptr);
     bool                        lora_gen_ = false;
     std::unique_ptr<lora::KeyMap> lora_keys_;
     mutable std::mutex          lora_lib_mu_;
-    std::map<std::string, std::pair<std::string, std::shared_ptr<const lora::AdapterFile>>> lora_lib_;
+    struct AdapterEntry {
+        std::string path;
+        std::string identity; // Empty for an explicitly loaded adapter.
+        std::shared_ptr<const lora::AdapterFile> file;
+        uint64_t version;
+    };
+    int resolve_gen_adapter(const std::string& name, AdapterEntry* entry, std::string* err);
+    int snapshot_gen_adapter(const std::string& path, std::shared_ptr<const lora::AdapterFile>* file,
+                             std::string* err) const;
+    std::map<std::string, AdapterEntry> lora_lib_;
+    std::set<std::string> unloaded_gen_adapters_;
+    uint64_t next_adapter_version_ = 1;
 private:
     std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */
     lora::SlotTable            lora_table_;      /* reads lora_epoch_, so declared after it */
