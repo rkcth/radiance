@@ -528,6 +528,14 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         const mm::FrameRGBA& last = r.images.back();
         dims_for((double)info.default_width * info.default_height,
                  (double)last.w / (double)last.h, mult, &r.w, &r.h);
+        /* Rounding the aspect-preserving size to the nearest grid can cross a tight
+         * deployment limit. Trim the longer side by grid units so auto remains usable. */
+        const int64_t max_pixels = info.max_tokens * info.latent_scale * info.latent_scale;
+        if ((int64_t)r.w * r.h > max_pixels) {
+            int32_t& longer = r.w >= r.h ? r.w : r.h;
+            const int32_t shorter = std::min(r.w, r.h);
+            longer = (int32_t)(max_pixels / shorter / mult * mult);
+        }
     } else {
         r.w = (int32_t)info.default_width;
         r.h = (int32_t)info.default_height;

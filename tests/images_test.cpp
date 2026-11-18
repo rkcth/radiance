@@ -442,4 +442,19 @@ TEST(a_streamed_generation_sends_previews_then_the_image) {
     CHECK_EQ(s.f->srv->in_flight(), (int64_t)0);
 }
 
+TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.default_width = s.img.inf.default_height = 1024;
+    s.img.inf.max_tokens = 4096;
+    const std::string pic = png(128, 96, 255, 255);
+    REQUIRE(!pic.empty());
+    const HttpResponse res = s.post("/v1/images/edits",
+        { { "prompt", "x" }, { "image", data_url(pic) } });
+    REQUIRE_EQ(res.status, 200);
+    CHECK_EQ(s.last().width, 1152);
+    CHECK_EQ(s.last().height, 896);
+}
+
+
 RAD_TEST_MAIN()

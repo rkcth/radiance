@@ -12018,6 +12018,60 @@ RadBuildCtx qimg_ctx(int rank, int world, int lossy = 0) {
  * prompt and sizes. One modulation projection is shared by every block; the DiT rotates three
  * sections of adjacent pairs from axes 16, 56, 56; the prefix is cached in a full KV group, read
  * causally by text and both ways by a picture. A Turbo container's fixed schedule names it. */
+TEST(qwenimage21_limits_preserve_defaults_and_bound_single_rank_declarations) {
+    MetaKV mk = qimg_meta();
+    for (const int64_t pixels : {int64_t(0), int64_t(256 * 256), int64_t(1) << 30}) {
+        RadBuilder b;
+        RadBuildCtx ctx = qimg_ctx(0, 1);
+        ctx.gen_max_pixels = pixels;
+        ctx.gen_max_refs = pixels == 0 ? 0 : 2;
+        REQUIRE_EQ(qwenimage21::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const int64_t expected = pixels == 256 * 256 ? 256 : qwenimage21::kMaxImageTokens;
+        CHECK_EQ(b.generator.max_tokens, expected);
+        CHECK_EQ(b.generator.max_refs, pixels == 0 ? qwenimage21::kMaxRefs : 2);
+        CHECK_EQ(b.bufs[b.generator.image_out - 1].d.shape[0], expected * 256 * 4);
+    }
+}
+
+TEST(qwenimage21_sizes_its_passes_for_a_bounded_deployment) {
+    MetaKV mk = qimg_meta();
+    RadArchProbe probe{};
+    probe.gen_max_pixels = 1024 * 1024;
+    probe.gen_max_refs = 1;
+    REQUIRE_EQ(qwenimage21::probe(mk.meta(), &probe), RAD_OK);
+    CHECK_EQ(probe.gen_rows, 8192);
+    CHECK_EQ(probe.gen_patches, 4508);
+
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        RadBuildCtx ctx = qimg_ctx(rank, 2);
+        ctx.gen_max_pixels = probe.gen_max_pixels;
+        ctx.gen_max_refs = probe.gen_max_refs;
+        ctx.max_tok = probe.gen_rows;
+        REQUIRE_EQ(qwenimage21::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK_EQ(b.generator.max_tokens, 4096);
+        CHECK_EQ(b.generator.max_refs, 1);
+        CHECK_EQ(b.generator.default_width, 1024);
+        CHECK_EQ(b.generator.default_height, 1024);
+        REQUIRE(b.generator.image_out > 0);
+        CHECK_EQ(b.bufs[b.generator.image_out - 1].d.shape[0], 1024 * 1024 * 4);
+        for (const auto& k : { gen_pass(b, RAD_GEN_PASS_DENOISE, 16, 2),
+                               gen_pass(b, RAD_GEN_PASS_DECODE, 0) }) {
+            k->g.dec_lane = 1;
+            RadCtx c{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+            qwenimage21::step(&c, &k->b);
+            CHECK(c.step_fail.empty());
+            CHECK_LINT(b, &c);
+        }
+    }
+
+    RadBuilder b;
+    RadBuildCtx ctx = qimg_ctx(0, 1);
+    ctx.gen_max_pixels = 1023;
+    CHECK_EQ(qwenimage21::declare(&b, mk.meta(), &ctx), RAD_E_INVAL);
+}
+
+
 TEST(qwenimage21_declares_a_generator_with_one_shared_modulation) {
     MetaKV mk = qimg_meta();
     RadBuilder b;
