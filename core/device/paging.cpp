@@ -586,20 +586,62 @@ int dev_page_out(int owner, const PageOut& req, PageResult* out) {
         }
         if (remapped)
             if (const int rc = dev_settle_maps(); rc < 0) return undo(rc);
-        /* Copies are issued once the batch's buffers all exist: none is allocated while one runs. */
+        /* The DMA engine can move local device/host ranges without occupying compute units.
+         * Lists yield the link to collectives. Unsupported ranges/backends use the ABI's
+         * ordinary-copy fallback; mappings exist before any submission and stay until all
+         * streams finish. The batch already bounds the list to sixteen chunks. */
+        std::map<int, std::vector<RadCopySeg>> copies;
         for (Job& j : batch) {
-            if (j.host && !j.fresh && !j.patch) continue;   /* a kept copy, exact: nothing to copy */
-            RadStream s = st.on(j.p.pg->device);
-            if (!s) return undo(RAD_E_DEVICE);
+            if (j.host && !j.fresh && !j.patch) continue;
             char* at = j.p.base + j.p.pg->off(j.p.i);
+            auto& segments = copies[j.p.pg->device];
             if (j.patch) {
-                for (const auto& [o, n] : j.runs)
-                    if (const int rc = rad_memcpy_async((char*)j.buf + o, at + o, n, s); rc < 0) return undo(rc);
-            } else if (const int rc = rad_memcpy_async(j.buf, at, j.p.pg->len(j.p.i), s); rc < 0) {
-                return undo(rc);
+                for (const auto& [offset, bytes] : j.runs)
+                    segments.push_back({at + offset, (char*)j.buf + offset, bytes});
+            } else {
+                segments.push_back({at, j.buf, j.p.pg->len(j.p.i)});
             }
         }
-        if (const int rc = st.sync_all(); rc < 0) return undo(rc);
+        struct Position { size_t segment = 0; int64_t offset = 0; };
+        std::map<int, Position> positions;
+        /* Bound both ring packets and bytes in flight. Fragmented dirty runs can turn sixteen
+         * chunks into many segments; never submit that whole list while holding the DMA ring.
+         * One small list per device is fenced before the next round, allowing other engines'
+         * transfers to enter between rounds. */
+        constexpr int64_t kCopyRoundBytes = 64LL << 20;
+        constexpr size_t kCopyRoundSegments = 64;
+        for (;;) {
+            bool submitted = false;
+            for (auto& [device, segments] : copies) {
+                Position& pos = positions[device];
+                std::vector<RadCopySeg> round;
+                int64_t bytes = 0;
+                while (pos.segment < segments.size() && bytes < kCopyRoundBytes &&
+                       round.size() < kCopyRoundSegments) {
+                    const RadCopySeg& seg = segments[pos.segment];
+                    const int64_t take = std::min(seg.bytes - pos.offset, kCopyRoundBytes - bytes);
+                    round.push_back({(const char*)seg.src + pos.offset,
+                                     (char*)seg.dst + pos.offset, take});
+                    bytes += take;
+                    pos.offset += take;
+                    if (pos.offset == seg.bytes) { ++pos.segment; pos.offset = 0; }
+                }
+                if (round.empty()) continue;
+                RadStream stream = st.on(device);
+                if (!stream) return undo(RAD_E_DEVICE);
+                const int rc = rad_memcpy_list_async(round.data(), (int)round.size(),
+                                                      RAD_COPY_YIELD, stream);
+                /* A failed DMA submission may have kicked a partial ring. Its stream's error
+                 * signal is not an independent completion fence, so do not unwind through
+                 * destinations that the DMA engine might still write. */
+                if (rc < 0)
+                    fatal("parking: copy-list submission failed (%s); partial DMA completion is "
+                          "unknown, so destinations remain owned until process exit", rad_strerror(rc));
+                submitted = true;
+            }
+            if (!submitted) break;
+            if (const int rc = st.sync_all(); rc < 0) return undo(rc);
+        }
         /* The staged ones go to disk, four writers at once. */
         std::vector<Job*> disk;
         for (Job& j : batch) if (j.to_disk) disk.push_back(&j);
