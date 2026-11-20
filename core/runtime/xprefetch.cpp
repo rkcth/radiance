@@ -7,7 +7,7 @@
 #include <chrono>
 #include <cpuid.h>
 #include <cstring>
-#include <immintrin.h>
+#include <x86intrin.h>
 #include <pthread.h>
 
 #if !(defined(RAD_HAVE_HIP) && RAD_HAVE_HIP)

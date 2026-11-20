@@ -12,22 +12,27 @@
 
 #include "build/rad_build.h"
 #include "lora/adapter.h"
+#include "lora/cpu_blas.h"
 #include "lora/lora.h"
 #include "plugin/registry.h"
 #include "rad_plugin.h"
 #include "server/loras.h"
 
+#include <filesystem>
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
 
 #include "util/json.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
 #include <tuple>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -381,7 +386,8 @@ TEST(adapter_files_group_by_module_and_refuse_what_they_cannot_reproduce) {
     std::string err;
     REQUIRE_EQ(a.open(f.f1, &err), RAD_OK);
     CHECK_EQ(a.modules().size(), (size_t)6);
-    CHECK_EQ(a.skipped().size(), (size_t)1);
+    CHECK(a.skipped().empty());
+    CHECK_EQ(a.biases().size(), (size_t)1);
     CHECK_EQ(std::string(a.kind_name()), std::string("LoRA"));
     const std::string dir = new_dir("genlora_bad");
     write_st(dir + "/dora.safetensors", { tensor("m.lora_A.weight", "F32", { 2, 4 }, 1),
@@ -393,8 +399,164 @@ TEST(adapter_files_group_by_module_and_refuse_what_they_cannot_reproduce) {
     CHECK_EQ(a.open(dir + "/half.safetensors", &err), (int)RAD_E_FORMAT);
 }
 
+TEST(comfyui_bias_deltas_compose_at_the_requested_strengths) {
+    const std::string dir = new_dir("genlora_bias");
+    const std::string path = dir + "/bias.safetensors";
+    const std::string module = "transformer.transformer_blocks.0.attn.to_out.0";
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 7)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(file->open(path, &err), RAD_OK);
+    REQUIRE_EQ(file->biases().size(), (size_t)1);
+    Program prog;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &prog, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(prog, {"*"}, 16, &sites, &err), RAD_OK);
+    lora::KeyMap keys(prog, sites);
+    std::map<std::string, std::vector<float>> biases;
+    REQUIRE_EQ(lora::compose_biases(keys, {{"one", file, 0.6}, {"two", file, 1.0}},
+                                    &biases, &err), RAD_OK);
+    REQUIRE(biases.count(module));
+    REQUIRE_EQ(biases.at(module).size(), (size_t)kD);
+    for (int64_t i = 0; i < kD; ++i)
+        CHECK(std::abs(biases.at(module)[(size_t)i] - 1.6f * val(7, (size_t)i)) < 1e-6f);
+}
+
+TEST(snapshotted_adapter_composes_its_original_bias_after_replacement) {
+    const std::string dir = new_dir("genlora_bias");
+    const std::string path = dir + "/bias.safetensors";
+    const std::string module = "transformer.transformer_blocks.0.attn.to_out.0";
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 7)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    CHECK_EQ(file->open_snapshot(path, 8, &err), RAD_E_FULL);
+    CHECK_EQ(file->size_bytes(), 0u);
+    REQUIRE_EQ(file->open_snapshot(path, 4096, &err), RAD_OK);
+    CHECK(file->size_bytes() > 0);
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 19)});
+    REQUIRE_EQ(file->biases().size(), (size_t)1);
+    Program prog;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &prog, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(prog, {"*"}, 16, &sites, &err), RAD_OK);
+    lora::KeyMap keys(prog, sites);
+    std::map<std::string, std::vector<float>> biases;
+    REQUIRE_EQ(lora::compose_biases(keys, {{"one", file, 0.6}, {"two", file, 1.0}},
+                                    &biases, &err), RAD_OK);
+    REQUIRE(biases.count(module));
+    REQUIRE_EQ(biases.at(module).size(), (size_t)kD);
+    for (int64_t i = 0; i < kD; ++i)
+        CHECK(std::abs(biases.at(module)[(size_t)i] - 1.6f * val(7, (size_t)i)) < 1e-6f);
+
+    write_st(path, {tensor(module + ".lora_A.weight", "F32", {2, kD}, 1)});
+    CHECK_EQ(file->open_snapshot(path, 4096, &err), RAD_E_FORMAT);
+    CHECK_EQ(file->size_bytes(), 0u);
+    CHECK(file->modules().empty());
+    CHECK(file->biases().empty());
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 19)});
+    REQUIRE_EQ(file->open_snapshot(path, 4096, &err), RAD_OK);
+    CHECK_EQ(file->biases().size(), 1u);
+}
+
+TEST(krea_projector_lora_resolves_and_composes_without_a_gemm_site) {
+    const std::string dir = new_dir("genlora_projector");
+    const std::string path = dir + "/projector.safetensors";
+    const std::string source = "diffusion_model.txtfusion.projector";
+    const std::string module = "transformer.text_fusion.projector";
+    write_st(path, {tensor(source + ".lora_down.weight", "F32", {1, 12}, 7),
+                    tensor(source + ".lora_up.weight", "F32", {1, 1}, 8)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(file->open(path, &err), RAD_OK);
+
+    Program prog;
+    prog.lora_roots.push_back({"transformer.", {"diffusion_model."}});
+    prog.lora_aliases.push_back({"transformer.", "txtfusion.projector", "text_fusion.projector"});
+    auto& projector = prog.lora_replacements[1];
+    projector.module = module;
+    projector.rows = 12;
+    projector.row_mixer = true;
+    lora::KeyMap keys(prog, {});
+    std::map<std::string, lora::Composite> deltas;
+    lora::ComposeReport report;
+    REQUIRE_EQ(lora::compose(keys, {{"turbo", file, 0.6}}, 128, &deltas, &report, &err), RAD_OK);
+    REQUIRE_EQ(report.modules, 1);
+    REQUIRE_EQ(report.exact, 1);
+    REQUIRE(deltas.count(module));
+    const auto& delta = deltas.at(module);
+    REQUIRE_EQ(delta.rows, 1);
+    REQUIRE_EQ(delta.K, 12);
+    REQUIRE_EQ(delta.r, 1);
+    for (size_t i = 0; i < 12; ++i)
+        CHECK(std::abs(delta.B[0] * delta.A[i] - 0.6f * val(8, 0) * val(7, i)) < 1e-6f);
+}
+
 /* A delta given as an operator truncates to its best rank-r form: exact at or above its rank, and
  * otherwise keeping what the sketch says it keeps. */
+TEST(openblas_adapter_math_matches_dense_references) {
+    const auto* blas = lora::cpu::blas();
+    if (std::getenv("RAD_TEST_REQUIRE_LORA_BLAS")) REQUIRE(blas != nullptr);
+    if (!blas) return;
+    constexpr int rows = 12, cols = 11, rank = 10, keep = 3;
+    std::vector<float> B(rows * rank), A(rank * cols);
+    const float diagonal[] = {5, -4, 4, 2, 1};
+    for (int i = 0; i < 5; ++i) {
+        B[i * rank + i] = 1;
+        A[i * cols + i] = diagonal[i];
+    }
+    // These two signed factors cancel, and the remaining ranks are zero.
+    B[7 * rank + 5] = 1;
+    B[7 * rank + 6] = 1;
+    A[5 * cols + 7] = 3;
+    A[6 * cols + 7] = -3;
+    double energy = 0, retained = 0;
+    REQUIRE(lora::cpu::energy(*blas, B, A, rows, rank, cols, &energy));
+    CHECK_NEAR(energy, 62.0, 1e-10);
+    std::vector<float> b, a;
+    REQUIRE(lora::cpu::compress(*blas, B, A, rows, cols, rank, keep, &b, &a, &retained));
+    CHECK_NEAR(retained, 57.0 / 62.0, 1e-6);
+    const auto delta = mul(b, a, rows, keep, cols, 1.0);
+    for (int row = 0; row < rows; ++row)
+        for (int col = 0; col < cols; ++col)
+            CHECK_NEAR(delta.d[(size_t)row * cols + col],
+                       row == col && row < keep ? diagonal[row] : 0.0f, 1e-5);
+
+    constexpr int a_rows = 2, a_cols = 3, b_rows = 3, b_cols = 2, sketch = 4, r2 = 2;
+    const float w1[] = {1, -2, 3, 4, 1, -1};
+    const float w2a[] = {1, 2, 0, -1, 4, 1};
+    const float w2b[] = {1, 2, -1, 3};
+    float w2[b_rows * b_cols] = {};
+    for (int i = 0; i < b_rows; ++i)
+        for (int j = 0; j < b_cols; ++j)
+            for (int r = 0; r < r2; ++r)
+                w2[i * b_cols + j] += w2a[i * r2 + r] * w2b[r * b_cols + j];
+    float input[(a_rows*b_rows + a_cols*b_cols) * sketch] = {};
+    for (size_t i = 0; i < std::size(input); ++i) input[i] = (int)(i % 7) - 3;
+    for (bool transpose : {false, true}) {
+        const int n = transpose ? a_cols * b_cols : a_rows * b_rows;
+        const int k = transpose ? a_rows * b_rows : a_cols * b_cols;
+        for (bool factored : {false, true}) {
+            std::vector<float> output((size_t)n * sketch);
+            REQUIRE(lora::cpu::apply_lokr(*blas, transpose, input, output.data(), sketch,
+                                         a_rows, a_cols, b_rows, b_cols, r2,
+                                         w1, factored ? nullptr : w2, w2a, w2b));
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < sketch; ++j) {
+                    float expected = 0;
+                    for (int h = 0; h < k; ++h) {
+                        const int row = transpose ? h : i;
+                        const int col = transpose ? i : h;
+                        expected += w1[(row / b_rows) * a_cols + col / b_cols] *
+                                    w2[(row % b_rows) * b_cols + col % b_cols] * input[h * sketch + j];
+                    }
+                    CHECK_NEAR(output[i * sketch + j], expected, 1e-5);
+                }
+        }
+    }
+}
+
 TEST(truncation_is_exact_within_the_rank_and_honest_past_it) {
     const int64_t N = 96, K = 80;
     std::vector<float> D((size_t)(N * K));
@@ -503,7 +665,7 @@ TEST(stacked_adapters_of_every_kind_pack_to_their_dense_delta_on_every_rank) {
             if (cs != RAD_OK) fprintf(stderr, "    world %d rank %d: %s\n", world, rank, err.c_str());
             REQUIRE_EQ(cs, RAD_OK);
             CHECK_EQ(rep.unplaced.size(), (size_t)1);
-            CHECK_EQ(rep.skipped.size(), (size_t)1);
+            CHECK(rep.skipped.empty());
             /* block 0's fc2 (a full delta, rank 128) is the one module past rank 24 */
             CHECK_EQ(rep.modules - rep.exact, (int64_t)1);
             CHECK_EQ(rep.worst_module, std::string("transformer.transformer_blocks.0.ff.net.2"));
@@ -554,6 +716,89 @@ TEST(stacked_adapters_of_every_kind_pack_to_their_dense_delta_on_every_rank) {
                     CHECK_NEAR(1.0 - rel * rel, rep.worst_kept, 0.03);
             }
         }
+    }
+}
+
+TEST(rotated_generators_pack_lora_in_the_activation_basis) {
+    const std::string path = new_dir("genlora-fwht128") + "/one.safetensors";
+    const std::string block = "transformer.transformer_blocks.0.";
+    const TW q = tensor(block + "attn.to_q.lora_A.weight", "F32", {1, kD}, 71);
+    const TW down = tensor(block + "ff.net.2.lora_A.weight", "F32", {1, kF}, 72);
+    write_st(path, {q, down,
+        tensor(block + "attn.to_q.lora_B.weight", "BF16", {kQ, 1}, 73),
+        tensor(block + "ff.net.2.lora_B.weight", "BF16", {kD, 1}, 74)});
+    auto adapter = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(adapter->open(path, &err), RAD_OK);
+    for (int rank : {0, 1}) {
+        Program program;
+        std::map<std::string, Truth> truth;
+        REQUIRE_EQ(build_gen(rank, 2, &program, &truth), RAD_OK);
+        for (OpInfo& op : program.ops) {
+            if (op.op != "gemm_nt_q") continue;
+            WeightInfo& w = program.weights[op.weights[0]];
+            if (w.name != "dit.0.qkv.weight" && w.name != "dit.0.down.weight") continue;
+            const bool u4 = w.name == "dit.0.down.weight";
+            w.enc_known = true;
+            rad_enc_clear(&w.enc);
+            rad_enc_copy_str(w.enc.scheme, "affine");
+            rad_enc_copy_str(w.enc.transform, "fwht128");
+            rad_enc_add_plane(&w.enc, "codes", u4 ? RAD_U4 : RAD_I8, 1, 1);
+            if (u4) {
+                rad_enc_add_plane(&w.enc, "scale", RAD_F16, 1, 128);
+                rad_enc_add_plane(&w.enc, "zero", RAD_U8, 1, 128);
+            }
+            op.base.set_s("dtype", u4 ? "w4a8i8_asym" : "i8a8h");
+            op.base.set_i("group", 256);
+            CHECK_EQ(lora::op_is_site(program, op, nullptr, nullptr), !u4);
+            op.base.set_i("group", 128);
+            CHECK(lora::op_is_site(program, op, nullptr, nullptr));
+            if (u4) {
+                w.enc.plane[1].block[1] = 64;
+                CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
+                w.enc.plane[1].block[1] = 128;
+            }
+            op.base.set_i("pb1", 16);
+            CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
+            op.base.set_i("pb1", 0);
+            std::strcpy(w.enc.transform, "fwht64");
+            CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
+            std::strcpy(w.enc.transform, "fwht128");
+        }
+        std::vector<lora::Site> sites;
+        REQUIRE_EQ(lora::build_sites(program, {"*"}, 16, &sites, &err), RAD_OK);
+        const lora::KeyMap keys(program, sites);
+        std::map<std::string, lora::Composite> modules;
+        lora::ComposeReport report;
+        REQUIRE_EQ(lora::compose(keys, {{"one", adapter, 1.0}}, 16, &modules, &report, &err),
+                   RAD_OK);
+        CHECK_EQ(report.exact, 2);
+        CHECK(report.unplaced.empty());
+        lora::AdapterInfo info;
+        std::vector<lora::PackedSite> packed;
+        REQUIRE_EQ(lora::pack_modules(sites, 16, lora::as_modules(modules, keys), &info,
+                                      &packed, &err, /*compact=*/true), RAD_OK);
+        int rotated_sites = 0;
+        for (const lora::Site& site : sites) {
+            if (!site.fwht128_input) continue;
+            ++rotated_sites;
+            const auto& slot = packed[(size_t)site.pool];
+            CHECK(!slot.empty);
+            CHECK_EQ(slot.r_used, 1);
+            const auto& original = site.weight == "dit.0.qkv.weight" ? q.v : down.v;
+            const auto& columns = truth.at(site.weight).cols;
+            for (int64_t i = 0; i < site.K_r; ++i) {
+                const int64_t start = (i / 128) * 128;
+                double value = 0;
+                for (uint32_t j = 0; j < 128; ++j) {
+                    const double coefficient = rad_bf16_to_f32(slot.a[(size_t)(start + j)]);
+                    const auto parity = std::popcount(uint32_t(i % 128) & j) % 2;
+                    value += parity ? -coefficient : coefficient;
+                }
+                CHECK_NEAR(value, original[(size_t)columns[(size_t)i]], 0.002);
+            }
+        }
+        CHECK_EQ(rotated_sites, 2);
     }
 }
 

@@ -40,6 +40,8 @@ public:
      * when a load looks for one. It must outlive the table and every hold the table handed out. */
     void reset(int n, const std::atomic<uint64_t>* epoch);
     int  size() const;
+    // True when every slot is in active use. A different combination must wait.
+    bool all_held() const;
 
     /* A free slot for `name`, or why not:
      *   RAD_E_INVAL  an adapter of that name is loaded

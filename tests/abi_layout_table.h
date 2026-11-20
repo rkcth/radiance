@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 43 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 44 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -394,7 +394,7 @@
 { "RadFuseStep", "n_p", 584, 4 },
 { "RadFuseStep", "from", 588, 32 },
 { "RadFuseStep", "n_from", 620, 4 },
-{ "RadGenBatch", "", 0, 408 },
+{ "RadGenBatch", "", 0, 424 },
 { "RadGenBatch", "rows", 0, 8 },
 { "RadGenBatch", "src", 8, 8 },
 { "RadGenBatch", "rope", 16, 8 },
@@ -449,6 +449,8 @@
 { "RadGenBatch", "entry_h", 384, 8 },
 { "RadGenBatch", "tokens_h", 392, 8 },
 { "RadGenBatch", "cond_opts", 400, 4 },
+{ "RadGenBatch", "ref_log_bias", 408, 8 },
+{ "RadGenBatch", "mode_sigma", 416, 8 },
 { "RadGeneratorDecl", "", 0, 376 },
 { "RadGeneratorDecl", "name", 0, 8 },
 { "RadGeneratorDecl", "layout", 8, 4 },

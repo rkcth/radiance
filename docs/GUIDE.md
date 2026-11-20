@@ -2499,6 +2499,67 @@ models:
 - `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/file.safetensors"}` adds a file
   under a name; unload removes it and frees the slots of every combination using it.
 
+#### Krea 2 reference edits and outfill
+
+An edit-enabled Krea Raw container serves both `/v1/images/generations` and
+`/v1/images/edits` under the same model name. Convert the full Diffusers pipeline, including the
+Qwen3-VL vision tower and the VAE encoder:
+
+```sh
+rad-convert /models/Krea-2-Raw -o krea-2-raw-edit-iq8r.rad \
+  --set pipeline.krea_reference_encoder=1 --recipe data/recipes/krea-2-iq8r.recipe
+```
+
+Use a matching Radiance executable and plugins. Keep the adapters in the configured
+`lora-dir` and allow rank 128 to stack the rank-64 Turbo LoRA with rank-64 Identity Edit or
+rank-32 Registered Outpaint. An ordinary edit takes an instruction and one reference by default.
+Start Radiance with `image-gen-max-refs: 2` to budget for two references. Send them in order in
+the JSON `images` array and identify their roles in the prompt. Krea fits and centers each
+reference independently. The optional `ref_boost` applies to all reference tokens. A value of 1
+leaves attention unchanged. Use 1024×1024 references for the tested Identity Edit V2 profile.
+Its two-reference ComfyUI workflow uses the first image as the scene and the second as the
+subject. Radiance and ComfyUI both carried the second subject's appearance into the first
+scene in a matched-input two-person fixture that asked for posture alone. Pose-only transfer with
+identity preservation remains unqualified.
+
+For the Registered Outpaint adapter, send a single image to `/v1/images/edits` with
+`size: "1024x1024"`, an `outfill` object, and a scene description. The source's long edge scales
+to 1024. The object accepts `horizontal` as `left`, `center` or `right` and `vertical` as
+`top`, `center` or `bottom`. Default placement is top left. The result blends the source back
+along a 32-pixel seam. The outfill profile uses the ComfyUI simple Euler schedule with eight steps
+by default. `guidance_scale: 0` is ComfyUI CFG 1 for Krea.
+The same numeric seed can produce different starting noise in Radiance and ComfyUI.
+If the adapter generates a solid border in an area that should extend the scene,
+try another explicit seed. Use the returned seed with the same model, adapters,
+request settings and runtime configuration to reproduce a result.
+
+The outfill client accepts a scene description directly. To generate one, set
+`--primary-caption-model` to a text model with a vision tower on the Radiance
+listener. If captioning fails and a separate endpoint is configured, the client
+tries that endpoint. You can use the separate endpoint on its own. Set
+`RADIANCE_API_KEY` for the Radiance listener and `CAPTION_API_KEY` for the separate
+caption endpoint. Use the listener URL and the registered Krea and caption
+model IDs from `GET /v1/models`. These examples use the image fleet
+example's default loopback port.
+
+```sh
+python3 scripts/krea2_outfill.py input.png output.png \
+  --url http://127.0.0.1:8000/v1 --model krea-2-raw-edit-iq8r \
+  --prompt "A girl posing in a sunlit studio"
+python3 scripts/krea2_outfill.py input.png output.png \
+  --url http://127.0.0.1:8000/v1 --model krea-2-raw-edit-iq8r \
+  --primary-caption-model "${RADIANCE_CAPTION_MODEL:?set the primary vision model ID}" \
+  --caption-url http://127.0.0.1:8010/v1 \
+  --caption-model "${CAPTION_MODEL:?set the fallback vision model ID}"
+```
+
+With the model configured for adapters, `POST /v1/loras/validate` takes a JSON object
+with `model` and the same `loras` array used for generation. It checks the files, strengths,
+target modules and rank on the host. A successful response contains `"compatibility": "compatible"`.
+Validation requires the model to be resident and returns HTTP 409 when it is parked.
+It uses no GPU adapter slot. On a keyless listener this endpoint
+requires local operator access.
+
 ### 4.10 Control vectors
 
 A **control vector** is a small GGUF file holding one direction per layer; applied while the model

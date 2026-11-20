@@ -1,4 +1,5 @@
 #include "server.h"
+#include "loras.h"
 #include "server_priv.h"
 
 #include <cstdio>
@@ -154,6 +155,7 @@ void Server::register_routes() {
         return r;
     });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
+    router_.post_guarded("/v1/loras/validate", [this](const HttpRequest& q) { return handle_validate_loras(q); });
     router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
     router_.post_guarded("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
@@ -2358,9 +2360,50 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     return HttpResponse::json_body(200, id.empty() ? models_body(cards) : model_body(c));
 }
 
-/* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
- * to unload. The path is read on this machine, so without --api-key only a loopback client may
- * ask, the rule /diagnostics follows. */
+HttpResponse Server::handle_validate_loras(const HttpRequest& req) {
+    auto fail = [&](const char* field, const std::string& why, int status, const char* type) {
+        ApiError error = err_bad(field, why);
+        error.status = status;
+        error.type = type;
+        return error_response(error, req.peer);
+    };
+    if (opt_.api_key.empty() && !local_operator(req))
+        return fail("loras", "adapter validation requires operator access", 403, "permission_error");
+
+    bool over = false, deep = false;
+    const json body = parse_json_bounded(req.body, 0, &over, &deep);
+    if (body.is_discarded() || over || deep || !body.is_object() ||
+        !body.contains("model") || !body["model"].is_string() || body["model"] == "")
+        return error_response(err_bad("model", "expected a nonempty image model ID"), req.peer);
+    const std::string model = body["model"].get<std::string>();
+    if (auto it = req.query.find("model"); it != req.query.end() && it->second != model)
+        return error_response(err_bad("model", "query and body name different models"), req.peer);
+    if (!deps_.front && model != opt_.model_id)
+        return fail("model", "unknown model", 404, "not_found_error");
+    std::vector<std::pair<std::string, double>> choices;
+    std::string field, why;
+    if (parse_loras(body, nullptr, &choices, &field, &why) < 0)
+        return error_response(err_bad(field.c_str(), why), req.peer);
+    if (choices.empty())
+        return error_response(err_bad("loras", "expected at least one adapter"), req.peer);
+
+    if (!opt_.gen_lora_validate)
+        return error_response(err_not_implemented("this model has no generator adapter slots"), req.peer);
+    if (auto no = admit(1, req.peer)) return *no;
+    auto release_admission = [this](Server*) { release(1); };
+    std::unique_ptr<Server, decltype(release_admission)> admission(this, release_admission);
+    const int status = opt_.gen_lora_validate(choices, &why);
+    if (status == RAD_E_FULL) return error_response(err_overloaded(why), req.peer);
+    if (status == RAD_E_NOTFOUND) return fail("loras", why, 404, "not_found_error");
+    if (status == RAD_E_STATE) return fail("loras", why, 409, "conflict_error");
+    if (status == RAD_E_IO || status == RAD_E_NOMEM)
+        return fail("loras", why, 503, "service_unavailable");
+    if (status < 0) return error_response(err_bad("loras", why), req.peer);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{{"model", model},
+                                                       {"compatibility", "compatible"}}));
+}
+
 /* A generator's adapter files: what `loras` and <lora:...> tags may name. */
 HttpResponse Server::handle_loras(const HttpRequest& req) {
     if (!opt_.gen_lora_names) {
@@ -2376,6 +2419,9 @@ HttpResponse Server::handle_loras(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(json{ { "object", "list" }, { "data", std::move(data) } }));
 }
 
+/* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
+ * to unload. The path is read on this machine, so without --api-key only a loopback client may
+ * ask, the rule /diagnostics follows. */
 HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     auto fail = [&](int status, const char* type, const std::string& msg) {
         ApiError e;

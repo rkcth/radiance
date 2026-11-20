@@ -878,6 +878,14 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "returned", i, wh));
             tt      = w_tmpl_[wh];
             tt.data = resolve_weight(wh);
+            if (gen_lora_slot_ >= 0 && !program_->lora_replacements.empty()) {
+                const auto bias = program_->lora_replacements.find(wh);
+                if (bias != program_->lora_replacements.end()) {
+                    const auto& slot = bias->second;
+                    tt.data = static_cast<char*>(buf_tmpl_[slot.slots].data) +
+                              2 * gen_lora_slot_ * slot.rows;
+                }
+            }
             w_direct_[wh] = 1;
             if (!tt.data)
                 return abort_step_msg(h, RAD_E_STATE,

@@ -28,9 +28,11 @@
 #include "lora.h"
 #include "../format/safetensors.h"
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <string>
@@ -56,6 +58,8 @@ public:
     /* Opens and groups the file's tensors by module. Refuses a file holding a form whose effect
      * this engine cannot reproduce (DoRA's magnitude, OFT, Tucker cores), naming it. */
     int open(const std::string& path, std::string* err);
+    uint64_t size_bytes() const { return st_.size_bytes(); }
+    int open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err);
     const std::string&             path() const { return st_.path(); }
     const std::vector<FileModule>& modules() const { return mods_; }
     /* Tensors that change no linear (a trained bias, a norm's weight), with why; reported, not
@@ -63,10 +67,13 @@ public:
     const std::vector<std::pair<std::string, std::string>>& skipped() const { return skipped_; }
     /* The most common kind among the modules, for messages ("LoRA", "LoHa", ...). */
     const char* kind_name() const;
+    const std::map<std::string, const StTensor*>& biases() const { return biases_; }
 
 private:
+    int group_tensors(const std::string& path, std::string* err);
     SafeTensorsFile st_;
     std::vector<FileModule> mods_;
+    std::map<std::string, const StTensor*> biases_;
     std::vector<std::pair<std::string, std::string>> skipped_;
 };
 
@@ -148,6 +155,10 @@ struct Strength {
     std::shared_ptr<const AdapterFile> file;
     double                             weight = 1.0;
 };
+
+/* Collect per-module bias deltas at the requested strengths, in checkpoint row order. */
+int compose_biases(const KeyMap& km, const std::vector<Strength>& ads,
+                   std::map<std::string, std::vector<float>>* out, std::string* err);
 
 /* What compose() did, for the log and the client. */
 struct ComposeReport {

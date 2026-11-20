@@ -1,5 +1,6 @@
 /* lora/adapter.cpp -- see adapter.h. Host code only. */
 #include "adapter.h"
+#include "cpu_blas.h"
 
 #include "rad_plugin.h"
 
@@ -13,6 +14,7 @@
 #include <limits>
 #include <regex>
 #include <thread>
+#include <sys/stat.h>
 #include <unordered_map>
 
 namespace rad {
@@ -214,6 +216,11 @@ void sym_eig(std::vector<double> G, int64_t l, std::vector<double>* w, std::vect
 /* ||B A||_F^2 for B [n, r], A [r, k]: trace((B^T B)(A A^T)). */
 double lowrank_energy(const std::vector<float>& B, const std::vector<float>& A, int64_t n, int64_t r,
                       int64_t k) {
+    if (const auto* blas = cpu::blas()) {
+        double fast = 0.0;
+        if (cpu::try_accelerated([&] { return cpu::energy(*blas, B, A, n, r, k, &fast); }))
+            return fast;
+    }
     std::vector<double> bb((size_t)(r * r), 0.0), aa((size_t)(r * r), 0.0);
     for (int64_t i = 0; i < n; ++i)
         for (int64_t p = 0; p < r; ++p) {
@@ -277,7 +284,7 @@ const Suffix kSuffix[] = {
     { ".oft_diag", -2, 0, "an OFT rotation" },
     { ".oft_R.weight", -2, 0, "an OFT rotation" },
     { ".boft_R", -2, 0, "a BOFT rotation" },
-    { ".diff_b", -3, 0, "a bias delta" },
+    { ".diff_b", -4, 0, nullptr },
     { ".w_norm", -3, 0, "a norm's weight delta" },
     { ".b_norm", -3, 0, "a norm's bias delta" },
     { ".lora_B.bias", -3, 0, "a bias on lora_B" },
@@ -290,8 +297,30 @@ const Suffix kSuffix[] = {
 /* ================================================================== the file */
 int AdapterFile::open(const std::string& path, std::string* err) {
     mods_.clear();
+    biases_.clear();
     skipped_.clear();
     if (st_.open(path) != RAD_OK) return fail(err, RAD_E_IO, path + ": cannot open as safetensors");
+    return group_tensors(path, err);
+}
+
+int AdapterFile::open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err) {
+    mods_.clear();
+    biases_.clear();
+    skipped_.clear();
+    const int opened = st_.open_snapshot(path, max_bytes);
+    if (opened < 0)
+        return fail(err, opened, path + ": could not snapshot adapter: " + rad_strerror(opened));
+    const int grouped = group_tensors(path, err);
+    if (grouped < 0) {
+        mods_.clear();
+        biases_.clear();
+        skipped_.clear();
+        st_.close();
+    }
+    return grouped;
+}
+
+int AdapterFile::group_tensors(const std::string& path, std::string* err) {
     std::map<std::string, FileModule> by;
     std::map<std::string, const StTensor*> alphas;
     for (const StTensor& t : st_.tensors()) {
@@ -306,6 +335,7 @@ int AdapterFile::open(const std::string& path, std::string* err) {
         if (hit->kind == -2)
             return fail(err, RAD_E_UNSUPPORTED, fmt("%s: %s is %s; that kind of adapter is not "
                                                     "served", path.c_str(), t.name.c_str(), hit->why));
+        if (hit->kind == -4) { biases_.emplace(key, &t); continue; }
         if (hit->kind == -3) { skipped_.push_back({ t.name, hit->why }); continue; }
         if (hit->kind == -1) { alphas[key] = &t; continue; }
         FileModule& m = by[key];
@@ -343,11 +373,12 @@ int AdapterFile::open(const std::string& path, std::string* err) {
                                                missing));
         mods_.push_back(m);
     }
-    if (mods_.empty()) return fail(err, RAD_E_FORMAT, path + ": no adapter modules in the file");
+    if (mods_.empty() && biases_.empty()) return fail(err, RAD_E_FORMAT, path + ": no adapter modules in the file");
     return RAD_OK;
 }
 
 const char* AdapterFile::kind_name() const {
+    if (mods_.empty()) return "bias";
     int n[4] = { 0, 0, 0, 0 };
     for (const FileModule& m : mods_) ++n[m.kind];
     const int k = (int)(std::max_element(n, n + 4) - n);
@@ -461,6 +492,11 @@ int module_delta(const FileModule& m, double w, Delta* out, std::string* err) {
         }
         /* Column x of X [K, l], as the matrix [b, e]: kron(w1, w2) x = w1 X w2^T, read as [a, c]. */
         out->apply = [=](const float* X, int64_t l, float* Y) {
+            if (const auto* blas = cpu::blas())
+                if (cpu::try_accelerated([&] {
+                    return cpu::apply_lokr(*blas, false, X, Y, l, a, b, c, e, r2, w1->data(),
+                                           full2 ? W2->data() : nullptr, W2a->data(), W2b->data());
+                })) return;
             std::vector<float> xm((size_t)(b * e)), t((size_t)(b * c)), y((size_t)(a * c)), u;
             for (int64_t col = 0; col < l; ++col) {
                 for (int64_t k = 0; k < K; ++k) xm[(size_t)k] = X[k * l + col];
@@ -497,6 +533,11 @@ int module_delta(const FileModule& m, double w, Delta* out, std::string* err) {
         };
         /* The transpose: kron(w1, w2)^T y = w1^T Y w2, Y the column as [a, c], read as [b, e]. */
         out->apply_t = [=](const float* Yin, int64_t l, float* X) {
+            if (const auto* blas = cpu::blas())
+                if (cpu::try_accelerated([&] {
+                    return cpu::apply_lokr(*blas, true, Yin, X, l, a, b, c, e, r2, w1->data(),
+                                           full2 ? W2->data() : nullptr, W2a->data(), W2b->data());
+                })) return;
             std::vector<float> ym((size_t)(a * c)), t((size_t)(b * c)), x((size_t)(b * e)), u;
             for (int64_t col = 0; col < l; ++col) {
                 for (int64_t n = 0; n < N; ++n) ym[(size_t)n] = Yin[n * l + col];
@@ -657,6 +698,8 @@ KeyMap::KeyMap(const Program& prog, const std::vector<Site>& sites) : prog_(&pro
             }
             adaptable_[src.module] = { rows, s.K_full > 0 ? s.K_full : -1 };
         }
+    for (const auto& [weight, replacement] : prog.lora_replacements)
+        if (replacement.row_mixer) adaptable_[replacement.module] = {1, replacement.rows};
     for (const LoraRoot& r : prog.lora_roots) {
         Root R;
         R.native = r.native;
@@ -780,6 +823,35 @@ struct Part {
 
 }  /* namespace */
 
+int compose_biases(const KeyMap& km, const std::vector<Strength>& ads,
+                   std::map<std::string, std::vector<float>>* out, std::string* err) {
+    out->clear();
+    for (const auto& ad : ads) {
+        for (const auto& [key, t] : ad.file->biases()) {
+            std::string why;
+            const auto targets = km.resolve(key, &why);
+            if (targets.size() != 1 || targets[0].from_lo || targets[0].from_hi || targets[0].to_lo)
+                return fail(err, RAD_E_UNSUPPORTED, ad.name + ": unsupported bias target " + key);
+            const auto& name = targets[0].module;
+            const int64_t expected = km.rows(name);
+            if (!float_dtype(t->dtype) || t->shape.size() != 1 || t->shape[0] <= 0 ||
+                (expected > 0 && t->shape[0] != expected))
+                return fail(err, RAD_E_SHAPE, ad.name + ": invalid bias shape or dtype for " + key);
+            const int64_t rows = t->shape[0];
+            auto& delta = (*out)[name];
+            if (!delta.empty() && delta.size() != (size_t)rows)
+                return fail(err, RAD_E_SHAPE, ad.name + ": inconsistent bias shape for " + key);
+            delta.resize((size_t)rows);
+            for (int64_t i = 0; i < rows; ++i) {
+                delta[(size_t)i] += (float)(ad.weight * elem(*t, i));
+                if (!std::isfinite(delta[(size_t)i]))
+                    return fail(err, RAD_E_INVAL, ad.name + ": nonfinite bias for " + key);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
             std::map<std::string, Composite>* out, ComposeReport* rep, std::string* err) {
     out->clear();
@@ -850,21 +922,36 @@ int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
             }
             if (!errs[i].empty()) continue;
             c.rows = rows; c.K = K;
-            if (lr && R <= max_rank) {
-                /* Side by side: every delta its own block of ranks. */
-                c.r = R;
-                c.B.assign((size_t)(rows * R), 0.0f);
-                c.A.assign((size_t)(R * K), 0.0f);
-                int64_t o = 0;
+            auto concatenate = [&](std::vector<float>* B, std::vector<float>* A) {
+                B->assign((size_t)(rows * R), 0.0f);
+                A->resize((size_t)(R * K));
+                int64_t offset = 0;
                 for (const Part& p : ps) {
                     const Delta& d = *p.d;
                     for (int64_t row = 0; row < p.n; ++row)
-                        std::memcpy(&c.B[(size_t)((p.to_lo + row) * R + o)],
-                                    &d.B[(size_t)((p.from_lo + row) * d.r)], (size_t)d.r * 4);
-                    std::memcpy(&c.A[(size_t)(o * K)], d.A.data(), (size_t)(d.r * K) * 4);
-                    o += d.r;
+                        std::memcpy(&(*B)[(size_t)((p.to_lo + row) * R + offset)],
+                                    &d.B[(size_t)((p.from_lo + row) * d.r)], (size_t)d.r * sizeof(float));
+                    std::memcpy(&(*A)[(size_t)(offset * K)], d.A.data(), d.A.size() * sizeof(float));
+                    offset += d.r;
                 }
+            };
+            if (lr && R <= max_rank) {
+                c.r = R;
+                concatenate(&c.B, &c.A);
                 continue;
+            }
+            if (lr && cpu::can_compress(rows, K, R, max_rank)) {
+                if (const auto* blas = cpu::blas()) {
+                    if (cpu::try_accelerated([&] {
+                        std::vector<float> B, A;
+                        concatenate(&B, &A);
+                        return cpu::compress(*blas, B, A, rows, K, R, max_rank, &c.B, &c.A, &kept[i]);
+                    })) {
+                        c.r = max_rank;
+                        exact[i] = 0;
+                        continue;
+                    }
+                }
             }
             /* The sum, as one operator over the module's rows, truncated to the slot's rank. */
             exact[i] = 0;
@@ -914,16 +1001,8 @@ int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
             c.r = (int64_t)(c.A.size() / (size_t)(K > 0 ? K : 1));
             /* Kept energy is exact when the sum is low-rank: ||B A||^2 of the parts side by side. */
             if (lr) {
-                std::vector<float> Bc((size_t)(rows * R), 0.0f), Ac((size_t)(R * K), 0.0f);
-                int64_t o = 0;
-                for (const Part& p : ps) {
-                    const Delta& d = *p.d;
-                    for (int64_t row = 0; row < p.n; ++row)
-                        std::memcpy(&Bc[(size_t)((p.to_lo + row) * R + o)],
-                                    &d.B[(size_t)((p.from_lo + row) * d.r)], (size_t)d.r * 4);
-                    std::memcpy(&Ac[(size_t)(o * K)], d.A.data(), (size_t)(d.r * K) * 4);
-                    o += d.r;
-                }
+                std::vector<float> Bc, Ac;
+                concatenate(&Bc, &Ac);
                 const double tot = lowrank_energy(Bc, Ac, rows, R, K);
                 const double got = lowrank_energy(c.B, c.A, rows, c.r, K);
                 kept[i] = tot > 0.0 ? std::min(1.0, got / tot) : 1.0;

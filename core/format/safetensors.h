@@ -38,6 +38,9 @@ public:
     SafeTensorsFile& operator=(const SafeTensorsFile&) = delete;
 
     int  open(const std::string& path);
+    /* Copy to private memory before parsing. Refuse files above max_bytes before allocation. */
+    int  open_snapshot(const std::string& path, uint64_t max_bytes);
+    uint64_t size_bytes() const { return map_bytes_; }
     void close();
 
     const StTensor*              find(const std::string& name) const;
@@ -46,6 +49,9 @@ public:
     const std::string&           path()     const { return path_; }
 
 private:
+    int open_file(const std::string& path, const uint64_t* snapshot_limit);
+    int read_snapshot(const std::string& path, uint64_t max_bytes);
+
     int         fd_ = -1;
     uint8_t*    map_ = nullptr;
     uint64_t    map_bytes_ = 0;

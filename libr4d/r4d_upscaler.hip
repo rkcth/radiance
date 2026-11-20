@@ -108,6 +108,52 @@ __device__ __forceinline__ bool volume_of(const int* geom, long long rows, int* 
 }
 
 // ---------------------------------------------------------------------------- conv3d_ndhwc
+// H3's RGB stem and pointwise projections use untransposed F32 weights. The geometry
+// lives on the device for both whole-frame and tiled encoding.
+template <bool RGB>
+__global__ __launch_bounds__(kT) void conv3d_plain_kernel(
+    const uint16_t* x, const float* w, const float* bias, const int* geom, const uint16_t* res,
+    uint16_t* y, int cin, int cout, long long ldx, long long ldr, long long ldy, long long cap) {
+    const long long t = geom[0], h = geom[1], width = geom[2];
+    if (t <= 0 || h <= 0 || width <= 0 || t > cap / h / width) return;
+    const long long id = (long long)blockIdx.x * kT + threadIdx.x;
+    const long long row = id / cout;
+    if (row >= t * h * width) return;
+    const int oc = id % cout;
+    float sum = 0;
+    if constexpr (RGB) {
+        if (h < 2 || width < 2) return;
+        const long long plane = h * width;
+        const long long frame = row / plane;
+        const long long iy = (row / width) % h, ix = row % width;
+        for (int dt = 0; dt < 3; ++dt) {
+            const long long z = frame + dt - 2;
+            if (z < 0) continue;
+            for (int dy = 0; dy < 3; ++dy) {
+                long long py = iy + dy - 1;
+                if (py < 0) py = 1;
+                else if (py == h) py = h - 2;
+                for (int dx = 0; dx < 3; ++dx) {
+                    long long px = ix + dx - 1;
+                    if (px < 0) px = 1;
+                    else if (px == width) px = width - 2;
+                    const auto* pixel = x + (z * plane + py * width + px) * ldx;
+                    const auto* tap = w + oc * 81 + dt * 9 + dy * 3 + dx;
+                    for (int c = 0; c < 3; ++c)
+                        sum = fmaf(bf2f(pixel[c]), tap[c * 27], sum);
+                }
+            }
+        }
+    } else {
+        const auto* pixel = x + row * ldx;
+        const auto* weights = w + (long long)oc * cin;
+        for (int c = 0; c < cin; ++c) sum = fmaf(bf2f(pixel[c]), weights[c], sum);
+    }
+    float value = sum + bias[oc];
+    if (res) value = bf2f((uint16_t)bf16x2_rne(value, 0)) + bf2f(res[row * ldr + oc]);
+    y[row * ldy + oc] = (uint16_t)bf16x2_rne(value, 0);
+}
+
 // An implicit GEMM over voxel rows: y[voxel][cout] = sum over (tap, cin) of x[voxel's tap
 // neighbour][cin] * w[cout][tap][cin], the weight stored tap-major (r4d_layout.cpp relayouts
 // PyTorch's [cout][cin][3][3][3] at load), so K = 27 cin runs over taps then channels and a 64-wide
@@ -821,6 +867,49 @@ int parse_f32_list(const char* s, float* out, int max) {
 
 /* ------------------------------------------------------------------ conv3d_ndhwc */
 enum { C3_X = 0, C3_W, C3_B, C3_GEOM, C3_RES, C3_Y };
+
+extern "C" int r4d_rad_conv3d_plain(const RadArgs* a, RadStream stream) {
+    const RadTensor *x = r4d_opt(a, C3_X), *w = r4d_opt(a, C3_W), *b = r4d_opt(a, C3_B);
+    const RadTensor *geom = r4d_opt(a, C3_GEOM), *res = r4d_opt(a, C3_RES), *y = r4d_opt(a, C3_Y);
+    if (!x || !w || !b || !geom || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_bf16(x) || !is_bf16(y) || !is_f32(w) || !is_f32(b) ||
+        !is_i32(geom) || (res && !is_bf16(res)))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long cin = r4d_geti_or(a, "cin", 0), cout = r4d_geti_or(a, "cout", 0);
+    const long long k = r4d_geti_or(a, "k", 0), kt = r4d_geti_or(a, "kt", 0);
+    const bool rgb = k == 3 && kt == 3 && cin == 3;
+    const int padded = rgb ? 1 : 0;
+    const char* pad = r4d_gets(a, "pad");
+    const char* tpad = r4d_gets(a, "tpad");
+    if ((!rgb && (k != 1 || kt != 1)) || cin <= 0 || cout <= 0 || cin > 16384 || cout > 16384 ||
+        r4d_geti_or(a, "stride", 1) != 1 || r4d_geti_or(a, "stride_t", 1) != 1 ||
+        r4d_geti_or(a, "causal", 0) != padded || r4d_geti_or(a, "reflect", 0) != padded ||
+        (pad && std::strcmp(pad, "same")) || (tpad && std::strcmp(tpad, "zero")) ||
+        r4d_geti_or(a, "tpre", 0) != 0 ||
+        r4d_numel(w) != cout * cin * (rgb ? 27 : 1) ||
+        r4d_numel(b) < cout || r4d_numel(geom) < 3)
+        return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(w) || !r4d_contig(b) || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    long long rx = 0, ry = 0, rr = 0;
+    const long long ldx = r4d_rows_pitch(x, cin, &rx);
+    const long long ldy = r4d_rows_pitch(y, cout, &ry);
+    const long long ldr = res ? r4d_rows_pitch(res, cout, &rr) : 0;
+    if (ldx < 0 || ldy < 0 || ldr < 0) return R4D_NO(RAD_E_STRIDE);
+    long long cap = rx < ry ? rx : ry;
+    if (res && rr < cap) cap = rr;
+    if (cap <= 0 || cap > ((1ll << 31) - kT) / cout) return R4D_NO(RAD_E_SHAPE);
+    const dim3 grid((unsigned)((cap * cout + kT - 1) / kT));
+    const auto* xp = (const uint16_t*)r4d_p(x);
+    const auto* wp = (const float*)r4d_p(w);
+    const auto* bp = (const float*)r4d_p(b);
+    const auto* gp = (const int*)r4d_p(geom);
+    const auto* rp = (const uint16_t*)r4d_p(res);
+    auto* yp = (uint16_t*)r4d_wp(y);
+    if (rgb) return R4D_EMIT(stream, conv3d_plain_kernel<true>, grid, dim3(kT), 0,
+                              xp, wp, bp, gp, rp, yp, (int)cin, (int)cout, ldx, ldr, ldy, cap);
+    return R4D_EMIT(stream, conv3d_plain_kernel<false>, grid, dim3(kT), 0,
+                    xp, wp, bp, gp, rp, yp, (int)cin, (int)cout, ldx, ldr, ldy, cap);
+}
 
 extern "C" int r4d_rad_conv3d_ndhwc(const RadArgs* a, RadStream stream) {
     const RadTensor *x = r4d_opt(a, C3_X), *w = r4d_opt(a, C3_W), *b = r4d_opt(a, C3_B);

@@ -203,7 +203,8 @@ struct ServerOptions {
      * left out; `gen_lora_names` is GET /v1/loras. Unset without adapters. */
     std::function<int(const std::vector<std::pair<std::string, double>>&, int32_t*,
                       std::shared_ptr<void>*, std::string*, std::string*)> gen_lora_acquire;
-    std::function<std::vector<std::string>()>                                gen_lora_names;
+    std::function<std::vector<std::string>()> gen_lora_names;
+    std::function<int(const std::vector<std::pair<std::string, double>>&, std::string*)> gen_lora_validate;
 
     std::string api_key;
     /* Extra Host authorities the keyless "loopback only" guards accept (--allow-host): names an
@@ -339,6 +340,7 @@ private:
     void realtime_run(RealtimeSession& s, WsConn& ws);
     bool realtime_loop(RealtimeSession& s, WsConn& ws);
     HttpResponse handle_models(const HttpRequest& req);
+    HttpResponse handle_validate_loras(const HttpRequest& req);
     HttpResponse handle_loras(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
     std::optional<HttpResponse> refuse_text(const std::string& peer,

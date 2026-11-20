@@ -324,9 +324,35 @@ void compositions(int P, int n, std::vector<std::vector<std::pair<int, int>>>* o
     if (n >= 1 && n <= P) rec(0, n);
 }
 
+constexpr int64_t kLoraTransformWidth = 128;
+
+/* These paths read row-major, unnormalised H128(x) codes plus their scales. The INT8 scale
+ * group may cover two transforms. The asymmetric U4 path shares the same input basis. */
+bool accepts_fwht128_input(const Program& prog, const OpInfo& op, const WeightInfo& w) {
+    if (!gen_scope(prog) || op.op != "gemm_nt_q" || !w.enc_known ||
+        w.enc.n_planes == 0 ||
+        std::strncmp(w.enc.transform, "fwht128", RAD_ENC_STR) != 0)
+        return false;
+    const char* dtype = op.base.get_s("dtype");
+    long long group = 0;
+    if (!dtype || !op.base.get_i("group", &group)) return false;
+    if (std::strcmp(dtype, "i8a8h") == 0 && w.enc.plane[0].dtype == RAD_I8)
+        return group == kLoraTransformWidth || group == 2 * kLoraTransformWidth;
+    if (std::strcmp(dtype, "w4a8i8_asym") != 0 || group != kLoraTransformWidth ||
+        w.enc.plane[0].dtype != RAD_U4 || !rad_enc_is(&w.enc, "affine") || w.enc.n_planes != 3)
+        return false;
+    const RadEncPlane* scale = rad_enc_plane(&w.enc, "scale");
+    const RadEncPlane* zero = rad_enc_plane(&w.enc, "zero");
+    return w.enc.plane[0].block[1] == 1 && scale && zero && scale->dtype == RAD_F16 &&
+           (zero->dtype == RAD_U8 || zero->dtype == RAD_U4) &&
+           scale->block[0] == 1 && zero->block[0] == 1 &&
+           scale->block[1] == group && zero->block[1] == group;
+}
+
 bool same_layout(const Site& a, const Site& b) {
     if (a.weight != b.weight || a.shard != b.shard || a.K_r != b.K_r || a.k_lo != b.k_lo ||
         a.K_full != b.K_full || a.N_r != b.N_r || a.R != b.R || a.n_modules != b.n_modules ||
+        a.fwht128_input != b.fwht128_input ||
         a.parts_resolved != b.parts_resolved || a.part_total != b.part_total ||
         a.part_lo != b.part_lo || a.part_hi != b.part_hi || a.part_y != b.part_y ||
         a.parts.size() != b.parts.size() || a.sources.size() != b.sources.size())
@@ -356,6 +382,7 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
     s.weight = W.name;
     s.shard = W.decl.shard;
     s.max_rank = max_rank;
+    s.fwht128_input = accepts_fwht128_input(prog, op, W);
 
     if (W.decl.rank != 2)
         return fail(err, RAD_E_SHAPE, fmt("weight '%s' is rank %u; a LoRA site needs a matrix",
@@ -392,6 +419,10 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
             s.K_full = s.K_r * world;
         }
     }
+
+    if (s.fwht128_input && (s.K_r % kLoraTransformWidth || s.k_lo % kLoraTransformWidth))
+        return fail(err, RAD_E_SHAPE, fmt("weight '%s': LoRA column slice must align to the "
+                                          "128-column Hadamard blocks", W.name.c_str()));
 
     /* ---- rows: share.cpp's per-part cut, in each part's own units. */
     const int P = W.decl.n_row_parts > 1 ? W.decl.n_row_parts : 1;
@@ -616,13 +647,10 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
             return no(fmt("%s reads K=%lld against a weight of %lld columns (a widened, rotated "
                           "input)", op.op.c_str(), k, (long long)w.decl.shape[1]));
     }
-    /* A quantised GEMM over a transformed weight is fed had_quant's rotated codes, so the adapter
-     * epilogue would multiply A against a transformed activation. A plain fp GEMM (gemm_nt,
-     * gemm_nt_bias) is fed what the architecture hands it: plain activations, with the kernel
-     * library's layout/relayout hooks presenting the planes in the plain basis at load (a plain
-     * kernel with no such hook is refused at declare by its own layout, RAD_E_DTYPE). A resolved
-     * plain GEMM over a transformed encoding is therefore basis-safe for the adapter epilogue. */
-    if ((gq || gqb) && w.enc_known && w.enc.transform[0])
+    /* Plain GEMMs consume ordinary activations even when the stored weight needs relayout.
+     * Quantised GEMMs consume transformed codes. Only the generator's supported FWHT128
+     * sites pack the adapter A matrix in that input basis. */
+    if ((gq || gqb) && w.enc_known && w.enc.transform[0] && !accepts_fwht128_input(prog, op, w))
         return no(fmt("weight '%s' is stored in the '%.*s' transform basis, so its GEMM is fed a "
                       "transformed activation", w.name.c_str(), (int)RAD_ENC_STR, w.enc.transform));
     return true;
@@ -1010,6 +1038,29 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     return pack_modules(sites, max_rank, mods, info, packed, err);
 }
 
+namespace {
+
+/* For the unnormalised H, <H(A)/128, H(x)> = <A, x>. Transform the original factor
+ * in float and round once when writing the BF16 slot. B and the module scale stay unchanged. */
+void pack_fwht128_row(uint16_t* dst, const StTensor& factor, int64_t offset, int64_t columns) {
+    for (int64_t block = 0; block < columns; block += kLoraTransformWidth) {
+        float values[kLoraTransformWidth];
+        for (int64_t i = 0; i < kLoraTransformWidth; ++i)
+            values[i] = elem_f32(factor, offset + block + i);
+        for (int64_t half = 1; half < kLoraTransformWidth; half *= 2)
+            for (int64_t base = 0; base < kLoraTransformWidth; base += 2 * half)
+                for (int64_t i = base; i < base + half; ++i) {
+                    const float lo = values[i], hi = values[i + half];
+                    values[i] = lo + hi;
+                    values[i + half] = lo - hi;
+                }
+        for (int64_t i = 0; i < kLoraTransformWidth; ++i)
+            dst[block + i] = rad_f32_to_bf16(values[i] / kLoraTransformWidth);
+    }
+}
+
+}  // namespace
+
 int pack_modules(const std::vector<Site>& sites, int max_rank,
                  const std::map<std::string, AdModule>& mods, AdapterInfo* info,
                  std::vector<PackedSite>* packed, std::string* err, bool compact) {
@@ -1227,9 +1278,13 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
             const StTensor& A = *am[i]->A;
             const int64_t r = am[i]->rank, kc = A.shape[1];
             const int64_t t0 = off[i];
-            for (int64_t j = 0; j < r; ++j)
-                for (int64_t k = 0; k < s.K_r; ++k)
-                    out.a[(size_t)((t0 + j) * s.K_r + k)] = elem_bf16(A, j * kc + s.k_lo + k);
+            for (int64_t j = 0; j < r; ++j) {
+                uint16_t* dst = out.a.data() + (t0 + j) * s.K_r;
+                const int64_t src = j * kc + s.k_lo;
+                if (s.fwht128_input) pack_fwht128_row(dst, A, src, s.K_r);
+                else
+                    for (int64_t k = 0; k < s.K_r; ++k) dst[k] = elem_bf16(A, src + k);
+            }
         }
         for (const SitePart& sp : parts) {
             size_t i = 0;

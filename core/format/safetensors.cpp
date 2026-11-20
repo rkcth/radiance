@@ -4,6 +4,7 @@
  */
 #include "safetensors.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -152,27 +153,91 @@ void SafeTensorsFile::close() {
 }
 
 int SafeTensorsFile::open(const std::string& path) {
+    return open_file(path, nullptr);
+}
+
+int SafeTensorsFile::open_snapshot(const std::string& path, uint64_t max_bytes) {
+    return open_file(path, &max_bytes);
+}
+
+int SafeTensorsFile::read_snapshot(const std::string& path, uint64_t max_bytes) {
+    struct stat before{};
+    if (::fstat(fd_, &before) != 0) return RAD_E_IO;
+    if (!S_ISREG(before.st_mode) || before.st_size < 8) return RAD_E_FORMAT;
+    const uint64_t bytes = static_cast<uint64_t>(before.st_size);
+    if (bytes > max_bytes || bytes > SIZE_MAX) return RAD_E_FULL;
+
+    void* memory = ::mmap(nullptr, static_cast<size_t>(bytes), PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) return RAD_E_NOMEM;
+    map_ = static_cast<uint8_t*>(memory);
+    map_bytes_ = bytes;
+    for (uint64_t offset = 0; offset < bytes;) {
+        const auto count = static_cast<size_t>(std::min<uint64_t>(bytes - offset, 1 << 20));
+        const ssize_t got = ::pread(fd_, map_ + offset, count, static_cast<off_t>(offset));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return RAD_E_IO;
+        offset += static_cast<uint64_t>(got);
+    }
+
+    /* Check both the open file and its current pathname. If the source changed
+     * while copying, the caller can snapshot the new revision on retry. */
+    struct stat after{}, named{};
+    if (::fstat(fd_, &after) != 0 || ::stat(path.c_str(), &named) != 0) return RAD_E_IO;
+    const auto same_revision = [](const struct stat& a, const struct stat& b) {
+#ifdef __APPLE__
+        const auto& am = a.st_mtimespec;
+        const auto& bm = b.st_mtimespec;
+        const auto& ac = a.st_ctimespec;
+        const auto& bc = b.st_ctimespec;
+#else
+        const auto& am = a.st_mtim;
+        const auto& bm = b.st_mtim;
+        const auto& ac = a.st_ctim;
+        const auto& bc = b.st_ctim;
+#endif
+        return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size &&
+               am.tv_sec == bm.tv_sec && am.tv_nsec == bm.tv_nsec &&
+               ac.tv_sec == bc.tv_sec && ac.tv_nsec == bc.tv_nsec;
+    };
+    if (!same_revision(before, after) || !same_revision(after, named)) return RAD_E_STATE;
+    if (::mprotect(map_, static_cast<size_t>(bytes), PROT_READ) != 0) return RAD_E_IO;
+    ::close(fd_);
+    fd_ = -1;
+    return RAD_OK;
+}
+
+int SafeTensorsFile::open_file(const std::string& path, const uint64_t* snapshot_limit) {
     close();
     path_ = path;
 
-    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (snapshot_limit ? O_NONBLOCK : 0));
     if (fd_ < 0) { RAD_ERR("%s: %s", path.c_str(), std::strerror(errno)); return RAD_E_IO; }
 
-    struct stat st{};
-    if (::fstat(fd_, &st) != 0) { RAD_ERR("%s: %s", path.c_str(), std::strerror(errno));
-                                  close(); return RAD_E_IO; }
-    map_bytes_ = (uint64_t)st.st_size;
-    if (map_bytes_ < 8) {
-        RAD_ERR("%s: %llu bytes -- too short to be safetensors", path.c_str(),
-                (unsigned long long)map_bytes_);
-        close();
-        return RAD_E_FORMAT;
-    }
+    if (snapshot_limit) {
+        const int status = read_snapshot(path, *snapshot_limit);
+        if (status < 0) {
+            RAD_ERR("%s: could not snapshot safetensors: %s", path.c_str(), rad_strerror(status));
+            close();
+            return status;
+        }
+    } else {
+        struct stat st{};
+        if (::fstat(fd_, &st) != 0) { RAD_ERR("%s: %s", path.c_str(), std::strerror(errno));
+                                      close(); return RAD_E_IO; }
+        map_bytes_ = (uint64_t)st.st_size;
+        if (map_bytes_ < 8) {
+            RAD_ERR("%s: %llu bytes -- too short to be safetensors", path.c_str(),
+                    (unsigned long long)map_bytes_);
+            close();
+            return RAD_E_FORMAT;
+        }
 
-    void* m = ::mmap(nullptr, (size_t)map_bytes_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    if (m == MAP_FAILED) { RAD_ERR("%s: mmap: %s", path.c_str(), std::strerror(errno));
-                           close(); return RAD_E_IO; }
-    map_ = (uint8_t*)m;
+        void* m = ::mmap(nullptr, (size_t)map_bytes_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (m == MAP_FAILED) { RAD_ERR("%s: mmap: %s", path.c_str(), std::strerror(errno));
+                               close(); return RAD_E_IO; }
+        map_ = (uint8_t*)m;
+    }
 
     uint64_t hlen = 0;
     std::memcpy(&hlen, map_, 8);

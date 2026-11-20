@@ -1,4 +1,14 @@
-# radiance
+# Radiance with Secondary Models
+
+Use Qwen Flash Next for chat or coding, edit a picture with Krea 2, then turn it into a
+video with Wan or MiniMax H3 on the same Radiance listener. Clients select a model per
+request. Upstream Radiance’s fleet manages when each model loads, parks or shares the GPUs.
+
+This branch adds one- and two-reference Krea edits, registered outpainting, Wan 2.2
+TI2V-5B, and W4A8 support for the H3 FL2VA and Ref2VA packages. Local LoRAs can be
+checked against a model before generation. The fork’s previous release was tested on
+two 32 GiB R9700s. This consolidation uses plugin ABI 42 and needs a matching engine
+and plugin build. [Fleet configuration](docs/MULTIMODEL.md) · [Krea editing guide](docs/GUIDE.md#krea-2-reference-edits-and-outfill)
 
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and
 music generation. Its HTTP API speaks OpenAI's chat, completions, Responses, images, audio and video
@@ -20,6 +30,13 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 
 | model | container | get it | fleet file |
 |---|---|---|---|
+| MiniMax H3 FL2VA W4A8 | `minimax-h3-fl2va-w4a8.rad` | [Model card and download](https://huggingface.co/rkcth/MiniMax-H3-FL2VA-Radiance-W4A8) | [fleet example](deploy/compose/flashnext-h3.radiance.yaml) |
+| MiniMax H3 Ref2VA W4A8 | `minimax-h3-ref2va-w4a8.rad` | [Model card and download](https://huggingface.co/rkcth/MiniMax-H3-Ref2VA-Radiance-W4A8) | [fleet example](deploy/compose/flashnext-h3.radiance.yaml) |
+| Wan 2.2 TI2V-5B BF16 | `wan-2.2-ti2v-5b-bf16.rad` | [Checkpoint](https://huggingface.co/rkcth/Wan-2.2-TI2V-5B-Radiance-BF16/resolve/main/wan-2.2-ti2v-5b-bf16.rad) · [Model card](https://huggingface.co/rkcth/Wan-2.2-TI2V-5B-Radiance-BF16) | [fleet example](deploy/compose/flashnext-wan-gemma.radiance.yaml) |
+| Huihui Gemma 4 26B MoE INT8 | `huihui-gemma4-26b-a4b-it-i8.rad` | [Checkpoint](https://huggingface.co/rkcth/Huihui-Gemma-4-26B-A4B-it-Abliterated-Radiance-INT8/resolve/main/huihui-gemma4-26b-a4b-it-i8.rad) · [Model card](https://huggingface.co/rkcth/Huihui-Gemma-4-26B-A4B-it-Abliterated-Radiance-INT8) | [fleet example](deploy/compose/flashnext-wan-gemma.radiance.yaml) |
+| Huihui Gemma 4 31B Dense W4A8 | `huihui-gemma4-31b-it-w4a8.rad` | [Checkpoint](https://huggingface.co/rkcth/Huihui-Gemma-4-31B-it-Abliterated-Radiance-W4A8/resolve/main/huihui-gemma4-31b-it-w4a8.rad) · [Model card](https://huggingface.co/rkcth/Huihui-Gemma-4-31B-it-Abliterated-Radiance-W4A8) | [fleet example](deploy/compose/flashnext-wan-gemma.radiance.yaml) |
+| Qwen Image 2.1 Uncensored IQ8R, fork package: text to image and reference edits | `qwen-image-2.1-uc-iq8r.rad` (16.1 GiB) | [download](https://huggingface.co/rkcth/Radiance-IQ8R-from-Qwen-Image-2.1-Uncensored) | [image fleet](deploy/compose/flashnext-images.radiance.yaml) |
+| Krea 2 Raw Edit IQ8R, fork package: generation, one- and two-reference edits, and outpainting | `krea-2-raw-edit-iq8r.rad` (17.2 GiB) | [download](https://huggingface.co/rkcth/Krea-2-Raw-Radiance-Edit-IQ8R) | [image fleet](deploy/compose/flashnext-images.radiance.yaml) |
 | Qwen3.8-Flash-Next: IQR-V4 experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | `tp1.yaml`, `tp2.yaml` |
 | Qwen3.8-Flash-Next abliterated (refusals removed): IQR-V4 trunk (GPTQ), codebook experts (round to nearest), MTP, vision | `qwen3.8-flash-next-uncensored-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/davetha/qwen3.8-flash-next-uncensored-iqr-v4) | — |
 | Qwen3.8-27B IQ8R (rotated int8), DFlash2 drafter, vision | `qwen3.8-27b-iq8r-dflash.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iq8r-dflash) | `tp2.yaml` |

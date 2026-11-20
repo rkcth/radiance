@@ -151,6 +151,8 @@ enum { kC = 24, kPatchVals = kC * kPatch * kPatch };
 /* Video sparse attention's tiles, in patches (time, row, column), for a checkpoint distilled with
  * it: 64 rows a tile, the dense segments cut into 64-row chunks of their own. */
 enum { kVsaT = 4, kVsaH = 4, kVsaW = 4, kVsaRows = kVsaT * kVsaH * kVsaW };
+/* The device selector's tile limit and the video driver's segment boundary capacity. */
+enum { kVsaTileLimit = 3072, kVsaPrefixSegments = 64 };
 
 /* ImageNet's normalisation, which the video decoder's pixels are in. */
 static const char* kPixMean = "0.485 0.456 0.406";
@@ -226,19 +228,29 @@ static int64_t vsa_keep(double sparsity, int64_t V) {
     const double keep = std::ceil((1.0 - sparsity) * (double)V);
     return std::max<int64_t>(1, std::min<int64_t>((int64_t)keep, V));
 }
-/* The most tiles a step has (the prompt's and the soundtrack's chunks, then the video's boxes) and
- * the most a video query keeps, over every size at the longest length. */
-static void vsa_bounds(double sparsity, int64_t* tiles, int64_t* keep) {
-    int64_t best = 0;
-    for (int64_t w = kMinSide; w <= (int64_t)kMaxArea / kMinSide; w += kMult)
-        for (int64_t h = kMinSide; h * w <= kMaxArea; h += kMult)
-            if (size_ok(w, h, kMaxArea))
-                best = std::max(best, vsa_video_tiles(max_lat_frames(), h / (kScale * kPatch),
-                                                      w / (kScale * kPatch)));
-    const int64_t prefix = ((int64_t)kMaxText + kVsaRows - 1) / kVsaRows +
-                           (kAudioCh * max_audio() + kVsaRows - 1) / kVsaRows;
-    *tiles = prefix + best;
-    *keep = vsa_keep(sparsity, best);
+static int64_t vsa_prefix_tiles(int64_t rows) { return (rows + kVsaRows - 1) / kVsaRows; }
+
+/* A packed step has at most max_rows. Each conditioning segment can add a padding tile, and
+ * the video can add more when a grid edge is not a multiple of four. */
+static void vsa_bounds(double sparsity, int64_t area, int64_t max_rows, int64_t* tiles,
+                       int64_t* keep) {
+    int64_t most_video_tiles = 0, most_video_padding = 0;
+    // An upscale pass can start below the output's minimum side or round its aspect ratio.
+    for (int64_t w = kMult; w * w <= kMaxAspect * area; w += kMult)
+        for (int64_t h = kMult; h * h <= kMaxAspect * area && h * w <= area; h += kMult) {
+            const int64_t ph = h / kMult, pw = w / kMult;
+            for (int64_t chunks = kMinChunks; chunks <= kMaxChunks; ++chunks) {
+                const int64_t frames = max_lat_frames(chunks);
+                const int64_t rows = frames * ph * pw;
+                if (rows >= max_rows) break;
+                const int64_t video_tiles = vsa_video_tiles(frames, ph, pw);
+                most_video_tiles = std::max(most_video_tiles, video_tiles);
+                most_video_padding = std::max(most_video_padding, video_tiles - rows / kVsaRows);
+            }
+        }
+    *tiles = std::min<int64_t>(kVsaTileLimit, vsa_prefix_tiles(max_rows) + kVsaPrefixSegments +
+                                           most_video_padding);
+    *keep = vsa_keep(sparsity, std::min(*tiles, most_video_tiles));
 }
 
 /* The packed sequence's rotary positions (diffusers' MiniMaxH3PrepareLayoutStep), the pack's
@@ -291,7 +303,7 @@ struct DitBlock {
     QuantFP8   q_attn{};
     GateQuantFP8 gq{};
     rad_op     op_mq1 = 0, op_mq2 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_ar2 = 0;
-    rad_op     op_sel = 0;         /* video sparse attention's tile selection */
+    rad_op     op_sel = 0, op_vsa = 0;
     rad_op     op_kq = 0;          /* the keys to int8 codes for the attention's scores */
     rad_op     op_vq = 0;          /* the values to E4M3 codes for the attention's P.V */
     /* The three modulation projections, one a modality, this rank's share of their rows; a
@@ -363,10 +375,8 @@ enum : int {
     kGrpTower   = 3300,
     kGrpVenc    = 3400,
     kGrpAenc    = 3500,
-    /* The encoders' weights only a host kernel reads (conv_in, the k=1 convs, the snake alphas):
-     * placement keeps a group with a host-only reader in host memory whole, so they are a group
-     * of their own. */
-    kGrpVencH   = 3450,
+    /* A host-only reader keeps its entire group in host memory. Keep the audio encoder's
+     * host-only weights apart from the weights read by GPU kernels. */
     kGrpAencH   = 3550,
 };
 
@@ -449,8 +459,10 @@ struct Model {
      * query's video tiles, the most tiles a step has and the most a query keeps, and the per-layer
      * selection and pooled-tile attention, [heads, tiles, k] i32 and [heads, tiles, head_dim]. */
     bool    vsa = false;
+    bool    vsa_gated = false;
     double  vsa_sparsity = 0.0;
     int64_t vsa_tiles = 0, vsa_k = 0;
+    int64_t vsa_min_rows = 0, vsa_dense_layers = 0;
     rad_buf b_sel = 0, b_coarse = 0;
     rad_buf b_k8 = 0, b_ks = 0;  /* the attention's keys at int8 codes and their scales */
     rad_buf b_v8 = 0, b_vs = 0;  /* its values at E4M3 codes and their column scales */
@@ -1270,6 +1282,15 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     RAD_ARCH_TRY(m.dit[0].down.probe(b, nm, g, nm.f("dit.blk.0.ffn_down"),
                                      { nm.ckpt("transformer.transformer_blocks.0.ff.net.2.weight") }));
     m.dit_i8 = m.dit[0].down.probed_i8;
+    // Rotated W4A8 consumes the same 128-column int8 activation groups as W8A8,
+    // after applying the weight's Hadamard basis to its inputs.
+    RadEncoding dit_encoding{};
+    const bool dit_rotated = weight_enc(b, nm.f("dit.blk.0.ffn_down.weight"), &dit_encoding) &&
+                             linear_is_wnh(dit_encoding);
+    if (dit_rotated && !rad_op_declared(b, "rms_mod_had_quant_i8g")) {
+        fprintf(stderr, "radiance: minimaxh3: rotated W4A8 requires rms_mod_had_quant_i8g\n");
+        return RAD_E_UNSUPPORTED;
+    }
     m.op_text = rw(b, RAD_OP(b, "lane_gather",
                              RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kMaxText), RAD_INT("n", D),
                                         RAD_INT("stride", (int64_t)kMaxText),
@@ -1289,13 +1310,17 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     RAD_ARCH_TRY(m.a_hm.declare_qs(b, nm, g, "dit.hm", D, 0, m.dit_i8, !m.dit_i8));
     /* rms_mod_quant_i8 writes a_hm's int8 codes, as rms_mod_quant_fp8 writes its E4M3 ones. */
     m.a_hm.q8_fed = m.dit_i8;
+    m.a_hm.q8_rot = dit_rotated;
     /* With video sparse attention a fourth projection beside q, k and v gates the pooled-tile
      * attention into each row's output. */
-    const int64_t nparts = m.vsa ? 4 : 3;
+    const int64_t nparts = m.vsa_gated ? 4 : 3;
     m.b_qkv = decl_b(b, nm.f("dit.qkv"), RAD_BF16, { T, nparts * qd });
     if (m.vsa) {
         m.b_sel = decl_b(b, nm.f("dit.vsa_sel"), RAD_I32, { g.n_head, m.vsa_tiles, m.vsa_k });
-        m.b_coarse = decl_b(b, nm.f("dit.vsa_coarse"), RAD_BF16, { g.n_head, m.vsa_tiles, hd });
+        if (m.vsa_gated)
+            m.b_coarse = decl_b(b, nm.f("dit.vsa_coarse"), RAD_BF16,
+                                { g.n_head, m.vsa_tiles, hd });
+        if (!m.b_sel || (m.vsa_gated && !m.b_coarse)) return RAD_E_INVAL;
     }
     m.b_k8 = decl_b(b, nm.f("dit.k8"), RAD_I8, { T, qd });
     m.b_ks = decl_b(b, nm.f("dit.ks"), RAD_F32, { T, qd / hd });
@@ -1305,6 +1330,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "dit.attn", qd, 0, m.dit_i8, !m.dit_i8));
     /* q_attn writes the int8 codes the output projection reads. */
     m.a_attn.q8_fed = m.dit_i8;
+    m.a_attn.q8_rot = dit_rotated;
     m.b_ao = decl_b(b, nm.f("dit.ao"), RAD_BF16, { T, D });
     /* More than one rank: the all-reduces of b_ao's halves run on the second lane (step_dit). */
     if (g.world > 1) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ao));
@@ -1317,7 +1343,9 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* A block's modulated norm: the previous block's delta added to `b_h`, the norm, and `a_hm`'s
      * codes, int8 or E4M3, in one op. */
     auto mod_q = [&](rad_weight w, bool gated) {
-        rad_op op = RAD_OP(b, m.dit_i8 ? "rms_mod_quant_i8" : "rms_mod_quant_fp8",
+        const char* norm = dit_rotated ? "rms_mod_had_quant_i8g"
+                         : m.dit_i8 ? "rms_mod_quant_i8" : "rms_mod_quant_fp8";
+        rad_op op = RAD_OP(b, norm,
                            RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
                                       RAD_INT("group", RAD_FP8_BLOCK),
                                       RAD_INT("gated", gated ? 1 : 0), RAD_STR("dtype", "bf16")),
@@ -1347,7 +1375,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                        RAD_BF16, { hd }, acc, grp);
         if (!B.w_n1 || !B.w_n2 || !B.w_qn || !B.w_kn) return RAD_E_INVAL;
         B.op_mq1 = mod_q(B.w_n1, l > 0);
-        if (m.vsa)
+        if (m.vsa_gated)
             RAD_ARCH_TRY(B.qkv.declare(b, nm, g, nm.f("%s.attn_qkv", dn), 4 * qd, D, RAD_SHARD_ROW,
                                        grp_layer(grp),
                                        { nm.ckpt("%s.attn.to_q.weight", pre),
@@ -1383,31 +1411,39 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_STR("dtype", "bf16")),
                                RAD_NOWEIGHTS),
                      { m.b_qkv }, { m.b_v8, m.b_vs });
-        if (m.vsa) {
+        if (m.vsa && l >= m.vsa_dense_layers) {
             /* Tiles of the packed sequence: each query tile's best video tiles by pooled score
              * and the softmax over every tile's pooled keys, then attention over the kept tiles
              * with that pooled term gated in. */
-            B.op_sel = rw(b, RAD_OP(b, "vsa_select",
+            B.op_sel = RAD_OP(b, "vsa_select",
                                     RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd),
                                                RAD_INT("tile_t", kVsaT), RAD_INT("tile_h", kVsaH),
                                                RAD_INT("tile_w", kVsaW), RAD_INT("patch", kPatch),
                                                RAD_F64("sparsity", m.vsa_sparsity),
                                                RAD_F64("scale", 1.0 / std::sqrt((double)hd))),
-                                    RAD_NOWEIGHTS),
-                          { m.b_qkv }, { m.b_sel, m.b_coarse });
+                                    RAD_NOWEIGHTS);
             /* The kept tiles' scores in int8, as the dense form below takes them. */
-            B.op_attn = rw(b, RAD_OP(b, "attn_vsa",
+            B.op_vsa = RAD_OP(b, "attn_vsa",
                                      RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd),
                                                 RAD_INT("tile_t", kVsaT), RAD_INT("tile_h", kVsaH),
                                                 RAD_INT("tile_w", kVsaW), RAD_INT("patch", kPatch),
                                                 RAD_F64("sparsity", m.vsa_sparsity),
                                                 RAD_F64("scale", 1.0 / std::sqrt((double)hd)),
                                                 RAD_STR("qk", "i8"), RAD_STR("pv", "fp8")),
-                                     RAD_NOWEIGHTS),
-                           { m.b_qkv, m.b_sel, m.b_coarse, m.b_k8, m.b_ks, m.b_v8, m.b_vs },
-                           { m.a_attn.x });
-            if (!B.op_sel) return RAD_E_INVAL;
-        } else {
+                                     RAD_NOWEIGHTS);
+            if (!B.op_sel || !B.op_vsa) return RAD_E_INVAL;
+            if (m.vsa_gated) {
+                rw(b, B.op_sel, { m.b_qkv }, { m.b_sel, m.b_coarse });
+                rw(b, B.op_vsa,
+                   { m.b_qkv, m.b_sel, m.b_coarse, m.b_k8, m.b_ks, m.b_v8, m.b_vs },
+                   { m.a_attn.x });
+            } else {
+                rw(b, B.op_sel, { m.b_qkv }, { m.b_sel });
+                rw(b, B.op_vsa, { m.b_qkv, m.b_sel, m.b_k8, m.b_ks, m.b_v8, m.b_vs },
+                   { m.a_attn.x });
+            }
+        }
+        if (!m.vsa_gated) {
             /* Dense attention with int8 scores: the keys quantised per (row, head) by
              * quant_act_i8g, the query inside the op, the score an exact integer product times
              * both scales, P.V in bf16. The prefix-free form of attn_prefix_self, the op that
@@ -1424,7 +1460,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                      RAD_NOWEIGHTS),
                            { m.b_qkv, m.b_k8, m.b_ks, m.b_v8, m.b_vs }, { m.a_attn.x });
         }
-        if (!B.op_kq || !B.op_vq) return RAD_E_INVAL;
+        if (!B.op_kq || !B.op_vq || (!m.vsa_gated && !B.op_attn)) return RAD_E_INVAL;
         RAD_ARCH_TRY(B.q_attn.declare(b, g, m.a_attn, qd));
         RAD_ARCH_TRY(B.o.declare(b, nm, g, nm.f("%s.attn_output", dn), D, qd, RAD_SHARD_COL,
                                  grp_layer(grp), { nm.ckpt("%s.attn.to_out.0.weight", pre) },
@@ -1449,7 +1485,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                     grp_layer(grp), { nm.ckpt("%s.ff.net.2.weight", pre) },
                                     m.a_ffn, m.b_ao));
         B.op_ar2 = all_reduce(b, g, m.b_ao, std::min<int64_t>(T, kArRows), D, "bf16", true);
-        if (!B.op_mq1 || !B.op_mq2 || !B.op_qkr || !B.op_attn) return RAD_E_INVAL;
+        if (!B.op_mq1 || !B.op_mq2 || !B.op_qkr) return RAD_E_INVAL;
     }
 
     /* ---- the output: norm_out's modulated norm (the last block's branch gated in), the heads in
@@ -2255,9 +2291,24 @@ static rad_op venc_conv(RadBuilder* b, int64_t M, int64_t cin, int64_t cout, int
                              RAD_PARAMS(RAD_RANGE("M", 1, M), RAD_INT("cin", cin),
                                         RAD_INT("cout", cout), RAD_INT("k", k), RAD_INT("kt", k),
                                         RAD_INT("causal", 1), RAD_INT("reflect", 1),
+                                        RAD_INT("stride", 1), RAD_INT("stride_t", 1),
+                                        RAD_STR("pad", "same"), RAD_STR("tpad", "zero"),
+                                        RAD_INT("tpre", 0),
                                         RAD_STR("dtype", "bf16")),
                              RAD_WEIGHTS(w, bias));
     return res ? rw(b, op, { x, res }, { y }) : rw(b, op, { x }, { y });
+}
+
+static rad_op venc_pointwise(RadBuilder* b, int64_t rows, int64_t cin, int64_t cout,
+                            rad_weight w, rad_weight bias) {
+    if (!w || !bias) return 0;
+    return RAD_OP(b, "conv3d_ndhwc",
+                  RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("cin", cin), RAD_INT("cout", cout),
+                             RAD_INT("k", 1), RAD_INT("kt", 1), RAD_INT("causal", 0),
+                             RAD_INT("reflect", 0), RAD_INT("stride", 1), RAD_INT("stride_t", 1),
+                             RAD_STR("pad", "same"), RAD_STR("tpad", "zero"), RAD_INT("tpre", 0),
+                             RAD_STR("dtype", "bf16")),
+                  RAD_WEIGHTS(w, bias));
 }
 
 /* GroupNorm over a level's whole clip volume, then SiLU. */
@@ -2319,11 +2370,6 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     auto wb = [&](const char* dn, const char* src, std::initializer_list<int64_t> shape) {
         return wcopy(b, dn, src, RAD_BF16, shape, acc, gv);
     };
-    /* conv_in's and the k=1 convolutions', f32, read by a host kernel (kGrpVencH). */
-    auto wh = [&](const char* dn, const char* src, std::initializer_list<int64_t> shape) {
-        return wcopy(b, dn, src, RAD_F32, shape, acc, kGrpVencH);
-    };
-
     /* Each level's frames, rows and rows a frame: a full clip at 256 x 256, or a frame of the
      * canvas, whichever is more. */
     int64_t tf[6], sd[6] = { 1, 1, 1, 1, 1, 1 }, R[6], PF[6];
@@ -2378,15 +2424,11 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                      RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
     m.b_eqt = decl_b(b, nm.f("venc.qt"), RAD_BF16, { m.enc_tiles * (int64_t)kTile * kTile, 48 },
                      RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
-    m.ve_qw = wh(nm.f("venc.q.weight"), nm.ckpt("vae.quant_conv.weight"), { 48, 48, 1, 1, 1 });
-    m.ve_qb = wh(nm.f("venc.q.bias"), nm.ckpt("vae.quant_conv.bias"), { 48 });
+    m.ve_qw = wt(nm.f("venc.q.weight"), nm.ckpt("vae.quant_conv.weight"), { 48, 48, 1, 1, 1 });
+    m.ve_qb = wt(nm.f("venc.q.bias"), nm.ckpt("vae.quant_conv.bias"), { 48 });
     /* The whole-canvas pass writes b_eq2; the tiled pass writes a tile's slice of b_eqt, which
      * op_vt_join blends into b_eq2. */
-    m.op_ve_q = rw(b, RAD_OP(b, "conv3d_ndhwc",
-                             RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("cin", 48),
-                                        RAD_INT("cout", 48), RAD_INT("k", 1), RAD_INT("kt", 1),
-                                        RAD_STR("dtype", "bf16")),
-                             RAD_WEIGHTS(m.ve_qw, m.ve_qb)),
+    m.op_ve_q = rw(b, venc_pointwise(b, R[5], 48, 48, m.ve_qw, m.ve_qb),
                    { m.b_eq48 }, { m.b_eq2, m.b_eqt });
     if (!m.op_ve_q) return RAD_E_INVAL;
     m.op_ve_pix = rw(b, RAD_OP(b, "chan_affine",
@@ -2404,8 +2446,8 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                        { m.b_epix32 }, { m.b_epix });
     /* Mapped by the presence check above. */
     m.ve_cinw = decl_w(b, nm.f("venc.cin.weight"), RAD_F32, { (int64_t)dims[0], 3, 3, 3, 3 },
-                       acc, RAD_SHARD_NONE, grp_layer(kGrpVencH));
-    m.ve_cinb = wh(nm.f("venc.cin.bias"), nm.ckpt("vae.encoder.conv_in.bias"), { (int64_t)dims[0] });
+                       acc, RAD_SHARD_NONE, grp_layer(gv));
+    m.ve_cinb = wt(nm.f("venc.cin.bias"), nm.ckpt("vae.encoder.conv_in.bias"), { (int64_t)dims[0] });
     if (!m.op_ve_pix || !m.op_ve_pcast) return RAD_E_INVAL;
     m.v_lv.reserve(6);
     for (int L = 0; L < 6; ++L) {
@@ -2427,15 +2469,11 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                  RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST)
                          : m.v_lv[(size_t)L - 1].a;
             const char* sc_src = nm.ckpt("vae.encoder.down_blocks.%d.resnets.0.conv_shortcut", L);
-            E.scw = wh(nm.f("venc.l%d.sc.weight", L), nm.ckpt("%s.weight", sc_src),
+            E.scw = wt(nm.f("venc.l%d.sc.weight", L), nm.ckpt("%s.weight", sc_src),
                        { cout, cin, 1, 1, 1 });
-            E.scb = wh(nm.f("venc.l%d.sc.bias", L), nm.ckpt("%s.bias", sc_src), { cout });
+            E.scb = wt(nm.f("venc.l%d.sc.bias", L), nm.ckpt("%s.bias", sc_src), { cout });
             if (!E.scw || !E.scb) return RAD_E_INVAL;
-            E.op_sc = rw(b, RAD_OP(b, "conv3d_ndhwc",
-                                   RAD_PARAMS(RAD_RANGE("M", 1, R[L]), RAD_INT("cin", cin),
-                                              RAD_INT("cout", cout), RAD_INT("k", 1),
-                                              RAD_INT("kt", 1), RAD_STR("dtype", "bf16")),
-                                   RAD_WEIGHTS(E.scw, E.scb)),
+            E.op_sc = rw(b, venc_pointwise(b, R[L], cin, cout, E.scw, E.scb),
                          { E.in }, { E.a });
             if (!E.op_sc) return RAD_E_INVAL;
         }
@@ -2580,7 +2618,7 @@ static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* Read once a media, as the video encoder's. */
     const int acc = RAD_ACCESS_PER_REQUEST;
     const int ga = kGrpAenc;
-    /* The snake alphas: `snake` in f32 is a host kernel (kGrpVencH). */
+    /* The snake alphas are read by a host kernel. */
     const int gh = kGrpAencH;
     static const int64_t kStr[5] = { 2, 4, 4, 5, 5 };
     for (int i = 0; i < 5; ++i)
@@ -2957,6 +2995,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const char* backend = rad_meta_gets(meta, "fastvideo_inference.attention_backend", "");
     if (!std::strcmp(backend, "VIDEO_SPARSE_ATTN_H3")) {
         m.vsa = true;
+        m.vsa_gated = rad_meta_geti(meta, "fastvideo_inference.vsa_gate_compress", 1) != 0;
+        m.vsa_min_rows = rad_meta_geti(meta, "fastvideo_inference.vsa_min_tokens", 0);
+        m.vsa_dense_layers = rad_meta_geti(meta, "fastvideo_inference.vsa_dense_prefix_layers", 0);
+        if (m.vsa_min_rows < 0 || m.vsa_dense_layers < 0 || m.vsa_dense_layers >= gd.n_layer ||
+            (m.vsa_gated && (m.vsa_min_rows || m.vsa_dense_layers))) {
+            fprintf(stderr, "radiance: minimaxh3: invalid video sparse attention cutoffs\n");
+            return RAD_E_UNSUPPORTED;
+        }
         m.vsa_sparsity = rad_meta_getf(meta, "fastvideo_inference.vsa_sparsity", -1.0);
         const long long tile = rad_meta_geti(meta, "fastvideo_inference.vsa_tile_size", 0);
         if (tile != kVsaRows || !(m.vsa_sparsity >= 0.0 && m.vsa_sparsity < 1.0)) {
@@ -2965,7 +3011,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "in [0, 1)\n", tile, m.vsa_sparsity, (int)kVsaRows);
             return RAD_E_UNSUPPORTED;
         }
-        vsa_bounds(m.vsa_sparsity, &m.vsa_tiles, &m.vsa_k);
+        vsa_bounds(m.vsa_sparsity, m.max_area, gd.max_tok, &m.vsa_tiles, &m.vsa_k);
     } else if (*backend && std::strcmp(backend, "FLASH_ATTN")) {
         fprintf(stderr, "radiance: minimaxh3: the checkpoint was made for the attention '%s'; this "
                         "plugin runs dense attention and VIDEO_SPARSE_ATTN_H3\n", backend);
@@ -3379,6 +3425,22 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         aseg = pk.segs[pk.segs.size() - 2].start;
         vseg = vid.start;
     }
+    const bool use_vsa = m.vsa && R >= m.vsa_min_rows;
+    if (use_vsa) {
+        int64_t prefix = 0;
+        if (V->ref_tab) {
+            for (const Ref2VASeg& s : pk.segs)
+                if (s.start < vseg) prefix += vsa_prefix_tiles(s.end - s.start);
+        } else {
+            prefix = vsa_prefix_tiles(nt) + vsa_prefix_tiles(arows);
+        }
+        const int64_t video = vsa_video_tiles(V->geom.lat_frames, V->geom.lat_h / kPatch,
+                                              V->geom.lat_w / kPatch);
+        if (prefix + video > m.vsa_tiles || vsa_keep(m.vsa_sparsity, video) > m.vsa_k) {
+            rad_step_fail(c, "minimaxh3: packed sequence exceeds sparse attention tile capacity");
+            return;
+        }
+    }
 
     if (V->step == 0) {
         RAD_ISSUE_N(c, m.op_rnd_v, vrows, praw(V->first_d, RAD_I32, 1), praw(V->seed, RAD_U32, 2),
@@ -3495,13 +3557,15 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                     RAD_W(B.w_kn));
         RAD_ISSUE_N(c, B.op_kq, R, bcol(m.b_qkv, qd, qd, R), brows(m.b_k8, R), brows(m.b_ks, R));
         RAD_ISSUE_N(c, B.op_vq, R, bcol(m.b_qkv, 2 * qd, qd, R), brows(m.b_v8, R), RAD_B(m.b_vs));
-        if (m.vsa) {
+        if (use_vsa && B.op_vsa) {
+            const RadOperand pooled_values = m.vsa_gated ? bcol(m.b_qkv, 2 * qd, qd, R) : RAD_NONE;
+            const RadOperand coarse = m.vsa_gated ? RAD_B(m.b_coarse) : RAD_NONE;
+            const RadOperand gate = m.vsa_gated ? bcol(m.b_qkv, 3 * qd, qd, R) : RAD_NONE;
             RAD_ISSUE_N(c, B.op_sel, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
-                        bcol(m.b_qkv, 2 * qd, qd, R), segs, geom, RAD_B(m.b_sel),
-                        RAD_B(m.b_coarse));
-            RAD_ISSUE_N(c, B.op_attn, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
-                        brows(m.b_v8, R), segs, geom, RAD_B(m.b_sel), RAD_B(m.b_coarse),
-                        bcol(m.b_qkv, 3 * qd, qd, R), brows(m.a_attn.x, R), brows(m.b_k8, R),
+                        pooled_values, segs, geom, RAD_B(m.b_sel), coarse);
+            RAD_ISSUE_N(c, B.op_vsa, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
+                        brows(m.b_v8, R), segs, geom, RAD_B(m.b_sel), coarse,
+                        gate, brows(m.a_attn.x, R), brows(m.b_k8, R),
                         brows(m.b_ks, R), RAD_B(m.b_vs));
         } else {
             RAD_ISSUE_N(c, B.op_attn, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
@@ -3755,14 +3819,71 @@ static void step_upscale(RadCtx* c, const RadBatch* batch, const Model& m) {
                 brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
 }
 
+/* Encode one causal volume, with geometry staged on the device and issue sizes on the host. */
+static void step_venc_volume(RadCtx* c, const Model& m, const int32_t* geom, int64_t frames,
+                             int64_t height, int64_t width, RadOperand pixels, RadOperand moments) {
+    const RadOperand stats = RAD_B(m.b_egn);
+    const int64_t half_t = (frames + 1) / 2, quarter_t = (half_t + 1) / 2;
+    const int64_t times[] = { frames, frames, half_t, quarter_t, quarter_t, quarter_t };
+    RadOperand level_geom[6];
+    int64_t rows[6];
+    for (int level = 0; level < 6; ++level) {
+        const int level_shape = std::min(level, 4);
+        const int scale = 1 << level_shape;
+        rows[level] = times[level] * (height / scale) * (width / scale);
+        level_geom[level] = praw(geom + 3 * level_shape, RAD_I32, 3);
+    }
+    const int64_t input_rows = rows[0];
+    RAD_ISSUE_N(c, m.op_ve_pix, input_rows, pixels, brows(m.b_epix32, input_rows));
+    RAD_ISSUE_N(c, m.op_ve_pcast, input_rows, brows(m.b_epix32, input_rows),
+                brows(m.b_epix, input_rows));
+    RAD_ISSUE_N(c, m.op_ve_cin, input_rows, brows(m.b_epix, input_rows), RAD_W(m.ve_cinw),
+                RAD_W(m.ve_cinb), level_geom[0], RAD_NONE, brows(m.v_lv[0].a, input_rows));
+    for (int level = 0; level < 6; ++level) {
+        const Model::VEncLevel& layer = m.v_lv[(size_t)level];
+        const int64_t n = rows[level];
+        const RadOperand gg = level_geom[level];
+        for (int blk = 0; blk < 2; ++blk) {
+            const Model::VEncBlock& block = layer.blk[blk];
+            const bool shortcut = blk == 0 && layer.op_sc;
+            const rad_buf input = shortcut ? layer.in : layer.a;
+            const rad_buf normalized = shortcut ? layer.in : layer.b;
+            /* The shortcut reads the raw input before norm1 overwrites it. */
+            if (shortcut)
+                RAD_ISSUE_N(c, layer.op_sc, n, brows(layer.in, n), RAD_W(layer.scw),
+                            RAD_W(layer.scb), gg, RAD_NONE, brows(layer.a, n));
+            RAD_ISSUE_N(c, block.op_n1, n, brows(input, n), RAD_W(block.n1w), RAD_W(block.n1b),
+                        RAD_NONE, stats, brows(normalized, n));
+            RAD_ISSUE_N(c, block.op_c1, n, brows(normalized, n), RAD_W(block.c1w), RAD_W(block.c1b),
+                        gg, RAD_NONE, brows(layer.c, n));
+            RAD_ISSUE_N(c, block.op_n2, n, brows(layer.c, n), RAD_W(block.n2w), RAD_W(block.n2b),
+                        RAD_NONE, stats, brows(layer.b, n));
+            RAD_ISSUE_N(c, block.op_c2, n, brows(layer.b, n), RAD_W(block.c2w), RAD_W(block.c2b),
+                        gg, brows(layer.a, n), brows(layer.a, n));
+        }
+        if (level < 4) {
+            const Model::VEncLevel& next = m.v_lv[(size_t)level + 1];
+            const rad_buf output = next.op_sc ? next.in : next.a;
+            RAD_ISSUE_N(c, layer.op_dn, rows[level + 1], brows(layer.a, n), RAD_W(layer.dnw),
+                        RAD_W(layer.dnb), gg, RAD_NONE, brows(output, rows[level + 1]));
+        }
+    }
+    const int64_t n = rows[5];
+    RAD_ISSUE_N(c, m.op_ve_nout, n, brows(m.v_lv[5].a, n), RAD_W(m.ve_now), RAD_W(m.ve_nob),
+                RAD_NONE, stats, brows(m.v_lv[5].b, n));
+    RAD_ISSUE_N(c, m.op_ve_cout, n, brows(m.v_lv[5].b, n), RAD_W(m.ve_coutw), RAD_W(m.ve_coutb),
+                level_geom[5], RAD_NONE, brows(m.b_eq48, n));
+    RAD_ISSUE_N(c, m.op_ve_q, n, brows(m.b_eq48, n), RAD_W(m.ve_qw), RAD_W(m.ve_qb),
+                level_geom[5], RAD_NONE, moments);
+}
+
 /* A picture larger than a tile, encoded as ComfyUI's vae.py tiled_encode does: overlapping tiles,
  * each through the trunk alone (GroupNorm sees only its tile), and each tile's moments blended
  * with its unblended top and left neighbours into the canvas (vtile_join). A tile's geometries are
  * its row of b_tplan, which vtile_plan writes as vae.py splits. Returns the slot row past the
  * media's latents. */
 static int64_t step_venc_tiled(RadCtx* c, const RadVideoGenBatch* V, const Model& m,
-                               const int32_t* gd, int64_t H, int64_t W, int64_t ppc,
-                               const RadOperand st, int64_t row0) {
+                               const int32_t* gd, int64_t H, int64_t W, int64_t ppc, int64_t row0) {
     const int64_t lat_h = H / kVaeRatio, lat_w = W / kVaeRatio;
     const std::vector<int64_t> ty = tile_starts(lat_h), tx = tile_starts(lat_w);
     const int64_t nh = (int64_t)ty.size(), nw = (int64_t)tx.size(), nt = nh * nw;
@@ -3793,54 +3914,9 @@ static int64_t step_venc_tiled(RadCtx* c, const RadVideoGenBatch* V, const Model
         const Tile& T = tl[t];
         const int64_t th = T.ny * kVaeRatio, tw = T.nx * kVaeRatio;   /* the tile, in pixels */
         const int64_t Rpix = th * tw, R5 = T.ny * T.nx;
-        int64_t R[6];
-        for (int L = 0; L < 6; ++L) {
-            const int64_t d = 1 << std::min(L, 4);   /* the level's spatial divisor */
-            R[L] = (th / d) * (tw / d);
-        }
-        /* The tile's plan row: its six {1, side, side} geometry entries, one frame deep. */
-        const int32_t* tr = tp + 22 * (int64_t)t;
-        const RadOperand gg[6] = { praw(tr + 4, RAD_I32, 3), praw(tr + 7, RAD_I32, 3),
-                                   praw(tr + 10, RAD_I32, 3), praw(tr + 13, RAD_I32, 3),
-                                   praw(tr + 16, RAD_I32, 3), praw(tr + 19, RAD_I32, 3) };
-        RAD_ISSUE_N(c, m.op_ve_pix, Rpix, brow_slice(m.b_vtile, T.prow, Rpix, 3),
-                    brows(m.b_epix32, Rpix));
-        RAD_ISSUE_N(c, m.op_ve_pcast, Rpix, brows(m.b_epix32, Rpix), brows(m.b_epix, Rpix));
-        RAD_ISSUE_N(c, m.op_ve_cin, Rpix, brows(m.b_epix, Rpix), RAD_W(m.ve_cinw),
-                    RAD_W(m.ve_cinb), gg[0], RAD_NONE, brows(m.v_lv[0].a, Rpix));
-        for (int L = 0; L < 6; ++L) {
-            const Model::VEncLevel& E = m.v_lv[(size_t)L];
-            const bool sc = E.op_sc;
-            for (int blk = 0; blk < 2; ++blk) {
-                const Model::VEncBlock& B = E.blk[blk];
-                const bool f0 = blk == 0 && sc;
-                const rad_buf xa = f0 ? E.in : E.a, nb = f0 ? E.in : E.b;
-                /* The shortcut convolves the raw input, before norm1 (as in the plain loop). */
-                if (f0)
-                    RAD_ISSUE_N(c, E.op_sc, R[L], brows(E.in, R[L]), RAD_W(E.scw), RAD_W(E.scb),
-                                gg[L], RAD_NONE, brows(E.a, R[L]));
-                RAD_ISSUE_N(c, B.op_n1, R[L], brows(xa, R[L]), RAD_W(B.n1w), RAD_W(B.n1b),
-                            RAD_NONE, st, brows(nb, R[L]));
-                RAD_ISSUE_N(c, B.op_c1, R[L], brows(nb, R[L]), RAD_W(B.c1w), RAD_W(B.c1b),
-                            gg[L], RAD_NONE, brows(E.c, R[L]));
-                RAD_ISSUE_N(c, B.op_n2, R[L], brows(E.c, R[L]), RAD_W(B.n2w), RAD_W(B.n2b),
-                            RAD_NONE, st, brows(E.b, R[L]));
-                RAD_ISSUE_N(c, B.op_c2, R[L], brows(E.b, R[L]), RAD_W(B.c2w), RAD_W(B.c2b),
-                            gg[L], brows(E.a, R[L]), brows(E.a, R[L]));
-            }
-            if (L < 4) {
-                const Model::VEncLevel& X = m.v_lv[(size_t)L + 1];
-                const rad_buf y = X.op_sc ? X.in : X.a;
-                RAD_ISSUE_N(c, E.op_dn, R[L + 1], brows(E.a, R[L]), RAD_W(E.dnw), RAD_W(E.dnb),
-                            gg[L], RAD_NONE, brows(y, R[L + 1]));
-            }
-        }
-        RAD_ISSUE_N(c, m.op_ve_nout, R5, brows(m.v_lv[5].a, R5), RAD_W(m.ve_now), RAD_W(m.ve_nob),
-                    RAD_NONE, st, brows(m.v_lv[5].b, R5));
-        RAD_ISSUE_N(c, m.op_ve_cout, R5, brows(m.v_lv[5].b, R5), RAD_W(m.ve_coutw),
-                    RAD_W(m.ve_coutb), gg[5], RAD_NONE, brows(m.b_eq48, R5));
-        RAD_ISSUE_N(c, m.op_ve_q, R5, brows(m.b_eq48, R5), RAD_W(m.ve_qw), RAD_W(m.ve_qb), gg[5],
-                    RAD_NONE, brow_slice(m.b_eqt, T.mrow, R5, 48));
+        /* Skip the origin and extents in the tile plan to reach the volume geometries. */
+        step_venc_volume(c, m, tp + 22 * (int64_t)t + 4, 1, th, tw,
+                         brow_slice(m.b_vtile, T.prow, Rpix, 3), brow_slice(m.b_eqt, T.mrow, R5, 48));
     }
     /* The blend over the canvas (gd's level-4/5 entry, in latents), then the plain path's fold:
      * the canvas has a one-clip encode's b_eq2 layout. */
@@ -3882,65 +3958,19 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
         rad_step_fail(c, "minimaxh3: a Vencode pass whose latents overflow the lane's slot");
         return;
     }
-    const RadOperand st = RAD_B(m.b_egn);
-    /* Each level's volume in the geometry; the last two levels have no downsampler between
-     * them. */
-    static const int kVOrg[6] = { 0, 3, 6, 9, 12, 12 };
     int64_t frow = row0;
     /* A one-frame media larger than a tile goes through the tiled path, as vae.py tiles its image
      * encodes; a clip never does, since venc_geom bounds its sides to kEncMaxSide. */
     const bool tiled = V->enc_frames == 1 && (H / kVaeRatio > kTile || W / kVaeRatio > kTile);
     if (tiled)
-        frow = step_venc_tiled(c, V, m, gd, H, W, ppc, st, row0);
+        frow = step_venc_tiled(c, V, m, gd, H, W, ppc, row0);
     else
     for (int64_t cc = 0; cc < n_clips; ++cc) {
         const bool last = cc == n_clips - 1;
         const int64_t R0 = (int64_t)g[0] * H * W;
-        const RadOperand gg[6] = { praw(gd + kVOrg[0], RAD_I32, 3), praw(gd + kVOrg[1], RAD_I32, 3),
-                                   praw(gd + kVOrg[2], RAD_I32, 3), praw(gd + kVOrg[3], RAD_I32, 3),
-                                   praw(gd + kVOrg[4], RAD_I32, 3), praw(gd + kVOrg[5], RAD_I32, 3) };
-        RAD_ISSUE_N(c, m.op_ve_pix, R0, praw2(V->enc_pixels + cc * R0 * 3, RAD_F32, R0, 3),
-                    brows(m.b_epix32, R0));
-        RAD_ISSUE_N(c, m.op_ve_pcast, R0, brows(m.b_epix32, R0), brows(m.b_epix, R0));
-        RAD_ISSUE_N(c, m.op_ve_cin, R0, brows(m.b_epix, R0), RAD_W(m.ve_cinw), RAD_W(m.ve_cinb),
-                    gg[0], RAD_NONE, brows(m.v_lv[0].a, R0));
-        for (int L = 0; L < 6; ++L) {
-            const Model::VEncLevel& E = m.v_lv[(size_t)L];
-            const int64_t R = (int64_t)g[kVOrg[L]] * g[kVOrg[L] + 1] * g[kVOrg[L] + 2];
-            const bool sc = E.op_sc;
-            for (int blk = 0; blk < 2; ++blk) {
-                const Model::VEncBlock& B = E.blk[blk];
-                const bool f0 = blk == 0 && sc;
-                const rad_buf xa = f0 ? E.in : E.a, nb = f0 ? E.in : E.b;
-                /* The shortcut convolves the raw input, so it runs before norm1 normalises `in` in
-                 * place. */
-                if (f0)
-                    RAD_ISSUE_N(c, E.op_sc, R, brows(E.in, R), RAD_W(E.scw), RAD_W(E.scb), gg[L],
-                                RAD_NONE, brows(E.a, R));
-                RAD_ISSUE_N(c, B.op_n1, R, brows(xa, R), RAD_W(B.n1w), RAD_W(B.n1b), RAD_NONE, st,
-                            brows(nb, R));
-                RAD_ISSUE_N(c, B.op_c1, R, brows(nb, R), RAD_W(B.c1w), RAD_W(B.c1b), gg[L],
-                            RAD_NONE, brows(E.c, R));
-                RAD_ISSUE_N(c, B.op_n2, R, brows(E.c, R), RAD_W(B.n2w), RAD_W(B.n2b), RAD_NONE, st,
-                            brows(E.b, R));
-                RAD_ISSUE_N(c, B.op_c2, R, brows(E.b, R), RAD_W(B.c2w), RAD_W(B.c2b), gg[L],
-                            brows(E.a, R), brows(E.a, R));
-            }
-            if (L < 4) {
-                const Model::VEncLevel& X = m.v_lv[(size_t)L + 1];
-                const int64_t RX = (int64_t)g[3 * (L + 1)] * g[3 * (L + 1) + 1] * g[3 * (L + 1) + 2];
-                const rad_buf y = X.op_sc ? X.in : X.a;
-                RAD_ISSUE_N(c, E.op_dn, RX, brows(E.a, R), RAD_W(E.dnw), RAD_W(E.dnb), gg[L],
-                            RAD_NONE, brows(y, RX));
-            }
-        }
         const int64_t R5 = (int64_t)g[12] * g[13] * g[14];
-        RAD_ISSUE_N(c, m.op_ve_nout, R5, brows(m.v_lv[5].a, R5), RAD_W(m.ve_now), RAD_W(m.ve_nob),
-                    RAD_NONE, st, brows(m.v_lv[5].b, R5));
-        RAD_ISSUE_N(c, m.op_ve_cout, R5, brows(m.v_lv[5].b, R5), RAD_W(m.ve_coutw),
-                    RAD_W(m.ve_coutb), gg[5], RAD_NONE, brows(m.b_eq48, R5));
-        RAD_ISSUE_N(c, m.op_ve_q, R5, brows(m.b_eq48, R5), RAD_W(m.ve_qw), RAD_W(m.ve_qb), gg[5],
-                    RAD_NONE, brows(m.b_eq2, R5));
+        step_venc_volume(c, m, gd, g[0], H, W,
+                         praw2(V->enc_pixels + cc * R0 * 3, RAD_F32, R0, 3), brows(m.b_eq2, R5));
         const int64_t flat = last ? short_last : full;
         RAD_ISSUE_N(c, m.op_ve_fold, flat * ppc,
                     bcol(m.b_eq2, 0, kC, flat * (H / kVaeRatio) * (W / kVaeRatio)),

@@ -3087,7 +3087,15 @@ attention VIDEO_SPARSE_ATTN_H3 at sparsity 0.8 and 64-row tiles: the prompt's an
 name      served as `fastvideo-fasth3-8-step-v2`
 ```
 
-Its text encoder and both decoders are MiniMax-H3's files byte for byte, so a container of the base
+For a sparse H3 checkpoint without `attn.to_gate_compress`, its conversion metadata can set
+`fastvideo_inference.vsa_gate_compress` to 0. The selection and token-level attention then use
+three QKV projections and omit the pooled-value branch. These checkpoints can also set
+`fastvideo_inference.vsa_dense_prefix_layers` and `fastvideo_inference.vsa_min_tokens` to keep
+initial layers and short packed sequences on dense attention. Packed reference segments receive
+the same exact attention as the text and audio prefix. The sparse selector supports up to 3,072
+tiles in a pass, counting the separately padded prefix segments and the video cubes.
+
+FastH3's text encoder and both decoders are MiniMax-H3's files byte for byte, so a container of the base
 model supplies them (`--reuse`, the transformer's tensors listed as `--changed`; see the recipe's
 header). The distilled model's first evaluation moves 21-23% under any perturbation (the reference
 itself between bf16 and emulated fp8, or with the fp8 text encoder's conditioning), so its per-step
