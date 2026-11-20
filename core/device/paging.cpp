@@ -555,6 +555,10 @@ int dev_page_out(int owner, const PageOut& req, PageResult* out) {
     /* A batch that fails before its swaps leaves nothing behind: the host memory it mapped at the
      * shadows and its staging buffers go back, and its chunks stay on the card as they were. */
     auto undo = [&](int rc) {
+        /* Earlier ranks can still write the batch destinations after a later failure.
+         * Never recycle or unmap them without completion on every copy stream. */
+        if (st.sync_all() < 0)
+            fatal("parking: copy streams did not drain; refusing to release their destinations");
         for (Job& j : batch) {
             if (j.committed) {
                 rad_dev_set(j.p.pg->device);
