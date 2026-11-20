@@ -6738,15 +6738,143 @@ TEST(a_refused_admission_holds_its_chain_until_the_request_goes) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
     CHECK_OK(f.start());
+    f.submit(32, 64);                             /* a runner can still free capacity */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
     f.pc.seed(240);
     f.pc.attn = 0;
     const uint64_t a = f.submit(160, 8);             /* the cache gives nothing back */
-    CHECK(f.sch.step() == nullptr);
+    CHECK(f.sch.step() != nullptr);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Waiting);
     REQUIRE_EQ(f.pc.holds.size(), 1u);
     CHECK_EQ(f.pc.holds[0], a);
     CHECK_OK(f.sch.cancel(a));
     CHECK(std::find(f.pc.releases.begin(), f.pc.releases.end(), a) != f.pc.releases.end());
+}
+
+TEST(an_idle_capacity_blocked_head_fails_and_releases_its_hold_for_a_follower) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096,
+            /*windowed=*/false, /*linear=*/false);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 64;                              /* the head adopts four cached blocks */
+    const uint64_t head = f.submit(160, 8);
+    const uint64_t small = f.submit(16, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.find(head)->n_computed, 64);
+    CHECK(!f.kv.has_sequence(head));
+    CHECK_EQ(std::count(f.pc.holds.begin(), f.pc.holds.end(), head), 1);
+    CHECK_EQ(std::count(f.pc.releases.begin(), f.pc.releases.end(), head), 1);
+    for (int32_t block : f.pc.seeded[0]) CHECK_EQ(f.kv.refcnt[0][(size_t)block], 1);
+}
+
+TEST(a_fresh_idle_request_recovers_an_orphaned_state_slot) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/1);
+    CHECK_OK(f.start());
+    f.kv.state_free[1].clear();
+    const uint64_t head = f.submit(16, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+}
+
+TEST(an_admission_allocator_error_keeps_its_status_without_cache_eviction) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_STATE;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_STATE);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(an_idle_request_waits_for_external_capacity_and_runs_when_it_arrives) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit(16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.pc.evict_calls, 1);
+    f.kv.ensure_error = RAD_OK;
+    f.kv.waiting_for_fleet = false;
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+}
+
+TEST(prefix_eviction_can_admit_an_external_waiter_without_a_broker_grant) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 0;
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    f.kv.waiting_for_fleet = true;                 /* the broker allowance never changes */
+    const uint64_t head = f.submit(160, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+    CHECK(f.pc.evict_calls > 0);
+    CHECK(f.kv.waiting_for_fleet);
+}
+
+TEST(an_external_capacity_wait_can_be_cancelled_without_blocking_its_follower) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit(16, 8);
+    const uint64_t small = f.submit(16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Waiting);
+    CHECK_OK(f.sch.cancel(head));
+    f.kv.ensure_error = RAD_OK;
+    f.kv.waiting_for_fleet = false;
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Running);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(a_backing_allocation_failure_does_not_evict_prefix_cache) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_NOMEM;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_NOMEM);
+}
+
+TEST(an_idle_admission_still_reclaiming_cache_gets_another_pass) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 0;
+    f.pc.evict_grant = 256 * 256 + 1;
+    const uint64_t head = f.submit(160, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.pc.evict_calls, 256);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
 }
 
 /* An engine that has stopped answers every request it held and refuses new ones, rather than

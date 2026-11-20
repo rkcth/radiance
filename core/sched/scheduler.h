@@ -583,6 +583,9 @@ private:
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
+    enum class AdmissionFailure { None, Capacity, ExternalCapacity, Allocator };
+    AdmissionFailure admission_failure_ = AdmissionFailure::None;
+    bool          admission_reclaim_pending_ = false; /* eviction hit its per-step work bound */
     bool          idle_refuse_ = false;       /* idle engine: this refusal will not clear by waiting */
     bool          room_wait_ = false;         /* the refusal is the fresh prefill's room gate */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
