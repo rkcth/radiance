@@ -515,7 +515,7 @@ typedef struct RadGenBatch {
     /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
      * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
-    /* ---- appended in ABI 42 (Krea 2 reference attention) */
+    /* ---- appended in ABI 44 (Krea 2 reference attention) */
     /* DENOISE: one natural-log bias a sequence on target queries to reference keys.
      * Negative infinity isolates the reference queries instead (registered outfill).
      * mode_sigma has three values a sequence, one per span in mode_cu. */

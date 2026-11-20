@@ -6796,6 +6796,22 @@ TEST(an_admission_allocator_error_keeps_its_status_without_cache_eviction) {
     CHECK(!f.kv.has_sequence(head));
 }
 
+TEST(an_allocator_error_after_passing_the_whole_prompt_gate_keeps_its_status) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_STATE;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_STATE);
+    CHECK(!f.kv.has_sequence(head));
+}
+
 TEST(an_idle_request_waits_for_external_capacity_and_runs_when_it_arrives) {
     Fixture f;
     f.build();
