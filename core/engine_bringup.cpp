@@ -62,6 +62,8 @@
 #include <chrono>
 
 namespace rad {
+#ifndef RAD_LOADER_INTERNALS_TEST
+
 
 /* ================================================================== the miss report */
 /* What did not resolve, in three classes reported differently:
@@ -2334,6 +2336,13 @@ int Engine::plan() {
     return RAD_OK;
 }
 
+#endif /* !RAD_LOADER_INTERNALS_TEST */
+
+#ifdef RAD_LOADER_INTERNALS_TEST
+/* The actual private helpers, with distinct linkage for backend-failure injection. */
+namespace loader_test {
+#endif
+
 /* ================================================================== 6. load */
 /* Weights are filled according to the plan. The mover has already reserved every slot and
  * published each weight's address, so this copies this rank's shard of each declared weight from
@@ -2451,6 +2460,7 @@ void sweep_give(void* p, int64_t bytes) {
 }
 }  // namespace
 
+#ifndef RAD_LOADER_INTERNALS_TEST
 void sweep_buffers_keep(bool on) {
     std::map<int64_t, std::vector<void*>> drop;
     {
@@ -2461,6 +2471,8 @@ void sweep_buffers_keep(bool on) {
     for (auto& [bytes, v] : drop)
         for (void* p : v) rad_dev_free(p, RAD_MEM_HOST_PINNED);
 }
+#endif
+
 
 /* The parts of [dst, dst + n) inside the sorted, disjoint ranges `clip`, as (offset, bytes). */
 static std::vector<std::pair<int64_t, int64_t>> clip_parts(
@@ -3794,6 +3806,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
 /* Read one rank's share of a checkpoint weight's selected planes from the mapped tensors into
  * `in` at the pool's offsets: whole rows in one read, a column share a block of rows at a time.
  * A reshaped whole plane has the same bytes, so it is read in the checkpoint's rows. */
+#ifdef RAD_LOADER_INTERNALS_TEST
+} /* namespace loader_test */
+#else
 static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneShare>& shares,
                                 const std::vector<int>& sel, const std::vector<int64_t>& offs,
                                 const std::string& name, uint8_t* in) {
@@ -5648,5 +5663,7 @@ int Engine::build_vocab_view() {
              humanb((int64_t)gi.bytes).c_str());
     return RAD_OK;
 }
+
+#endif /* !RAD_LOADER_INTERNALS_TEST */
 
 }  /* namespace rad */

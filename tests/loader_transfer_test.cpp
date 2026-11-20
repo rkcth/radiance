@@ -32,7 +32,9 @@ int copy_async(void* dst, const void* src, int64_t bytes, RadStream stream) {
 #define rad_event_sync event_sync
 #define rad_stream_sync stream_sync
 #define rad_memcpy_async copy_async
+#define RAD_LOADER_INTERNALS_TEST 1
 #include "../core/engine_bringup.cpp"
+#undef RAD_LOADER_INTERNALS_TEST
 #undef rad_event_create
 #undef rad_event_record
 #undef rad_event_sync
@@ -44,7 +46,7 @@ TEST(failed_completion_events_drain_before_resolving_ring_ownership) {
     for (Fault mode : { Create, Record, Wait, Copy }) {
         fault = None;
         fences = 0;
-        rad::PinRing ring;
+        rad::loader_test::PinRing ring;
         ring.start(1, true);
         auto piece = ring.take(4096);
         REQUIRE(bool(piece));
@@ -69,7 +71,7 @@ TEST(ambiguous_upload_or_failed_fallback_fence_cannot_recycle_the_ring) {
         REQUIRE(child >= 0);
         if (child == 0) {
             fault = None;
-            rad::PinRing ring;
+            rad::loader_test::PinRing ring;
             ring.start(1, true);
             auto piece = ring.take(4096);
             if (!piece) _exit(98);

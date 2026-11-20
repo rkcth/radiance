@@ -11,11 +11,13 @@ int copy_async(void* dst,const void* src,int64_t bytes,RadStream stream) { ++cop
 #define rad_stream_create stream_create
 #define rad_dev_alloc device_alloc
 #define rad_memcpy_async copy_async
+#define RAD_LOADER_INTERNALS_TEST 1
 #include "../core/engine_bringup.cpp"
+#undef RAD_LOADER_INTERNALS_TEST
 #undef rad_stream_create
 #undef rad_dev_alloc
 #undef rad_memcpy_async
-namespace rad {
+namespace rad::loader_test {
 struct LoaderTransferTestAccess {
     static int run(RelayoutPool &pool, StagedWeight &weight, const uint8_t *input) {
         const uint8_t *planes[] = {input};
@@ -65,16 +67,16 @@ TEST(cpu_refill_clips_identity_and_converted_writes_without_gpu_copies) {
                 input[(size_t)i] = (uint8_t)(i % 251);
         std::memset(dst + page, 0xa5, (size_t)page);
         std::memset(dst + 3 * page, 0xa5, (size_t)page);
-        std::vector<rad::StagedWeight> staged(1);
+        std::vector<rad::loader_test::StagedWeight> staged(1);
         auto &item = staged[0];
         item.prog = &program;
         item.wi = 1;
         item.dst = dst;
         item.dev = false;
         item.clip = &clips;
-        rad::RelayoutPool pool(staged);
+        rad::loader_test::RelayoutPool pool(staged);
         copies = 0;
-        CHECK_OK(rad::LoaderTransferTestAccess::run(pool, item, input.data()));
+        CHECK_OK(rad::loader_test::LoaderTransferTestAccess::run(pool, item, input.data()));
         CHECK_EQ(copies.load(), 0);
         for (const auto &clip : clips) {
             for (auto *p = clip.first; p < clip.second; p += convert ? 4 : 1) {
@@ -95,21 +97,21 @@ TEST(host_fill_preflight_bounds_all_inputs_and_partial_output_before_mapping) {
     weight.stored_bytes = 4096;
     std::vector<uint8_t> memory(8192);
     std::vector<std::pair<uint8_t *, uint8_t *>> clips{{memory.data(), memory.data() + 4096}};
-    rad::StagedWeight item;
+    rad::loader_test::StagedWeight item;
     item.prog = &program;
     item.wi = 1;
     item.dst = memory.data();
     item.clip = &clips;
     item.in_bytes = 2049;
-    std::vector<rad::StagedWeight> staged(2, item);
-    CHECK_OK(rad::RelayoutPool::check_host_fill(staged, 8192));
+    std::vector<rad::loader_test::StagedWeight> staged(2, item);
+    CHECK_OK(rad::loader_test::RelayoutPool::check_host_fill(staged, 8192));
     staged.push_back(item);
-    CHECK_EQ(rad::RelayoutPool::check_host_fill(staged, 8192), RAD_E_FULL);
+    CHECK_EQ(rad::loader_test::RelayoutPool::check_host_fill(staged, 8192), RAD_E_FULL);
     staged.resize(1);
     staged[0].in_bytes = -1;
-    CHECK_EQ(rad::RelayoutPool::check_host_fill(staged, 8192), RAD_E_FULL);
+    CHECK_EQ(rad::loader_test::RelayoutPool::check_host_fill(staged, 8192), RAD_E_FULL);
     staged[0].in_bytes = INT64_MAX;
-    CHECK_EQ(rad::RelayoutPool::check_host_fill(staged, INT64_MAX), RAD_E_FULL);
+    CHECK_EQ(rad::loader_test::RelayoutPool::check_host_fill(staged, INT64_MAX), RAD_E_FULL);
     const int64_t reserve_bytes = ((int64_t)1 << 30) + 4096;
     void *large =
         mmap(nullptr, (size_t)reserve_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -124,7 +126,7 @@ TEST(host_fill_preflight_bounds_all_inputs_and_partial_output_before_mapping) {
     clips = {{staged[0].dst, staged[0].dst + 4096}};
     weight.widen = true;
     weight.stored_bytes = ((int64_t)1 << 30) + 1;
-    CHECK_EQ(rad::RelayoutPool::check_host_fill(staged, 8192), RAD_E_FULL);
+    CHECK_EQ(rad::loader_test::RelayoutPool::check_host_fill(staged, 8192), RAD_E_FULL);
     CHECK_EQ(memory.front(), 0);
 }
 TEST(cpu_container_sweep_preserves_strides_and_clipped_layout_without_gpu_resources) {
@@ -173,7 +175,7 @@ TEST(cpu_container_sweep_preserves_strides_and_clipped_layout_without_gpu_resour
     std::vector<uint8_t> output((size_t)weight.stored_bytes, 0xa5), verbatim(60, 0);
     std::vector<std::pair<uint8_t *, uint8_t *>> clips{{output.data() + 64, output.data() + 128},
                                                        {output.data() + 512, output.data() + 580}};
-    std::vector<rad::StagedWeight> staged(1);
+    std::vector<rad::loader_test::StagedWeight> staged(1);
     auto &item = staged[0];
     item.prog = &program;
     item.wi = 1;
@@ -181,17 +183,17 @@ TEST(cpu_container_sweep_preserves_strides_and_clipped_layout_without_gpu_resour
     item.clip = &clips;
     item.in_bytes = count * 2;
     item.remaining = count * 2;
-    REQUIRE_EQ(rad::RelayoutPool::check_host_fill(staged, 4096), RAD_OK);
-    rad::RelayoutPool pool(staged);
+    REQUIRE_EQ(rad::loader_test::RelayoutPool::check_host_fill(staged, 4096), RAD_OK);
+    rad::loader_test::RelayoutPool pool(staged);
     pool.start(2, 4096, true);
-    std::vector<rad::LoadRun> runs{{offset, count * 2, nullptr, count * 2, count * 2, 1, 0, 0, 0},
+    std::vector<rad::loader_test::LoadRun> runs{{offset, count * 2, nullptr, count * 2, count * 2, 1, 0, 0, 0},
                                    {offset + 4, 9 * 16 + 6, verbatim.data(), 6, 16, 10, 0, 0, -1}};
     copies = 0;
     streams = 0;
     pinned = 0;
     int64_t read = 0;
     int before = 0;
-    CHECK_OK(rad::sweep_container(&file, runs, {0}, &pool, &read, [&] {
+    CHECK_OK(rad::loader_test::sweep_container(&file, runs, {0}, &pool, &read, [&] {
         ++before;
         return RAD_OK;
     }));
