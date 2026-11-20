@@ -79,6 +79,21 @@ struct AttnGatedFP8 {
     /* `sel`'s row pitch is `topk + 1`; the extra slot is the partial page
      * (r4d_qsa_select_bf16.hip). */
     int64_t     qsa_topk = 0;
+    /* The architecture's word that a sequence with one row in the step has that row at its
+     * context's last position (`seqused - 1`: a plain decode row, a serial head's round), so at or
+     * below `qsa_exact_to` such a row's selection is the head of the sequence's block table and its
+     * `seqused` the sequence's (qsa_select: every complete block in block order, then the partial
+     * page, and `pos + 1`). The sparse row is then issued over the table and the indexer selects
+     * nothing (qsa_use). Off: such a step keeps the selection. */
+    bool        qsa_table_rows = false;
+    /* The architecture's pass key carries whether this group's exact host bound
+     * (RadBatch::kv_used_max_h, the furthest context any row of the step can read) is within
+     * `qsa_exact_to`, so that bound may say whether the step needs scores (qsa_within) in place of
+     * the rounded `max_ctx_len + max_q_len`, which a 4-row step leaves at 1025 tokens. It never
+     * moves the choice between the dense and the sparse kernel, which stays the rounded bound's:
+     * the two agree on the keys, not on the last bit of the sum. Off: the rounded bound, which the
+     * core's key holds. */
+    bool        qsa_exact_host = false;
     /* Query rows per sparse attention launch, a scratch budget. The decode kernel's split-KV
      * partials are sized at declare from `max_seqs` and `q_len`, so issuing more rows than
      * `max_seqs` means declaring a larger value, which grows the scratch arena (the maximum over
@@ -111,6 +126,14 @@ struct AttnGatedFP8 {
      * (decl_prefetch, rad_arch.h), issued behind the q, k and v projections on decode steps
      * (prefetch_beside). 0 where none is declared. */
     rad_op     op_pf_o = 0;
+    /* The same read as a second op for steps of at least pf_o_v_rows rows, where the
+     * architecture measured another workgroup count for them (decl_prefetch's `blocks`); 0 where
+     * every step takes op_pf_o. */
+    rad_op     op_pf_o_v = 0;
+    int64_t    pf_o_v_rows = 0;
+    /* The most rows of a decode step whose k and v projections are issued in front of the q|gate
+     * projection (step()); 0, the default, keeps the declared order on every step. */
+    int64_t    kv_first_rows = 0;
     NormQuantFP8 nq_h{};
 
     rad_op     op_fused = 0;                                 /* qk_norm_rope_gate, if it resolves */
@@ -168,8 +191,12 @@ struct AttnGatedFP8 {
     /* The block's tail, declared last by every rank: the all-reduce and the trailing add. */
     int  declare_out(RadBuilder* b, bool add_out);
     /* `own_ar` false: the caller issues the all-reduce itself (GdnFP8::step says when). */
+    /* `side`: an independent chain's ops, issued behind this block's ordered launches (SideOps,
+     * rad_arch.h): one behind the prologue and the store, one behind the attention, one behind
+     * the gate where the gate is a launch of its own. Null, and on the paths that return early,
+     * nothing is asked of it. */
     void step(RadCtx* c, const RadBatch* batch, bool own_ar = true,
-              ArPieces* pieces = nullptr) const;
+              ArPieces* pieces = nullptr, const SideOps* side = nullptr) const;
     bool issues_ar(int64_t T) const { return op_ar && !ar_taken(g, T, ar_out, ar_out_take); }
     void issue_ar(RadCtx* c, int64_t r0, int64_t rows) const {
         RAD_ISSUE_N(c, op_ar_ov ? op_ar_ov : op_ar, rows * g.n_embd,
@@ -185,6 +212,41 @@ struct AttnGatedFP8 {
      * components agree, so plane 0 of an M-RoPE batch's positions is each token's position) and
      * the gate quantised by gate_quant_fp8. A streamed group never takes it: the pieces path's
      * plain store never writes the host mirror. */
+    /* The rounded host bound of the furthest context a row of the step reads; by it a step of
+     * several rows a sequence takes the dense or the sparse kernel (step(), `sparse`). */
+    int64_t qsa_reach(const RadBatch* batch) const {
+        return (int64_t)batch->max_ctx_len + batch->max_q_len;
+    }
+    /* Whether every row of the step is at or below the exactness bound, by the tightest host
+     * ceiling there is: the group's exact one where the pass key holds its side of the bound
+     * (qsa_exact_host), else the rounded one. Every row's position + 1 is at most either. */
+    bool qsa_within(const RadBatch* batch, const RadKVGroupBatch* kvb) const {
+        if (qsa_exact_to <= 0) return false;
+        int64_t reach = qsa_reach(batch);
+        if (qsa_exact_host && kvb && batch->kv && batch->kv_used_max_h) {
+            const int64_t tight = batch->kv_used_max_h[kvb - batch->kv];
+            if (tight > 0 && tight < reach) reach = tight;
+        }
+        return reach <= qsa_exact_to;
+    }
+    /* What this step's attention reads of the selection (QsaUse, rad_arch.h); the architecture
+     * hands it to the indexer, which runs first, and step() takes its path by the same call. */
+    int qsa_use(const RadBatch* batch) const {
+        if (!qsa_sel || !qsa_sequ || op_fill || qsa_eager()) return kQsaSelect;
+        const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+        /* A streamed group may be ring-bound, where every pass is sparse and the resolve rewrites
+         * the selection; it keeps the selection at every context. */
+        if (!kvb || kvb->stream || !kvb->block_table || !kvb->seqused) return kQsaSelect;
+        if (!qsa_within(batch, kvb)) return kQsaSelect;
+        /* One row a sequence is the sparse row at every context: over the table where the
+         * architecture vouches for it, else over a selection. */
+        if (batch->n_tok == batch->n_seq)
+            return (qsa_table_rows && batch->max_q_len == 1) ? kQsaUnread : kQsaOnce;
+        /* Several rows a sequence: the dense attention, which reads the table, where the rounded
+         * bound is within the budget too, else the sparse row a query over a selection. */
+        return qsa_reach(batch) <= qsa_exact_to ? kQsaUnread : kQsaOnce;
+    }
+
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
         const int64_t T = batch->n_tok;
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
@@ -571,7 +633,7 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
 }
 
 inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
-                               ArPieces* pieces) const {
+                               ArPieces* pieces, const SideOps* side) const {
     const RadKVGroupBatch* kvb = kv_batch(batch, kv);
     const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
     const int32_t* table = kvb ? kvb->block_table  : nullptr;
@@ -633,11 +695,23 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
         return;
     }
-    qg.step(c, w.h, w.qg, T);
-    kp.step(c, w.h, w.k,  T);
-    vp.step(c, w.h, w.v,  T);
+    /* The three projections read the same input and none reads another's output, so a recorded
+     * pass starts them together (Ctx::haz_mark) whatever their order; the order decides which
+     * the card launches first. On a decode step of up to `kv_first_rows` rows the two small ones
+     * go first: behind the wide q|gate projection their launches wait until its blocks are all
+     * on the card, and the prologue then waits for them. Qwen3.8-Flash-Next at tp 2, chain 3
+     * with coupling (twelve trunk layers and the head's): -0.66% a step. */
+    if (T <= kv_first_rows && batch->phase == RAD_PHASE_DECODE) {
+        kp.step(c, w.h, w.k,  T);
+        vp.step(c, w.h, w.v,  T);
+        qg.step(c, w.h, w.qg, T);
+    } else {
+        qg.step(c, w.h, w.qg, T);
+        kp.step(c, w.h, w.k,  T);
+        vp.step(c, w.h, w.v,  T);
+    }
     /* The out projection's weight, read beside the prologue and the attention (op_pf_o). */
-    prefetch_beside(c, op_pf_o, o.w, T);
+    prefetch_beside(c, op_pf_o_v && T >= pf_o_v_rows ? op_pf_o_v : op_pf_o, o.w, T);
 
     /* Fused or unfused prologue. The fused kernel takes the whole [q|gate] projection and splits it
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
@@ -682,6 +756,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     }
 
     if (!fused_kv && !folded_stream) store_cache(c, kvb, slot, T);
+    if (side) side->at(0);
 
     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
      * by row, and a row need not be a sequence, so T queries issued as T rows of q_len 1, each with
@@ -694,7 +769,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * Launches are chunked because the split-KV scratch is sized at declare from `max_seqs` and
      * `q_len` (rows = max_seqs * q_len_max * heads); more rows are refused as RAD_E_SCRATCH at
      * issue. Rows of q_len 1 up to the declared max_seqs always fit. */
-    const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
+    const int64_t reach  = qsa_reach(batch);
     /* A pass on a streamed group's ring (a ring smaller than the id space, and not staged) must
      * take the sparse path: on the ring a block id is not a pool address, so the dense path would
      * read ring slots as pages. `T == n_seq` alone misses a verify pass, whose T is
@@ -708,6 +783,19 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const bool    sparse = qsa_sel && qsa_sequ &&
                            (ring_bound || T == batch->n_seq || qsa_exact_to <= 0 ||
                             reach > qsa_exact_to);
+    /* At or below the bound a step of one row a sequence has no selection (qsa_use): the sparse
+     * row reads the sequence's own block table and length, which is what qsa_select would have
+     * written for it (the field says why), so the launch, its kernel and its bytes are the sparse
+     * row's. */
+    const bool by_table = sparse && T == batch->n_seq && qsa_use(batch) == kQsaUnread;
+    const int64_t tpitch = kvb ? kvb->block_table_pitch : 0;
+    auto sel_rows = [&](int64_t off, int64_t rows) {
+        return by_table ? praw2(table + off * tpitch, RAD_I32, rows, tpitch)
+                        : brow_slice(qsa_sel, off, rows, qsa_topk + 1);
+    };
+    auto sequ_rows = [&](int64_t off, int64_t rows) {
+        return by_table ? praw(used + off, RAD_I32, rows) : brow_slice(qsa_sequ, off, rows, 1);
+    };
     const bool gated = sparse && op_attn_gq;
     /* A streamed group's selection, per launch: make the rows' blocks resident and rewrite `sel`
      * as ring slots, after this layer's store (a block copied in from the mirror must carry this
@@ -715,6 +803,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * and never resolves, so a prefill cannot overflow the ring. */
     const KVStreamLayer res_l = op_resolve ? kv_stream_layer(c, kv, layer, kvb) : KVStreamLayer{};
     auto resolve_sel = [&](int64_t off, int64_t rows) {
+        if (by_table) return;                   /* never a streamed group (qsa_use) */
         if (kv_stage_layer(c, kv, kvb, layer)) return;
         if (!res_l.host || res_l.blocks <= 0 || res_l.slots <= 0 || rows <= 0) return;
         kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
@@ -736,8 +825,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 RAD_ISSUE_N(c, op_attn_gq, 1,
                             brow_slice(w.q, off, rows, qw),
                             kv_cache(kv, layer),
-                            brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                            brow_slice(qsa_sequ, off, rows, 1),
+                            sel_rows(off, rows), sequ_rows(off, rows),
                             RAD_NONE, RAD_NONE, RAD_NONE,
                             brow_slice(w.attn.x, off, rows, qw),
                             bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
@@ -760,8 +848,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             RAD_ISSUE_N(c, op_attn_gq, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
-                        brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                        brow_slice(qsa_sequ, off, rows, 1),
+                        sel_rows(off, rows), sequ_rows(off, rows),
                         RAD_NONE, RAD_NONE, RAD_NONE,
                         brow_slice(w.attn.x, off, rows, qw),
                         bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
@@ -777,8 +864,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             RAD_ISSUE_N(c, op_attn, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
-                        brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                        brow_slice(qsa_sequ, off, rows, 1),
+                        sel_rows(off, rows), sequ_rows(off, rows),
                         RAD_NONE, RAD_NONE, RAD_NONE,
                         brow_slice(w.attn.x, off, rows, qw));
         }
@@ -839,6 +925,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     /* Every attention launch of this layer is issued: start the next layer's stage copy, which
      * crosses the link under the out projection and the next layer's projections. */
     if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
+    if (side) side->at(1);
     if (gated) {
         /* the sparse attention gated and quantised in its merge */
     } else if (op_sig) {
@@ -852,6 +939,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                     bcol(w.qg, g.head_dim, g.head_dim, T), brows(w.attn.x, T),
                     brows(w.attn.cq(), T), brows(w.attn.cs(), T), brows(w.attn.x, T));
     }
+    if (side && !gated) side->at(2);
 
     o.step(c, w.attn, w.h.x, T);
     if (own_ar && op_ar && !ar_taken(g, T, ar_out, ar_out_take))

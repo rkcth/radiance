@@ -18,6 +18,7 @@
 #include "halo.h"
 #include "halo_gemm_args.h"
 #include "halo_common.h"
+#include "halo_chain.h"
 #include "halo_gdn_wmma.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -89,7 +90,7 @@ __device__ __forceinline__ v4i fragW2(const uint4& lo, const uint4& hi, int u, u
 #define HALO_W2A8_BOUNDS(MT, NPW) ((MT) * (NPW) >= 8 ? 256 : ((MT) * (NPW) >= 4 ? 512 : 1024))
 
 template <int MT, int NPW>
-__global__ __launch_bounds__(HALO_W2A8_BOUNDS(MT, NPW)) void halo_gemm_w2a8_kernel(
+__device__ __forceinline__ void halo_gemm_w2a8_kernel_body(
     const signed char* __restrict__ A, const float* __restrict__ Ascale,
     const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
@@ -208,6 +209,18 @@ __global__ __launch_bounds__(HALO_W2A8_BOUNDS(MT, NPW)) void halo_gemm_w2a8_kern
   }
 }
 
+/* halo_gemm_w2a8_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int MT, int NPW, class CH = HaloUnchained>
+__global__ __launch_bounds__(HALO_W2A8_BOUNDS(MT, NPW))
+void halo_gemm_w2a8_kernel(
+    const signed char* __restrict__ A, const float* __restrict__ Ascale,
+    const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+    if (CH::on) halo_chain_wait();
+    halo_gemm_w2a8_kernel_body<MT, NPW>(A, Ascale, Wq, Ws, C, M, K, N, WV, SK);
+    if (CH::on) halo_chain_done();
+}
+
 static void gemm_w2a8_impl(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
                            int WV, int SK, int MB, int NPW, long stream) {
   if (M < 1 || M > HALO_GEMM_W2A8_MAX_M)
@@ -231,7 +244,7 @@ static void gemm_w2a8_impl(long a, long ascale, long wq, long ws, long c, int M,
   auto Zp = (const unsigned*)ws;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH2(MT, NP) hipLaunchKernelGGL((halo_gemm_w2a8_kernel<MT, NP>), \
+#define LAUNCH2(MT, NP) hipLaunchKernelGGL((halo_chain_flag() ? halo_gemm_w2a8_kernel<MT, NP, r4dchain> : halo_gemm_w2a8_kernel<MT, NP, HaloUnchained>), \
     grid, block, smem, st, Ap, Sp, Wp, Zp, Cp, M, K, N, WV, SK)
 #define LAUNCH2_MB4(NP) switch (MB) { \
     case 1: LAUNCH2(1, NP); break; \
@@ -272,6 +285,7 @@ static int halo_gemm_w2a8_nt_max_m(void) { return HALO_GEMM_W2A8_MAX_M; }
 
 // ============================================================== the plugin ABI entry points
 extern "C" int halo_rad_gemm_w2a8(const RadArgs* a, RadStream s) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     GemmOps g;
     int rc = gemm_ops(a, &g, 1);
     if (rc != RAD_OK) return rc;

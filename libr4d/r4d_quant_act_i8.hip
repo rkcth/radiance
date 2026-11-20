@@ -21,7 +21,7 @@ template <int THR, bool CHAIN = false>
 __device__ __forceinline__ void r4d_quant_act_i8_body(
     const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
     int K) {
-  if (CHAIN) r4d_chain_wait();
+  if (CHAIN) r4d_chain_wait_vec();
   const int row = blockIdx.x;
   const __hip_bfloat16* a = A + (size_t)row * K;
   signed char* q = Q + (size_t)row * K;
@@ -125,7 +125,7 @@ __device__ __forceinline__ void r4d_quant_act_i8_asum_body(R4D_QUANT_ACT_I8_ASUM
 template <int THR, class CH>
 __global__ __launch_bounds__(THR)
 void r4d_quant_act_i8_asum_kernel(R4D_QUANT_ACT_I8_ASUM_PARAMS) {
-  if (CH::on) r4d_chain_wait();
+  if (CH::on) r4d_chain_wait_vec();
   r4d_quant_act_i8_asum_body<THR>(A, Q, S, Asum, K, group, Mpad);
   if (CH::on) r4d_chain_done();
 }

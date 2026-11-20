@@ -861,4 +861,23 @@ TEST(conditioning_options_ride_in_the_cond_passes_the_generator_declared) {
     CHECK(has(said, "conditioning options 0x80"));
 }
 
+
+TEST(guidance_requires_enough_simultaneous_entries_at_submission) {
+    for (const int entries : {1, 2}) {
+        GenFixture f;
+        f.build();
+        f.prog.ctx.max_seqs = entries;
+        REQUIRE_EQ(f.start(), (int)RAD_OK);
+        auto guided = f.req(64, 64);
+        guided->has_neg = true;
+        guided->neg.tokens = {5, 6};
+        std::string why;
+        CHECK_EQ(f.drv.submit(std::move(guided), &why),
+                 entries == 1 ? (int)RAD_E_INVAL : (int)RAD_OK);
+        if (entries == 1) CHECK(has(why, "--max-num-seqs"));
+        CHECK_EQ(f.drv.submit(f.req(64, 64), &why), (int)RAD_OK);
+        f.drv.shutdown("test finished", RAD_E_STATE);
+    }
+}
+
 RAD_TEST_MAIN()

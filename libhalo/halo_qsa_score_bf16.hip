@@ -23,6 +23,7 @@
 #include "halo_args.h"
 #include "halo_emit.h"
 #include "halo_common.h"
+#include "halo_chain.h"
 #include "halo_gdn_wmma.h"
 
 #include <hip/hip_runtime.h>
@@ -244,7 +245,7 @@ constexpr long long kMxWavesTarget = 4096;
 constexpr long long kMxMinTiles    = 4;
 
 template <int HEADS>
-__global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
+__device__ __forceinline__ void qsa_score_mx_kernel_body(
     const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
@@ -336,6 +337,19 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
     }
 }
 
+/* qsa_score_mx_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int HEADS, class CH = HaloUnchained>
+__global__ __launch_bounds__(kMxWaves * kWave)
+void qsa_score_mx_kernel(
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
+    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
+    const int32_t* __restrict__ nc, float* __restrict__ out,
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
+    if (CH::on) halo_chain_wait();
+    qsa_score_mx_kernel_body<HEADS>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec);
+    if (CH::on) halo_chain_done();
+}
+
 /* Form override for tests (halo_selftest compares the two): 0 = automatic, 1 = scalar,
  * 2 = matrix. Like halo_gemm_fp8a8_pin_mw. */
 int g_qsa_form = 0;
@@ -376,7 +390,7 @@ static int halo_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, 
         const unsigned gx = (unsigned)((tiles + tpw * kMxWaves - 1) / (tpw * kMxWaves));
         const int vec = (out_ld % 4 == 0) && ((out & 15) == 0);
 #define RAD_QSA_MX(H)                                                                             \
-        emit_rc = HALO_EMIT(stream, (qsa_score_mx_kernel<H>), dim3(gx, (unsigned)qt),          \
+        emit_rc = HALO_EMIT(stream, (halo_chain_flag() ? qsa_score_mx_kernel<H, r4dchain> : qsa_score_mx_kernel<H, HaloUnchained>), dim3(gx, (unsigned)qt),          \
                            dim3(kMxWaves * kWave), 0, (const unsigned short*)q,                   \
                            (const unsigned short*)bk,                                             \
                            (const int32_t*)bt, (const int32_t*)cu, (const int32_t*)nc,            \
@@ -434,6 +448,7 @@ static int halo_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, 
 enum { QS_Q = 0, QS_BK = 1, QS_BT = 2, QS_CU = 3, QS_NC = 4, QS_OUT = 5 };
 
 extern "C" int halo_rad_qsa_score(const RadArgs* a, RadStream stream) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     const RadTensor* q  = halo_opt(a, QS_Q);
     const RadTensor* bk = halo_opt(a, QS_BK);
     const RadTensor* bt = halo_opt(a, QS_BT);

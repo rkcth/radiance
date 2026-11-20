@@ -303,7 +303,8 @@ public:
      * n_computed); -1 means the sequence's current end. A WINDOW group recycles only blocks below
      * keep_from - window + 1, not below the window of the step's end, which would drop keys the
      * first rows of a multi-block prefill chunk still read. */
-    int  ensure(uint64_t seq, int64_t n_tokens, int64_t keep_from = -1);
+    int  ensure(uint64_t seq, int64_t n_tokens, int64_t keep_from = -1,
+                bool* waiting_for_fleet = nullptr);
 
     /* A WINDOW group's caps. A sequence holds the window behind the step's first query plus the
      * step's own tokens (at most window_blocks + ceil(max_tok / block) + 1), and one step carries
@@ -499,7 +500,13 @@ public:
      * loan it can still afford, and the slab owner drains to that before returning, so admission
      * is decided against the whole carve. Without a hook, lent blocks are not recalled and the
      * request gets RAD_E_FULL. */
-    void    set_reclaim(std::function<int(int64_t tokens)> f) { reclaim_ = std::move(f); }
+    void set_reclaim(std::function<int(int64_t tokens)> f) {
+        if (!f) { reclaim_ = {}; return; }
+        reclaim_ = [f = std::move(f)](int64_t tokens, bool*) { return f(tokens); };
+    }
+    void set_fleet_reclaim(std::function<int(int64_t tokens, bool* waiting)> f) {
+        reclaim_ = std::move(f);
+    }
 
     /* Copies the leader's loan onto a follower rank. Block ids are shared across ranks and only
      * rank 0 tracks sequences, so a follower takes the leader's mark instead of computing one;
@@ -627,6 +634,32 @@ public:
     int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                            const std::vector<int32_t>* win = nullptr);
 
+    /* ---------------- the checkpoint stage ----------------
+     *
+     * One snapshot of the linear state on the card, laid out as a checkpoint slot's linear section
+     * (checkpoint_copy's walk: group by group in plans() order, a layer after another), carved
+     * from the KV pool as a fixed cost. A checkpoint inside a step (RadBatch::ckpt_cut): the
+     * plugin copies each layer's state there between the recurrence's two pieces (rad_ckpt_snap,
+     * Ctx::set_ckpt_snap), since the live slot has moved on by the step's end; the engine then
+     * copies the layers the step left alone in (checkpoint_stage_rest) and the stage to the host
+     * slot in one copy (checkpoint_stage_out, Engine::save_checkpoints).
+     *
+     * Planned (plan_groups) where the engine snapshots linear state into a prefix cache and the
+     * slot has no window section, under Config::ckpt_stage (the plugin cuts its step at a tail
+     * snapshot and --prefix-resume is nearest); 0 bytes and a null stage otherwise, which keeps
+     * every checkpoint at a chunk's end. */
+    int64_t ckpt_stage_bytes() const { return stage_bytes_; }
+    void*   ckpt_stage() const { return stage_; }
+    /* Per group (by index): the group's offset in the stage and its bytes a layer, -1 / 0 for a
+     * group with no state. */
+    void    ckpt_stage_layout(std::vector<int64_t>* off, std::vector<int64_t>* lb) const;
+    /* The live slots' state of every stateful (group, layer) `skip` does not name into the stage,
+     * on `s`: the layers a step with a checkpoint inside it left alone. */
+    int     checkpoint_stage_rest(const int32_t* state_slots, int n_slots, RadStream s,
+                                  const std::function<bool(size_t, int64_t)>& skip);
+    /* The stage into checkpoint slot `ck`, as one copy on `s`. */
+    int     checkpoint_stage_out(int32_t ck, RadStream s);
+
     /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
      * A WINDOW group keeps only the blocks its window can still read, so the prefix cache's block
      * lists do not describe it. A prompt extending a cached prefix at position P needs blocks
@@ -720,6 +753,9 @@ private:
     int64_t   ck_rank_off_ = 0;
     int64_t   checkpoint_bytes_ = 0;
     int64_t   window_ck_bytes_ = 0;   /* the window section of checkpoint_bytes_ */
+    int64_t   stage_bytes_ = 0;       /* ckpt_stage_bytes */
+    void*     stage_ = nullptr;
+    int64_t   stage_off_ = 0;         /* in the pool */
     std::vector<StateClear> clears_;                  /* grabbed slots the engine must zero */
     void*     pool_base_ = nullptr;
     BundleComparison bundling_;
@@ -766,7 +802,7 @@ private:
     /* Backs (or unbacks) every lendable group's stripes between the live marks of two loans. */
     int      flex_span(int64_t lo_loan, int64_t hi_loan, bool back);
     uint64_t seq_frees_ = 0;
-    std::function<int(int64_t)> reclaim_;
+    std::function<int(int64_t, bool*)> reclaim_;
     std::vector<int64_t>  live_;            /* per group: blocks the cache may hand out */
     std::vector<int64_t>  free_usable_;     /* per group: free ids below live_ */
     std::vector<int64_t>  bucket_blocks_;   /* per group: blocks one held_hist_ bucket covers */
@@ -779,7 +815,7 @@ private:
     int64_t  lent_blocks(size_t i, int64_t tokens) const;
     /* Moves every lendable group's mark to a loan of `tokens`, unchecked (set_loan checks). */
     void     apply_loan(int64_t tokens);
-    int  grow_for(int32_t g, int64_t blocks);
+    int  grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet = nullptr);
     void note_held(int32_t g, int32_t b, int delta);
     bool      configured_ = false;
     static const std::vector<int32_t> kNoBlocks;

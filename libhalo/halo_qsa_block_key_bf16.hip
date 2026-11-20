@@ -32,7 +32,8 @@
 #include "halo_args.h"
 #include "rad_yarn.h"
 #include "halo_emit.h"
-#include "halo_common.h"   // halo_wave_sum
+#include "halo_common.h"
+#include "halo_chain.h"   // halo_wave_sum
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -56,7 +57,7 @@ __device__ __forceinline__ int qbk_comp(int mode, int i, int s0, int s1, int s2)
     return i < s0 ? 0 : (i < s0 + s1 ? 1 : 2);
 }
 
-__global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
+__device__ __forceinline__ void qsa_block_key_kernel_body(
     const uint16_t* __restrict__ k, const float* __restrict__ w,
     const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
     uint16_t* __restrict__ out,
@@ -126,6 +127,20 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
     ((__hip_bfloat16*)out)[(size_t)orow * o_ld + t] = __float2bfloat16(res);
 }
 
+/* qsa_block_key_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(kMaxN)
+void qsa_block_key_kernel(
+    const uint16_t* __restrict__ k, const float* __restrict__ w,
+    const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
+    uint16_t* __restrict__ out,
+    int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
+    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) {
+    if (CH::on) halo_chain_wait();
+    qsa_block_key_kernel_body(k, w, page, bpos, out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn);
+    if (CH::on) halo_chain_done();
+}
+
 }  // namespace
 
 //   k    [M*ratio][n]  bf16, `k_ld` elements a row (0 = n)
@@ -146,7 +161,7 @@ static int halo_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lo
     if (!o_ld) o_ld = n;
     /* n threads rounded up to whole waves for the block reduction (extra threads contribute 0). */
     const int thr = ((n + 31) / 32) * 32;
-    return HALO_EMIT(stream, qsa_block_key_kernel, dim3((unsigned)M), dim3((unsigned)thr), 0,
+    return HALO_EMIT(stream, (halo_chain_flag() ? qsa_block_key_kernel<r4dchain> : qsa_block_key_kernel<HaloUnchained>), dim3((unsigned)M), dim3((unsigned)thr), 0,
                     (const uint16_t*)k, (const float*)w, (const int32_t*)page,
                     (const int32_t*)bpos, (uint16_t*)out, n, ratio, rot, eps, wadd, theta, rscale,
                     pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn);
@@ -157,6 +172,7 @@ static int halo_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lo
 enum { QBK_K = 0, QBK_W = 1, QBK_PAGE = 2, QBK_POS = 3, QBK_OUT = 4 };
 
 extern "C" int halo_rad_qsa_block_key(const RadArgs* a, RadStream stream) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     const RadTensor* k = halo_opt(a, QBK_K);
     const RadTensor* w = halo_opt(a, QBK_W);
     const RadTensor* pg = halo_opt(a, QBK_PAGE);      /* optional: absent is a contiguous write */

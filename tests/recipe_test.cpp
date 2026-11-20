@@ -125,7 +125,75 @@ bool has_opt(const RecipeRule* r, const char* k, const char* v) {
         if (kk == k && vv == v) return true;
     return false;
 }
+bool has_key(const RecipeRule* r, const char* k) {
+    for (const auto& kv : r->options)
+        if (kv.first == k) return true;
+    return false;
+}
 }  /* namespace */
+
+TEST(the_q38_native_mtp_overlay_only_changes_draft_weights) {
+    const std::string src = __FILE__;
+    std::ifstream in(src.substr(0, src.find_last_of('/')) + "/../data/recipes/q38-27b-native-mtp-u2.recipe");
+    REQUIRE(in.good());
+    Recipe r;
+    std::string why;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    REQUIRE_EQ(r.add_text(text, "mtp.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)7);
+    for (const char* linear : {"attn_qg", "attn_k", "attn_v", "attn_output", "ffn_gate_up", "ffn_down"}) {
+        const auto* rule = r.match(std::string("blk.64.") + linear + ".weight");
+        REQUIRE(rule != nullptr);
+        CHECK_EQ(rule->quantizer, std::string("rtn"));
+        CHECK_EQ(rule->options_text(), std::string("codes=i8,group=128,scale=bf16,transform=fwht128"));
+    }
+    const auto* head = r.match("mtp.draft_head.weight");
+    REQUIRE(head != nullptr);
+    CHECK_EQ(head->quantizer, std::string("rtn"));
+    CHECK_EQ(head->options_text(), std::string("codes=u2,group=128,scale=f16,zero=u8"));
+    for (const char* n : {"blk.63.attn_qg.weight", "output.k4.weight", "output.weight",
+                          "token_embd.weight", "blk.64.attn_norm.weight", "mtp.fc.weight"})
+        CHECK(r.match(n) == nullptr);
+}
+
+/* The calibrated native-MTP overlay keeps the int8 block at RTN and fits only the U2 draft head. */
+TEST(the_q38_native_mtp_gptq_overlay_uses_the_draft_head_gram) {
+    const std::string src = __FILE__;
+    std::ifstream in(src.substr(0, src.find_last_of('/')) +
+                     "/../data/recipes/q38-27b-native-mtp-u2-gptq.recipe");
+    REQUIRE(in.good());
+    Recipe r;
+    std::string why;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const char* old_calib = std::getenv("MTP_CALIB");
+    const std::string saved_calib = old_calib ? old_calib : "";
+    setenv("MTP_CALIB", "/tmp/qwen35-mtp-calib", 1);
+    const int parse_rc = r.add_text(text, "mtp-gptq.recipe", &why);
+    if (old_calib) setenv("MTP_CALIB", saved_calib.c_str(), 1);
+    else unsetenv("MTP_CALIB");
+    REQUIRE_EQ(parse_rc, RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)7);
+    for (const char* linear : {"attn_qg", "attn_k", "attn_v", "attn_output", "ffn_gate_up", "ffn_down"}) {
+        const auto* rule = r.match(std::string("blk.64.") + linear + ".weight");
+        REQUIRE(rule != nullptr);
+        CHECK_EQ(rule->quantizer, std::string("rtn"));
+        CHECK(has_opt(rule, "codes", "i8"));
+        CHECK(has_opt(rule, "group", "128"));
+        CHECK(has_opt(rule, "scale", "bf16"));
+        CHECK(has_opt(rule, "transform", "fwht128"));
+    }
+    const auto* head = r.match("mtp.draft_head.weight");
+    REQUIRE(head != nullptr);
+    CHECK_EQ(head->quantizer, std::string("gptq"));
+    CHECK(has_opt(head, "codes", "u2"));
+    CHECK(has_opt(head, "zero", "u8"));
+    CHECK(has_opt(head, "group", "128"));
+    CHECK(has_opt(head, "scale", "f16"));
+    CHECK(has_opt(head, "calib", "/tmp/qwen35-mtp-calib"));
+    CHECK(has_opt(head, "damp", "0.01"));
+    CHECK(r.match("mtp.fc.weight") == nullptr);
+    CHECK(r.match("output.k4.weight") == nullptr);
+}
 
 /* The Sage-A1.5 recipe as it ships: every trunk linear -- attention, the delta net's in- and
  * out-projections, the routed and shared experts of all 40 blocks and the MTP layer at its own
@@ -343,6 +411,67 @@ TEST(the_museglimmer_iq8r_recipe_decides_the_model_it_was_written_for) {
         CHECK(r.match(n) == nullptr);
 }
 
+/* Muse Glimmer IQ4R-V4 uses computed-MAD trellises across the trunk and a compact U3/U4
+ * DFlash2. The target head, embedding, norms, vision, selector and convolutions remain BF16. */
+TEST(the_museglimmer_iq4r_v4_recipe_selects_the_trellis_trunk) {
+    const std::string dir = std::string(__FILE__).substr(
+                                0, std::string(__FILE__).find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/museglimmer-30b-iq4r-v4.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    const char* old_calib = std::getenv("CALIB");
+    const std::string saved_calib = old_calib ? old_calib : "";
+    setenv("CALIB", "/tmp/muse-glimmer-calib", 1);
+    const int parse_rc = r.add_text(text, "museglimmer-30b-iq4r-v4.recipe", &why);
+    if (old_calib) setenv("CALIB", saved_calib.c_str(), 1);
+    else unsetenv("CALIB");
+    REQUIRE_EQ(parse_rc, RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)14);
+    for (const char* n : { "blk.0.attn_q.weight", "blk.51.attn_gate.weight",
+                           "blk.12.attn_k.weight", "blk.12.attn_v.weight",
+                           "blk.0.ffn_gate_up.weight", "blk.51.ffn_down.weight" }) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("gptq"));
+        CHECK(has_opt(m, "tcq", "16"));
+        CHECK(has_opt(m, "tcq_code", "mad"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+        if (std::string(n).find("ffn_") != std::string::npos)
+            CHECK(has_opt(m, "calib", "/tmp/muse-glimmer-calib"));
+        else
+            CHECK(!has_key(m, "calib"));
+        CHECK(has_opt(m, "tcq_order", "1"));
+    }
+    const RecipeRule* kv = r.match("blk.1.attn_k.weight");
+    REQUIRE(kv != nullptr);
+    CHECK(has_opt(kv, "tcq_rows", "128"));
+    for (const char* n : { "dflash.fc.weight", "dflash.blk.0.attn_q.weight",
+                           "dflash.blk.4.attn_output.weight", "dflash.blk.0.ffn_gate_up.weight",
+                           "dflash.blk.4.ffn_down.weight" }) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("gptq"));
+        CHECK(has_opt(m, "tcq", "16"));
+        CHECK(has_opt(m, "tcq_code", "mad"));
+        CHECK(has_opt(m, "tcq_rows", "256"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+        CHECK(!has_key(m, "calib"));
+    }
+    CHECK(has_opt(r.match("dflash.blk.0.ffn_down.weight"), "codes", "u3"));
+    CHECK(has_opt(r.match("dflash.blk.0.attn_q.weight"), "codes", "u4"));
+    const RecipeRule* o = r.match("blk.3.attn_output.weight");
+    REQUIRE(o != nullptr);
+    CHECK(has_opt(o, "codes", "u5"));
+    CHECK(has_opt(o, "scale", "bf16"));
+    CHECK(!has_opt(o, "tcq_order", "1"));
+    for (const char* n : { "output.weight", "token_embd.weight", "blk.3.attn_norm.weight",
+                           "dflash.blk.0.attn_norm.weight", "dflash.sel_pred", "v.proj.weight",
+                           "dspark.fc.weight" })
+        CHECK(r.match(n) == nullptr);
+}
+
 /* The Flint recipes as they ship, over arch/flint's declared names. flint-iq8r: every trunk linear
  * (attention, the two dense layers, the shared expert's gate/up) IQ8R, the routed experts and the
  * shared expert's down projection rotated int8 at a bf16 scale a (row, 128 of K), the head plain
@@ -474,6 +603,87 @@ TEST(the_ling_tiny_iq8r_recipe_decides_the_model_it_was_written_for) {
                            "blk.3.attn_kv_a.weight", "blk.3.attn_kv_b.weight",
                            "blk.3.attn_head_gate.weight", "blk.0.ssm_conv.weight",
                            "token_embd.weight", "output.weight" };
+    for (const char* n : kept) CHECK(r.match(n) == nullptr);
+}
+
+/* The Ling-3.0-flash recipe as it ships, over arch/bailing_hybrid's declared names: the trunk as the
+ * tiny IQ8R recipe (KDA projections, MLA out, the two dense layers' pair, the shared expert's
+ * gate/up IQ8R; the shared expert's down projection rotated int8 at a bf16 scale a (row, 128 of
+ * K)), the 512 routed experts of a layer rotated four-bit codes into the w4nl codebook at an E4M3
+ * scale a (row, 64 of K). Flash's MLA has no query LoRA, so no q_a norm is cast. The KDA beta, the
+ * MLA's q parts, kv projections and head gate, the convolution taps, the embedding and the head
+ * match no rule and keep the checkpoint's bf16. The experts name their statistics through $CALIB,
+ * so the test sets it. */
+TEST(the_ling_flash_iq8r_w4nl64_recipe_decides_the_model_it_was_written_for) {
+    const char* old_calib = std::getenv("CALIB");
+    const std::string saved_calib = old_calib ? old_calib : "";
+    struct RestoreCalib {
+        bool had;
+        const std::string& value;
+        ~RestoreCalib() {
+            if (had) ::setenv("CALIB", value.c_str(), 1);
+            else ::unsetenv("CALIB");
+        }
+    } restore_calib{ old_calib != nullptr, saved_calib };
+    ::setenv("CALIB", "/data/calib", 1);
+    const std::string dir = std::string(__FILE__).substr(
+                                0, std::string(__FILE__).find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/ling-3.0-flash-iq8r-w4nl64.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text(text, "ling-3.0-flash-iq8r-w4nl64.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)18);
+    const char* iq8r[] = { "blk.0.attn_qkv.weight", "blk.40.attn_forget.weight",
+                           "blk.1.attn_gate.weight", "blk.2.attn_output.weight",
+                           "blk.5.attn_output.weight", "blk.0.ffn_gate_up.weight",
+                           "blk.1.ffn_down.weight", "blk.2.ffn_gate_up_shexp.weight",
+                           "blk.41.ffn_gate_up_shexp.weight" };
+    for (const char* n : iq8r) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "i8"));
+        CHECK(has_opt(m, "group", "256"));
+        CHECK(has_opt(m, "scale", "u8"));
+        CHECK(has_opt(m, "scale2", "bf16"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+    }
+    const char* w4nl[] = { "blk.2.ffn_gate_up_exps.0.weight", "blk.41.ffn_down_exps.511.weight" };
+    for (const char* n : w4nl) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("gptq"));
+        CHECK(has_opt(m, "table", "w4nl"));
+        CHECK(has_opt(m, "group", "64"));
+        CHECK(has_opt(m, "scale", "fp8_e4m3"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+        CHECK(has_opt(m, "calib", "/data/calib"));
+    }
+    {
+        const RecipeRule* m = r.match("blk.7.ffn_down_shexp.weight");
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "i8"));
+        CHECK(has_opt(m, "group", "128"));
+        CHECK(has_opt(m, "scale", "bf16"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+    }
+    const char* f32[] = { "blk.0.attn_norm.weight", "blk.5.attn_kv_a_norm.weight",
+                          "blk.2.ffn_norm.weight", "blk.0.ssm_norm.weight", "blk.0.ssm_a",
+                          "blk.0.ssm_dt_bias", "blk.2.glm_router.weight",
+                          "blk.2.glm_router.correction", "output_norm.weight" };
+    for (const char* n : f32) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("cast"));
+        CHECK(has_opt(m, "dtype", "f32"));
+    }
+    const char* kept[] = { "blk.0.attn_beta.weight", "blk.5.attn_q_rope.weight",
+                           "blk.5.attn_q_nope.weight", "blk.5.attn_kv_a.weight",
+                           "blk.5.attn_kv_b.weight", "blk.5.attn_head_gate.weight",
+                           "blk.0.ssm_conv.weight", "token_embd.weight", "output.weight" };
     for (const char* n : kept) CHECK(r.match(n) == nullptr);
 }
 

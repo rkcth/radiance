@@ -23,7 +23,8 @@
 #include "halo_args.h"
 #include "halo_emit.h"
 #include "halo_launch.h"   // HALO_DYN_LDS
-#include "halo_common.h"   // the DPP wave scans
+#include "halo_common.h"
+#include "halo_chain.h"   // the DPP wave scans
 
 #include <hip/hip_runtime.h>
 #include <cmath>
@@ -131,7 +132,7 @@ __device__ __forceinline__ void counts_before(const uint32_t* wsum, int lane, in
  * entirely in the query's past when b * ratio + ratio - 1 <= pos. At decode this equals the
  * sequence's complete count. */
 template <bool Signed>
-__global__ __launch_bounds__(kThreads) void qsa_select_kernel(
+__device__ __forceinline__ void qsa_select_kernel_body(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
@@ -294,6 +295,20 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
                                                       (uint32_t)(p % ratio) + 1u);
         if (seqused) seqused[m] = su;
     }
+}
+
+/* qsa_select_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <bool Signed, class CH = HaloUnchained>
+__global__ __launch_bounds__(kThreads)
+void qsa_select_kernel(
+    const float* __restrict__ score, const int32_t* __restrict__ bt,
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu,
+    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
+    if (CH::on) halo_chain_wait();
+    qsa_select_kernel_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
+    if (CH::on) halo_chain_done();
 }
 
 /* ===================================================== the wide-launch path, for a prefill chunk
@@ -1150,7 +1165,7 @@ static int halo_qsa_select_bf16_emit(long score, long bt, long nc, long pos, lon
     /* Never more than the table width. */
     int cap = (M <= kCacheMaxM) ? lds_cap_of() : 0;
     if (cap > nb) cap = nb;
-    return HALO_EMIT(stream, qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
+    return HALO_EMIT(stream, (halo_chain_flag() ? qsa_select_kernel<Signed, r4dchain> : qsa_select_kernel<Signed, HaloUnchained>), dim3((unsigned)M), dim3(kThreads),
                     (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                     (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
                     (int32_t*)sel, (int32_t*)nsel,
@@ -1170,6 +1185,7 @@ enum { QL_SCORE = 0, QL_BT = 1, QL_NC = 2, QL_POS = 3, QL_CU = 4, QL_SEL = 5, QL
        QL_SEQ = 7 };
 
 extern "C" int halo_rad_qsa_select(const RadArgs* a, RadStream stream) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     const RadTensor* sc = halo_opt(a, QL_SCORE);
     const RadTensor* bt = halo_opt(a, QL_BT);
     const RadTensor* nc = halo_opt(a, QL_NC);

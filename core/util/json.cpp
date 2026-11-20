@@ -93,10 +93,10 @@ Json yy_scalar(yyjson_val* v) {
     }
 }
 
-/* Convert, counting against budget (every value, containers included, as the pre-migration
- * parser callback counted) and depth. Both bounds are enforced where the value is DISCOVERED,
- * not in a second pass over the whole document: a body past either bound is refused while the
- * scratch is still budget-sized, not after the tree's worth of frames has been collected.
+/* Convert, counting against budget (every value, containers included) and depth. Both bounds are
+ * enforced where the value is discovered, not in a second pass over the whole document: a body
+ * past either bound is refused while the scratch is still budget-sized, not after the tree's
+ * worth of frames has been collected.
  * Returns discarded when either bound trips, after setting the matching flag. */
 Json yy_convert(yyjson_val* root, int64_t budget, int max_depth, bool* over, bool* deep) {
     *over = false;

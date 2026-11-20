@@ -17,14 +17,6 @@ namespace server {
 /* ------------------------------------------------------------------ per-choice state */
 
 struct Server::Generation {
-    explicit Generation(const Deps& deps, const std::shared_ptr<const TextEndpoint>& endpoint = {})
-        : scheduler(endpoint ? endpoint->scheduler : deps.sched),
-          tokenizer(endpoint ? endpoint->parser.tok : deps.tok),
-          text_owner(endpoint ? std::shared_ptr<const void>(endpoint) : deps.text_owner) {}
-
-    IScheduler*                  scheduler;
-    ITokenizer*                 tokenizer;
-    std::shared_ptr<const void>  text_owner;
     std::shared_ptr<Sink>         sink;
     /* The runtime LoRA adapter this choice runs with, held so it cannot be unloaded under it. */
     std::shared_ptr<void>         lora_hold;

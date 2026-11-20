@@ -61,6 +61,7 @@ add_executable(rad-schemas rad_schemas.cpp)
 target_link_libraries(rad-schemas PRIVATE rad_abi ${CMAKE_DL_LIBS})
 set_target_properties(rad-schemas PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 rad_add_tool(rad-convert  rad_convert.cpp)
+target_sources(rad-convert PRIVATE rad_add_vision.cpp)
 # Optional OpenMP across weights and within a large one.
 find_package(OpenMP QUIET)
 if(OpenMP_CXX_FOUND)

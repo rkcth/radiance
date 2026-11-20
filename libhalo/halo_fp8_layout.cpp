@@ -244,22 +244,54 @@ bool i8_rotated(const RadParam* p, int n_p) {
     return d && std::strcmp(d, "i8a8h") == 0;
 }
 
+/* int8 codes with a bf16 scale per (row, 128), at transform `tr`. */
+bool i8_codes(const RadEncoding* enc, const char* tr) {
+    return halo_enc::affine(enc, RAD_I8, RAD_BF16, 1, HALO_FP8_BLOCK, RAD_DT_INVALID, tr);
+}
+
+/* IQ8R: int8 codes rotated 128 wide, a u8 scale per (row, 256) under one bf16 scale a row
+ * (libquant's `codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128`). A weight
+ * element is code * scale * scale.1. libr4d's test, by the rename transform. */
+bool iq8r_codes(const RadEncoding* enc) {
+    if (!enc || !rad_enc_is(enc, "affine") || enc->n_planes != 3 ||
+        std::strncmp(enc->transform, "fwht128", RAD_ENC_STR) != 0)
+        return false;
+    if (enc->plane[0].dtype != RAD_I8 || enc->plane[0].block[1] != 1) return false;
+    const int s = rad_enc_find(enc, "scale"), s2 = rad_enc_find(enc, "scale.1");
+    return s >= 0 && enc->plane[s].dtype == RAD_U8 && enc->plane[s].kind == RAD_PLANE_TILED &&
+           enc->plane[s].block[0] == 1 && enc->plane[s].block[1] == HALO_I8_GROUP_WIDE &&
+           s2 >= 0 && enc->plane[s2].dtype == RAD_BF16 && enc->plane[s2].kind == RAD_PLANE_TILED &&
+           enc->plane[s2].block[0] == 1 && enc->plane[s2].block[1] == 0;
+}
+
+/* The scale group is 128, or 256 for IQ8R (the rotation stays 128 wide). Either way the kernels
+ * read one bf16 scale per (row, group), tile-major: IQ8R's is the product of its two stored
+ * levels, rounded once (libr4d's `r4d.iq8r.s.t16`, the same bytes). */
 int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out) {
     if (!out || !pl) return RAD_E_INVAL;
     FGeom g;
-    const int rc = fgeom(p, n_p, &g);
-    if (rc != RAD_OK) return rc;
+    g.N = halo_pgeti_or(p, n_p, "N", 0);
+    g.K = halo_pgeti_or(p, n_p, "K", 0);
+    const long long group = halo_pgeti_or(p, n_p, "group", HALO_FP8_BLOCK);
+    if (g.N <= 0 || g.K <= 0 || (group != HALO_FP8_BLOCK && group != HALO_I8_GROUP_WIDE))
+        return RAD_E_SHAPE;
+    g.sn = (g.N + HALO_FP8_BLOCK - 1) / HALO_FP8_BLOCK;
+    g.sk = (g.K + group - 1) / group;
     if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
     const bool rot = i8_rotated(p, n_p);
-    if (!halo_enc::affine(enc, RAD_I8, RAD_BF16, 1, HALO_FP8_BLOCK, RAD_DT_INVALID,
-                         rot ? "fwht128" : ""))
-        return RAD_E_DTYPE;
+    const bool wide = group == HALO_I8_GROUP_WIDE;
+    if (wide ? !(rot && iq8r_codes(enc)) : !i8_codes(enc, rot ? "fwht128" : "")) return RAD_E_DTYPE;
     if (operand == FL_BSCALE) {
-        if (!halo_enc::selects(enc, sel, n, "scale") || !halo_enc::dims(pl[0], g.N, g.sk))
+        if (wide) {
+            if (!halo_enc::selects(enc, sel, n, "scale", "scale.1") ||
+                !halo_enc::dims(pl[0], g.N, g.sk) || !halo_enc::dims(pl[1], g.N, 1))
+                return RAD_E_SHAPE;
+        } else if (!halo_enc::selects(enc, sel, n, "scale") || !halo_enc::dims(pl[0], g.N, g.sk)) {
             return RAD_E_SHAPE;
+        }
         if (g.N % halo_fp8::kFragRows) return RAD_E_SHAPE;
-        ffill(out, "r4d.i8.s.t16", RAD_BF16, g.N, g.sk, g.N * g.sk * 2);
+        ffill(out, wide ? "r4d.iq8r.s.t16" : "r4d.i8.s.t16", RAD_BF16, g.N, g.sk, g.N * g.sk * 2);
         return RAD_OK;
     }
     if (!halo_enc::selects(enc, sel, n, "codes") || !halo_enc::dims(pl[0], g.N, g.K))
@@ -277,6 +309,26 @@ extern "C" int halo_rad_layout_i8_block(const RadParam* p, int n_p, int operand,
     return i8_enc_layout(p, n_p, operand, enc, sel, pl, n, out);
 }
 
+/* The same int8 weight at one scale per (row, 128 of K), both planes row-major as stored: what
+ * the grouped expert GEMM reads, which stages a run's rows through LDS and gains nothing from a
+ * permutation. An expert then goes from the container or a host pool to the kernel unchanged.
+ * libr4d's hook, by the rename transform. */
+extern "C" int halo_rad_layout_i8_rowmajor(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, RadLayout*) {
+    if (!pl) return RAD_E_INVAL;
+    FGeom g;
+    const int rc = fgeom(p, n_p, &g);
+    if (rc != RAD_OK) return rc;
+    if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
+    if (!i8_codes(enc, i8_rotated(p, n_p) ? "fwht128" : "")) return RAD_E_DTYPE;
+    if (operand == FL_BSCALE
+            ? !halo_enc::selects(enc, sel, n, "scale") || !halo_enc::dims(pl[0], g.N, g.sk)
+            : !halo_enc::selects(enc, sel, n, "codes") || !halo_enc::dims(pl[0], g.N, g.K))
+        return RAD_E_SHAPE;
+    return RAD_E_UNSUPPORTED;                          /* the stored plane, as it is */
+}
+
 extern "C" int halo_rad_relayout_i8_block(const RadParam* p, int n_p, int operand,
                                          const RadEncoding* enc, const int* sel,
                                          const RadTensor* pl, int n, void* dst,
@@ -287,8 +339,20 @@ extern "C" int halo_rad_relayout_i8_block(const RadParam* p, int n_p, int operan
     if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
     if (operand == FL_BSCALE) {
         const long long N = pl[0].shape[0], nkb = pl[0].shape[1];
-        const uint16_t* s = (const uint16_t*)pl[0].data;
         uint16_t* d = (uint16_t*)dst;
+        if (n == 2) {
+            /* IQ8R: the two levels' product, the one bf16 the fold multiplies by. */
+            if (!pl[1].data) return RAD_E_SHAPE;
+            for (long long r = 0; r < N; ++r) {
+                const uint8_t* s1 = halo_enc::row(pl[0], r);
+                const float s2 = rad_load_f32(pl[1].data, RAD_BF16, r);
+                for (long long kb = 0; kb < nkb; ++kb)
+                    rad_store_f32(d, RAD_BF16, ((r / 16) * nkb + kb) * 16 + r % 16,
+                                  (float)s1[kb] * s2);
+            }
+            return RAD_OK;
+        }
+        const uint16_t* s = (const uint16_t*)pl[0].data;
         for (long long r = 0; r < N; ++r)
             for (long long kb = 0; kb < nkb; ++kb)
                 d[((r / 16) * nkb + kb) * 16 + r % 16] = s[r * nkb + kb];
@@ -310,6 +374,8 @@ extern "C" int halo_rad_unrelayout_i8_block(const RadParam* p, int n_p, int oper
     if (rc != RAD_OK) return rc;
     if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
     if (operand == FL_BSCALE) {
+        /* IQ8R's product does not come apart into its two stored levels. */
+        if (n == 2) return RAD_E_UNSUPPORTED;
         const long long N = pl[0].shape[0], nkb = pl[0].shape[1];
         const uint16_t* s = (const uint16_t*)src;
         uint16_t* d = (uint16_t*)pl[0].data;

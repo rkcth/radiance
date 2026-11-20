@@ -99,6 +99,19 @@ const std::vector<NamedTable>& named_tables() {
                     14.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 30.0f,
                     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
                     -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f } },
+        /* The 64-level form for libr4d's w6nl64a8h: 32 positive E4M3-exact magnitudes followed
+         * by their negatives. Fitted to group-64 absmax-normalised FWHT-128 BF16 Flash-Next
+         * down-weight samples for least weight error, not against activations
+         * (tools/fit_w6nl.py). The high code bit is the sign, and libr4d's layout verifies this
+         * complete table before serving it. */
+        { "w6nl", { 0.875f, 2.75f, 4.5f, 6.0f, 6.5f, 7.0f, 7.5f, 8.0f,
+                    9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f,
+                    18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f,
+                    36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f, 64.0f,
+                    -0.875f, -2.75f, -4.5f, -6.0f, -6.5f, -7.0f, -7.5f, -8.0f,
+                    -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f, -16.0f,
+                    -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f, -32.0f,
+                    -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f, -64.0f } },
         /* A one-bit weight: a sign and the block's scale. */
         { "binary", { -1.0f, 1.0f } },
         /* BitNet's ternary weight, a two-bit code with one code unused. */
@@ -117,7 +130,7 @@ bool parse_table(const char* s, std::vector<float>* out, std::string* why) {
         char* end = nullptr;
         const float v = std::strtof(p, &end);
         if (end == p || !std::isfinite(v)) {
-            if (why) *why = fmt("table=%s is neither nf4, iq4nl, w4nl, w5nl, binary, ternary nor a "
+            if (why) *why = fmt("table=%s is neither nf4, iq4nl, w4nl, w5nl, w6nl, binary, ternary nor a "
                                 "`;`-separated list of values", s);
             return false;
         }

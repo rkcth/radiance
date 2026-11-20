@@ -1,0 +1,34 @@
+# museglimmer-30b-iq4r-v4.recipe -- Muse Glimmer 30B computed-trellis IQR-V4 trunk.
+#
+# Convert from the BF16 Muse release and local DFlash2 (this selects museglimmer_ct):
+#   CALIB=/path/to/RADGRAM2 rad-convert <Muse-Glimmer-30B> \
+#       --draft-model <Muse-Glimmer-30B-DFlash2> \
+#       --tokenizer <Muse-Glimmer-30B>/tokenizer.json \
+#       --chat-template <Muse-Glimmer-30B>/chat_template.jinja \
+#       --recipe data/recipes/museglimmer-30b-iq4r-v4.recipe \
+#       --set quantization_config.quant_method=compressed-tensors \
+#       -o muse-glimmer-30b-iq4r-v4-df2.rad
+#
+# The seven trunk projections use 128-wide FWHT and computed-MAD trellis codes, read at i8a8h.
+# Reuse the existing Muse CalibFull data for MLP gate/up and down only; convert its
+# safetensors to RADGRAM2 first. That capture has no attention Hessians, so attention GPTQ uses
+# its documented nearest-round fallback. DFlash2 has no tapped Hessians either, so its dense
+# linears use the same no-Gram fallback: U3 for the large MLPs and U4 for attention/fc. Keep the
+# target head, embedding, norms, vision tower, selector, convolution weights and codebooks
+# unchanged. K/V use tcq_rows=128 for TP2's local KV head.
+
+blk.*.attn_q.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=1024 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_gate.weight    gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=1024 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_k.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128  block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_v.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128  block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_output.weight  gptq codes=u5 tcq=16 tcq_code=mad tcq_rows=256 group=128 scale=bf16 dyn=1 transform=fwht128 tcq_gain=1.20 damp=0.01
+blk.*.ffn_gate_up.weight  gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=512  block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 calib=$CALIB tcq_order=1
+blk.*.ffn_down.weight     gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256  block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 calib=$CALIB tcq_order=1
+
+dflash.fc.weight                          gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_q.weight                 gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_k.weight                 gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_v.weight                 gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_output.weight            gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.ffn_gate_up.weight            gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+dflash.blk.*.ffn_down.weight               gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01

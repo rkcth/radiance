@@ -120,13 +120,32 @@ struct Nemo {
     }
 };
 
-/* The weights as the release recipes store them: the drafter's linears and every trunk linear block
- * fp8, dt's rows of in_proj bf16 (32 a rank at four ranks, no whole scale block). The drafter's
- * keys come first: the fake answers the first key a name contains. */
+/* The weights as the 2.0 recipe stores them: the drafter's linears rotated int8 with a bf16 scale
+ * per (row, 128 of K), as the DFlash2 recipes do; every trunk linear int8 at 128, unrotated; the
+ * routed experts w4nl64; dt's rows of in_proj bf16 (32 a rank at four ranks, no whole scale block).
+ * The drafter's keys come first: the fake answers the first key a name contains. */
 void nemo_encs(RadBuilder& b) {
-    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
-    b.encs = { { "dflash.fc.", fp8 }, { "dflash.blk.", fp8 }, { "ssm_dt", rad_enc_plain(RAD_BF16) },
-               { "blk.", fp8 } };
+    RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(r8.transform, "fwht128");
+    RadEncoding nl = rad_enc_affine(RAD_U4, RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&nl, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&nl, "table", RAD_F32, 1, 16);
+    rad_enc_copy_str(nl.transform, "fwht128");
+    b.encs = { { "dflash.fc.", r8 }, { "dflash.blk.", r8 }, { "ssm_dt", rad_enc_plain(RAD_BF16) },
+               { "_exps", nl }, { "blk.", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) } };
+}
+
+/* The IQ8R recipe's forms: every trunk linear IQ8R (int8 codes with a u8 scale per (row, 256 of K)
+ * under a bf16 one a row, each 128 of K rotated), the routed experts and the drafter's linears
+ * rotated int8 at 128, dt's rows bf16. */
+void iq8r_encs(RadBuilder& b) {
+    RadEncoding iq8r = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&iq8r, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(iq8r.transform, "fwht128");
+    RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(r8.transform, "fwht128");
+    b.encs = { { "dflash.fc.", r8 }, { "dflash.blk.", r8 }, { "ssm_dt", rad_enc_plain(RAD_BF16) },
+               { "_exps", r8 }, { "blk.", iq8r } };
 }
 
 int buf_named(const RadBuilder& b, const char* name) {
@@ -185,7 +204,6 @@ TEST(drafter_geom_replicates_kv_heads_only_when_the_block_asks) {
  * query heads over that head (gqa 8, a libr4d row of its own) where two ranks run 16 (gqa 16). At
  * two ranks nothing is spanned: the even shard is the head. */
 TEST(lilicorr_replicates_its_two_kv_heads_at_four_ranks) {
-    SKIP("Nemotron-H's trunk is block fp8, which this build does not serve; the case returns with an int8 container");
     Nemo f;
     const RadModelMeta meta = f.meta();
     for (int world : { 2, 4 })
@@ -245,7 +263,6 @@ TEST(lilicorr_replicates_its_two_kv_heads_at_four_ranks) {
 /* A speculative step at four ranks: the trunk's verify of two sequences, the drafter's context pass
  * over its rows and its query pass, each without a step failure and lint-clean. */
 TEST(nemotronh_tp4_steps_lint_clean_with_the_lilicorr_drafter) {
-    SKIP("Nemotron-H's trunk is block fp8, which this build does not serve; the case returns with an int8 container");
     Nemo f;
     const RadModelMeta meta = f.meta();
     for (int rank : { 0, 3 }) {
@@ -268,12 +285,86 @@ TEST(nemotronh_tp4_steps_lint_clean_with_the_lilicorr_drafter) {
     }
 }
 
+/* The 2.0 recipe's drafter is rotated int8, and its backbone reads int8 codes: the five pairs its
+ * linears read (the taps, fc's output, the convolution's output, the attention and the feed-forward
+ * product) are int8 with an f32 scale per 128 of K, every GEMM over a `dflash.` weight runs at
+ * i8a8h, and no E4M3 quantiser writes a drafter buffer, at one, two and four ranks. Before, the
+ * backbone declared E4M3 pairs and a rotated int8 fc was refused at declare. */
+TEST(a_rotated_int8_lilicorr_backbone_reads_int8_codes) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        nemo_encs(b);
+        const RadBuildCtx ctx = nemo_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        for (const char* q : { "df_srcq", "df_cq", "df_h2q", "df_atq", "df_ffq" }) {
+            const int i = buf_named(b, q);
+            REQUIRE(i != 0);
+            CHECK_EQ((int)b.bufs[(size_t)i - 1].d.dtype, (int)RAD_I8);
+        }
+        const int cq = buf_named(b, "df_cq"), cs = buf_named(b, "df_cs");
+        REQUIRE(cq != 0 && cs != 0);
+        CHECK_EQ(b.bufs[(size_t)cs - 1].d.shape[1], b.bufs[(size_t)cq - 1].d.shape[1] / 128);
+        int fp8q = 0, gemms = 0, i8a8h = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "quant_act_fp8" || o.op == "had_quant_act_fp8")
+                for (rad_buf wb : o.writes)
+                    fp8q += b.bufs[(size_t)wb - 1].name.rfind("df_", 0) == 0;
+            if (o.op != "gemm_nt_q") continue;
+            bool df = false;
+            for (rad_weight wt : o.w)
+                df |= b.weights[(size_t)wt - 1].name.find("dflash.") != std::string::npos;
+            if (!df) continue;
+            ++gemms;
+            for (const RecParam& q : o.p)
+                if (q.key == "dtype") i8a8h += q.sval == "i8a8h";
+        }
+        CHECK_EQ(fp8q, 0);
+        CHECK(gemms > 0);
+        CHECK_EQ(i8a8h, gemms);
+    }
+}
+
+/* An IQ8R trunk keeps one scale a 256 columns, and the shared expert's down projection reads its
+ * rank's slice along K, so every slice is whole 256-column groups: Bolt's 5376 is 21 of them, 11
+ * and 10 at two ranks, 6, 5, 5 and 5 at four. Every rank declares, the slices cover the expert
+ * once, and a speculative step at two ranks is lint-clean. Sliced in 128-column blocks, two ranks
+ * held 2688 columns each and the down projection was refused. */
+TEST(an_iq8r_trunk_slices_the_shared_expert_in_whole_256_column_groups) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        int64_t total = 0;
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            iq8r_encs(b);
+            const RadBuildCtx ctx = nemo_ctx(rank, world);
+            REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+            const int up = buf_named(b, "shared_up");
+            REQUIRE(up != 0);
+            const int64_t w = b.bufs[(size_t)up - 1].d.shape[1];
+            CHECK_EQ(w % 256, (int64_t)0);
+            total += w;
+            if (world != 2) continue;
+            auto trunk = kit(b, { 8, 8 }, {});
+            auto cpass = context_pass(b, *trunk);
+            auto qpass = query_pass(b, 2, 8, 7);
+            std::vector<int32_t> anchors = { 7, 15 };   /* each sequence's last committed row */
+            qpass->b.anchor_rows = anchors.data();
+            auto v = run_passes(b, nemotronh::step, { trunk.get(), cpass.get(), qpass.get() }, rank,
+                                world);
+            CHECK_PASSES(b, v);
+        }
+        CHECK_EQ(total, (int64_t)5376);
+    }
+}
+
 /* The engine's arena levels declare again at a smaller max_tok (RadBuildCtx::shape_probe) and
  * must get the real declare's graph: the same ops with the same fixed parameters, only ranged row
  * counts and buffer rows smaller. The drafter's split fc gathers its message as a range; a fixed
  * numel there left every level unplanned, and sixteen sequences short of the lent arena. */
 TEST(nemotronh_sizing_declares_match_the_real_graph_at_every_arena_level) {
-    SKIP("Nemotron-H's trunk is block fp8, which this build does not serve; the case returns with an int8 container");
     Nemo f;
     const RadModelMeta meta = f.meta();
     for (int world : { 2, 4 })
@@ -327,6 +418,109 @@ TEST(nemotronh_probe_names_lilicorrs_depth) {
     REQUIRE_EQ(nemotronh::probe(&meta, &pr), RAD_OK);
     CHECK_EQ(pr.draft_depth, 7);
     CHECK_EQ(pr.draft_depth_fixed, 1);
+}
+
+/* An int8 trunk: with the trunk linears stored int8 (a bf16 scale a [1 x 128]) and the routed
+ * experts w4nl64, every block linear of Bolt's nine-block cut runs at i8a8 behind a quant_act_i8g of
+ * its own over the bf16 plane, and no linear stays block fp8. The bf16 rows of dt in in_proj run as
+ * a plain GEMM, one a Mamba block. The deployment declares no drafter, so no LiLiCorr linear is
+ * counted. */
+void int8_trunk_encs(RadBuilder& b) {
+    RadEncoding nl = rad_enc_affine(RAD_U4, RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&nl, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&nl, "table", RAD_F32, 1, 16);
+    rad_enc_copy_str(nl.transform, "fwht128");
+    b.encs = { { "ssm_dt", rad_enc_plain(RAD_BF16) }, { "_exps", nl },
+               { "blk.", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) } };
+}
+
+TEST(an_int8_trunk_runs_every_block_linear_at_i8a8) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        int8_trunk_encs(b);
+        const RadBuildCtx ctx = build_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        int i8a8 = 0, fp8a8 = 0, q8 = 0, plain = 0, dt = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "quant_act_i8g") ++q8;
+            if (o.op == "gemm_nt") {
+                ++plain;
+                for (rad_weight wt : o.w)
+                    dt += b.weights[(size_t)wt - 1].name.find("ssm_dt") != std::string::npos;
+            }
+            if (o.op != "gemm_nt_q") continue;
+            for (const RecParam& q : o.p) {
+                if (q.key != "dtype") continue;
+                i8a8 += q.sval == "i8a8";
+                fp8a8 += q.sval == "fp8a8";
+            }
+        }
+        /* four Mamba blocks of three linears, the attention's two, and for each of the four MoE
+         * blocks the shared expert's two and the latent's two */
+        CHECK_EQ(i8a8, 30);
+        CHECK_EQ(q8, 30);
+        CHECK_EQ(fp8a8, 0);
+        CHECK_EQ(plain, 4);
+        CHECK_EQ(dt, 4);
+    }
+}
+
+/* The routed arm of w4nl64 experts reads rotated int8 codes: in each of Bolt's four MoE blocks the
+ * rotated copy of the latent and the relu^2 product are written by had_quant_act_i8g, and both
+ * grouped GEMMs run at w4nl64a8i8h, at one, two and four ranks. No op is had_quant_act_fp8, which
+ * this build's kernels do not declare. */
+TEST(the_routed_arm_reads_rotated_int8_codes) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        int8_trunk_encs(b);
+        const RadBuildCtx ctx = build_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        int hq_i8 = 0, hq_fp8 = 0, gemm_i8 = 0, gemm_other = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "had_quant_act_i8g") ++hq_i8;
+            if (o.op == "had_quant_act_fp8") ++hq_fp8;
+            if (o.op.rfind("moe_gemm_q", 0) != 0) continue;
+            for (const RecParam& q : o.p)
+                if (q.key == "dtype") (q.sval == "w4nl64a8i8h" ? gemm_i8 : gemm_other) += 1;
+        }
+        CHECK_EQ(hq_i8, 8);
+        CHECK_EQ(hq_fp8, 0);
+        CHECK_EQ(gemm_i8, 8);
+        CHECK_EQ(gemm_other, 0);
+    }
+}
+
+/* An int8 trunk quantises no activation to E4M3 that no op reads: in Bolt's nine-block cut, with its
+ * latent, at one, two and four ranks, no quant_act_fp8 is declared or issued, and the out
+ * projections' inputs and the shared expert's product have no E4M3 plane. The relu^2 product is
+ * written once, in bf16. The block norms' E4M3 codes remain (rmsnorm_quant_fp8 has no unrotated
+ * int8 form), and the latent's plane is declared for MoeFP8's prepared input but not written. */
+TEST(an_int8_trunk_quantises_nothing_to_e4m3_that_no_op_reads) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        int8_trunk_encs(b);
+        const RadBuildCtx ctx = build_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        int fp8q = 0, relu = 0;
+        for (const RecOp& o : b.ops) {
+            fp8q += o.op == "quant_act_fp8";
+            relu += o.op == "act_mul";
+        }
+        CHECK_EQ(fp8q, 0);
+        CHECK(relu > 0);
+        for (const char* n : { "attn_out.q", "ssm_out.q", "shared_ff.q" })
+            CHECK_EQ(buf_named(b, n), 0);
+        auto trunk = kit(b, { 1, 1 }, { 8 });
+        auto v = run_passes(b, nemotronh::step, { trunk.get() }, world - 1, world);
+        CHECK_PASSES(b, v);
+        CHECK_EQ(count_issued(issued_ops(b, *v[0]), "quant_act_fp8"), 0);
+    }
 }
 
 RAD_TEST_MAIN()

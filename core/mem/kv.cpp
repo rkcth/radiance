@@ -3,6 +3,7 @@
 
 #include "kvstream/carve.h"
 #include "kvstream/plan.h"
+#include "device/device.h"
 
 #include <algorithm>
 #include <cmath>
@@ -303,6 +304,21 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
         if (p.runtime_win && !p.zero)
             fixed += align_up(max_seqs_ * p.ring_blocks_max() * p.bytes_per_block, RAD_ALIGN_UNIT);
 
+    /* The checkpoint stage (ckpt_stage): one snapshot of the linear state, where a lone spanned
+     * prefill may take its tail snapshot inside its last chunk (--prefill-span above 1,
+     * --prefill-tail-snapshot on), the engine snapshots into a prefix cache and the slot carries
+     * no window. */
+    stage_bytes_ = 0;
+    {
+        int64_t lin = 0;
+        for (const auto& p : plans_) if (p.stateful() && !p.zero) lin += p.bytes_per_state;
+        if (cfg.ckpt_stage && cfg.prefill_span > 1 && cfg.prefill_tail_snapshot &&
+            cfg.prefix_cache && cfg.checkpoint_slots != 0 && window_ck_bytes_ == 0 && lin > 0 &&
+            lin == checkpoint_bytes_)
+            stage_bytes_ = lin;
+    }
+    if (stage_bytes_ > 0) fixed += align_up(stage_bytes_, RAD_ALIGN_UNIT);
+
     fixed_ = fixed;
     ckpts_ = budget_ckpts;
     return RAD_OK;
@@ -418,6 +434,8 @@ void KVManager::forget() {
     live_.clear(); free_usable_.clear(); bucket_blocks_.clear(); held_hist_.clear();
     chunk_blocks_.clear(); short_peak_.clear();
     pool_ = nullptr;
+    stage_ = nullptr;
+    stage_off_ = 0;
     clears_.clear();
     seqs_.clear(); pending_.clear();
     configured_ = false;
@@ -520,7 +538,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     pool_base_ = kv_pool.base();
     pool_ = &kv_pool;
 
-    if (fixed >= budget_bytes && !(plans_.size() <= 1 && fixed == 0)) {
+    if (fixed >= budget_bytes) {
         RAD_ERR("vram_kv does not fit its fixed costs:\n"
                 "  linear/conv state  %10s  (%lld sequences)\n"
                 "  vram_kv            %10s\n"
@@ -567,7 +585,6 @@ int KVManager::carve_into(Pool& kv_pool) {
     /* ---- carve. Every reservation comes from the KV pool only; the mover works inside the
      * weight slab and cannot reach it (spec §6). ---- */
     for (auto& p : plans_) {
-        if (p.index == 0) continue;  /* the null handle owns no storage */
         int64_t bytes = p.paged() ? kv_pool_bytes(p)
                                   : p.n_states * p.bytes_per_state;
         if (p.zero) {
@@ -589,6 +606,15 @@ int KVManager::carve_into(Pool& kv_pool) {
         p.base = ptr;
         p.pool_offset = off;
         p.pool_bytes = bytes;
+    }
+    /* The checkpoint stage, after the groups (its bytes are in fixed_). */
+    if (stage_bytes_ > 0) {
+        stage_ = kv_pool.reserve("checkpoint stage", stage_bytes_, RAD_ALIGN_UNIT, &stage_off_);
+        if (!stage_) {
+            RAD_ERR("the checkpoint stage (%s) did not fit the KV pool",
+                    humanb(stage_bytes_).c_str());
+            return RAD_E_NOMEM;
+        }
     }
     /* --checkpoint-slots does nothing on a model with no recurrent state; say so. */
     if (ckpts_ > 0 && checkpoint_bytes_ <= 0)
@@ -671,6 +697,10 @@ int KVManager::carve_into(Pool& kv_pool) {
             for (const auto& p : plans_) {
                 if (p.zero || !p.base) continue;
                 const int rc = lendable(p.index) ? 0 : pool_->commit(p.pool_offset, p.pool_bytes);
+                if (rc < 0) return rc;
+            }
+            if (stage_) {
+                const int rc = pool_->commit(stage_off_, stage_bytes_);
                 if (rc < 0) return rc;
             }
             if (const int rc = flex_span(flex_floor_loan_, carved + 1, true); rc < 0) {
@@ -894,7 +924,7 @@ int64_t KVManager::held_top(size_t i) const {
 /* Takes back enough of the loan that `blocks` more can be handed out, without limit: the request
  * is already admitted and the budget says it fits. Recalls the shortfall plus the buffer, so a
  * sequence growing a block at a time does not recall per block. */
-int KVManager::grow_for(int32_t g, int64_t blocks) {
+int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
     if (g < 0 || g >= (int32_t)plans_.size()) return RAD_E_INVAL;
     const KVGroupPlan& p = plans_[(size_t)g];
     if (!p.paged()) return RAD_OK;
@@ -913,7 +943,7 @@ int KVManager::grow_for(int32_t g, int64_t blocks) {
     int64_t keep = (p.n_blocks - live) * p.block_size;
     if (keep > loan_) keep = loan_;
     if (reclaim_) {
-        const int rc = reclaim_(keep);
+        const int rc = reclaim_(keep, waiting_for_fleet);
         if (rc == RAD_E_FULL) return rc;   /* a flex cache the fleet could not grow: the request waits */
         if (rc < 0) {
             RAD_ERR("KV group '%s': a request needs %lld more blocks and the expert slab could not "
@@ -1482,7 +1512,9 @@ void KVManager::trim_window(uint64_t id, int64_t keep_from) {
     recycle_window(s, keep_from);
 }
 
-int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
+int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from,
+                      bool* waiting_for_fleet) {
+    if (waiting_for_fleet) *waiting_for_fleet = false;
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
     if (n_tokens <= s->n_tokens) return RAD_OK;
@@ -1511,8 +1543,16 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                 if (bi >= 0 && bi < (int64_t)s->blocks[g].size()
                     && refcount_[g][(size_t)s->blocks[g][(size_t)bi]] > 1) need[g] += 1;
             }
-            if (need[g] > available_blocks((int32_t)g)) return RAD_E_FULL;
-            RAD_TRY(grow_for((int32_t)g, need[g]));
+            if (need[g] > available_blocks((int32_t)g)) {
+                /* The Fleet allowance can grow with no local request running. An impossible
+                 * full-pool requirement, or a state-slot shortage, is not such a wait. */
+                const int64_t full_free = free_blocks((int32_t)g) +
+                    std::max<int64_t>(p.n_blocks - live_blocks((int32_t)g), 0);
+                if (waiting_for_fleet && flex() && lendable((int32_t)g) && need[g] <= full_free)
+                    *waiting_for_fleet = true;
+                return RAD_E_FULL;
+            }
+            RAD_TRY(grow_for((int32_t)g, need[g], waiting_for_fleet));
         } else if (p.stateful() && s->state[g] < 0) {
             if (free_states_[g].empty()) return RAD_E_FULL;
         }
@@ -1816,6 +1856,50 @@ int KVManager::checkpoint_save(const int32_t* slots, int n, int32_t ck, RadStrea
 int KVManager::checkpoint_restore(const int32_t* slots, int n, int32_t ck, RadStream s,
                                   const std::vector<int32_t>* win) {
     return checkpoint_copy(slots, n, ck, /*save=*/false, s, win);
+}
+
+void KVManager::ckpt_stage_layout(std::vector<int64_t>* off, std::vector<int64_t>* lb) const {
+    off->assign(plans_.size(), -1);
+    lb->assign(plans_.size(), 0);
+    int64_t at = 0;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (!p.stateful()) continue;
+        (*off)[g] = at;
+        (*lb)[g] = p.layer_bytes_per_state();
+        at += p.layer_bytes_per_state() * p.n_layers;
+    }
+}
+
+int KVManager::checkpoint_stage_rest(const int32_t* slots, int n, RadStream s,
+                                     const std::function<bool(size_t, int64_t)>& skip) {
+    if (!stage_) return RAD_E_STATE;
+    if (!slots || n < (int)plans_.size()) return RAD_E_INVAL;
+    int64_t off = 0;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (!p.stateful()) continue;
+        const int64_t nbytes = p.layer_bytes_per_state();
+        for (int64_t l = 0; l < p.n_layers; ++l) {
+            if (skip(g, l)) continue;
+            void* st = slots[g] >= 0 ? state_ptr((int32_t)g, (int32_t)l, slots[g]) : nullptr;
+            if (!st) return RAD_E_STATE;
+            RAD_TRY(rad_memcpy_async((char*)stage_ + off + l * nbytes, st, nbytes, s));
+        }
+        off += nbytes * p.n_layers;
+    }
+    return RAD_OK;
+}
+
+int KVManager::checkpoint_stage_out(int32_t ck, RadStream s) {
+    if (!stage_) return RAD_E_STATE;
+    if (!ck_store_ || !ck_store_->in_use(ck)) {
+        RAD_ERR("checkpoint stage: the store does not hold slot %d", (int)ck);
+        return RAD_E_INVAL;
+    }
+    char* dst = (char*)checkpoint_ptr(ck);
+    if (!dst) return RAD_E_INVAL;
+    return rad_memcpy_async(dst, stage_, stage_bytes_, s);
 }
 
 bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out) const {

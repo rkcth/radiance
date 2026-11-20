@@ -26,7 +26,7 @@ template <uint32_t THR, bool CHAIN, bool GRP = false>
 __device__ __forceinline__ void gelu_mul_quant_i8_body(
     const uint16_t* __restrict__ gu, signed char* __restrict__ q, float* __restrict__ S,
     uint16_t* __restrict__ yo, uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
-    if (CHAIN) r4d_chain_wait();
+    if (CHAIN) r4d_chain_wait_vec();
     extern __shared__ uint16_t ybuf[];
     __shared__ float lm[THR / 32];
     const uint32_t row = blockIdx.x;

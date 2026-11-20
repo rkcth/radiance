@@ -771,10 +771,10 @@ Each algorithm pairs with any grid it makes sense for, and a recipe names all th
 | `cast` | a float in another float dtype | none | `plain` |
 
 The grid is `codes` (integers to 32 bits, fp8/6/4) or `table` (a codebook: NF4, IQ4_NL's values,
-the `w4nl` table Flash-Next's experts are served in and its 32-level `w5nl` form, binary, ternary,
-or given), a scale block and dtype, an optional second scale level the first is relative to (an
-E4M3 or integer sub-scale under an f32 or f16, as in NVFP4 and the K-quants), an optional integer
-zero and an optional Hadamard.
+the `w4nl` table Flash-Next's experts are served in and its 32-level `w5nl` and 64-level `w6nl`
+forms, binary, ternary, or given), a scale block and dtype, an optional second scale level the
+first is relative to (an E4M3 or integer sub-scale under an f32 or f16, as in NVFP4 and the
+K-quants), an optional integer zero and an optional Hadamard.
 
 Adding a quantisation format is a quantiser plugin plus a kernel that accepts its encoding; the
 core does not change.

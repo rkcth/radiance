@@ -198,6 +198,124 @@ __device__ __forceinline__ void r4d_archk_wait(unsigned int* my_flags, unsigned 
   }
 }
 
+// ---- The handshake of a kernel whose threads each own at most one word of the block's message
+// (a decode or verify step: r4d_ar_hc_write_reg_kernel, r4d_ar_oneshot_2rank_exact.hip). Such a
+// kernel is a chain of dependent round trips, and this is the plain kernels' protocol -- the same
+// check word, the same flag value, a pass only behind the peer's flag and on an agreeing sum --
+// with the chain shortened:
+//
+//  * Barriers order LDS only (r4d_lds_barrier). A __syncthreads also waits for every outstanding
+//    load and store and invalidates the vector caches: 0.26 us against 0.03 on this part, five
+//    times a launch in the plain kernels.
+//  * The flag poll is a relaxed system-scope load. As an acquire load every poll is followed by a
+//    system-scope cache invalidate (0.35 us, and whatever the card had cached for the kernels
+//    behind goes with it), for as long as the peer is late. The slot is fine-grained memory, read
+//    past the caches, and the push check re-reads behind a system-scope acquire whenever the
+//    bytes do not agree, exactly as r4d_archk_wait does.
+//  * `push` stores the thread's word and `rehash` loads the peer's into the caller's registers, so
+//    the reduce reads nothing again.
+//
+// drain 4 is the plain kernels' test mode (r4d_ar_late_push_pin): the flag ahead of the push and
+// the push ~20 us behind it.
+#define R4D_ARW_SPIN_MAX 4000000000ULL
+
+// A barrier that orders LDS only.
+__device__ __forceinline__ void r4d_lds_barrier() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+// The wake word of a 2-rank instance: the word behind the flags and the two slots' check words
+// (r4d_ar_entry.hip sizes the allocation). Nothing reads it.
+//
+// The path between two cards idles when nothing crosses it. On 2x R9700 behind an EPYC's two root
+// complexes, with each card's own link busy all the while: a store into the peer's memory more
+// than ~20 us after the last one becomes visible there ~4 us later than one behind recent traffic,
+// and the path is back at full speed ~2-4 us after that first store. A step's all-reduces are
+// ~100 us apart, and a handshake's last store is its flag, so the whole of that wait lands on the
+// flag: both ranks sit in their polls for it (5.9 us a mixer all-reduce of Qwen3.8-Flash-Next
+// where neither rank was late, against 2.4 behind a store 2-20 us earlier). A block's first lane
+// stores into the wake word before it waits for its turn, which is as early as the kernel knows it
+// is about to push: the path wakes while the block waits, takes its counters and pushes.
+__device__ __forceinline__ void r4d_ar_link_wake(unsigned int* peer_flags, unsigned int nbw) {
+  if (threadIdx.x == 0)
+    __hip_atomic_store(&peer_flags[3u * nbw], blockIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename P, typename F>
+__device__ __forceinline__ void r4d_ar_word_handshake(unsigned int* peer_flags,
+                                                      unsigned int* my_flags, unsigned int nbw,
+                                                      unsigned int slot, unsigned int b,
+                                                      unsigned int seq, int drain, const P& push,
+                                                      const F& rehash) {
+  __shared__ unsigned int s_wput[32];
+  __shared__ unsigned int s_wchk[32];
+  __shared__ unsigned int s_wok;
+  const unsigned int tid = threadIdx.x, nt = blockDim.x, nw = (nt + 31u) / 32u;
+  const bool late = drain == 4;
+  if (late) {
+    if (tid == 0)
+      __hip_atomic_store(&peer_flags[b], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    const unsigned long long t0 = wall_clock64();
+    while (wall_clock64() - t0 < 2000ull) __builtin_amdgcn_s_sleep(8);   // 100 MHz: 20 us
+  }
+  unsigned int hck = 0u;
+  push(hck);
+  hck = r4d_archk_wave_sum(hck);
+  if ((tid & 31u) == 0u) s_wput[tid >> 5] = hck;
+  /* Every wave's pushes are out before the one barrier in front of the flag (the drain modes of
+   * the plain kernels; 2 is thread 0's fence below). */
+  if (drain == 1) __threadfence_system();
+  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  r4d_lds_barrier();
+  if (tid == 0) {
+    unsigned int t = 0u;
+    for (unsigned int w = 0; w < nw; ++w) t += s_wput[w];
+    unsigned int* const cw = r4d_archk_word(peer_flags, nbw, slot, b);
+    if (late) {
+      /* Nothing else writes the pushes back before the kernel ends: a release (r4d_archk_put). */
+      __hip_atomic_store(cw, t + seq * R4D_ARCHK_SALT, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    } else {
+      /* The flag's release writes the pushes back, so the check word itself can be relaxed. */
+      __hip_atomic_store(cw, t + seq * R4D_ARCHK_SALT, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      if (drain == 2) __threadfence_system();
+      __hip_atomic_store(&peer_flags[b], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    unsigned long long z = 0;
+    /* A handshake that cannot complete is a lockstep violation; trap rather than sum stale bytes. */
+    while (r4d_ar_seq_behind(__hip_atomic_load(&my_flags[b], __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_SYSTEM), seq))
+      if (++z > R4D_ARW_SPIN_MAX) __builtin_trap();
+  }
+  r4d_lds_barrier();
+  const unsigned long long t0 = tid == 0 ? wall_clock64() : 0ull;
+  for (;;) {
+    /* The check word first, so its round trip overlaps the re-hash's loads (r4d_archk_wait). */
+    const unsigned int want = tid == 0 ? __hip_atomic_load(r4d_archk_word(my_flags, nbw, slot, b),
+                                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)
+                                       : 0u;
+    unsigned int h = 0u;
+    rehash(h);
+    h = r4d_archk_wave_sum(h);
+    if ((tid & 31u) == 0u) s_wchk[tid >> 5] = h;
+    r4d_lds_barrier();
+    if (tid == 0) {
+      unsigned int t = 0u;
+      for (unsigned int w = 0; w < nw; ++w) t += s_wchk[w];
+      const bool ok = t + seq * R4D_ARCHK_SALT == want;
+      if (!ok && wall_clock64() - t0 > R4D_ARCHK_DEADLINE) __builtin_trap();
+      s_wok = ok ? 1u : 0u;
+    }
+    r4d_lds_barrier();
+    if (s_wok) return;
+    r4d_lds_barrier();   // s_wchk and s_wok are rewritten by the next try
+    /* Drop the vector caches, so the next try reads the bytes from where the push lands. */
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    __builtin_amdgcn_s_sleep(2);
+  }
+}
+
 // ---- The host mailbox's one read. A host twin's slots are pinned host memory (r4d_ar_entry.hip),
 // which the card reads past every cache over its own link, so reading the slot for the check and
 // again for the reduce crosses the link twice: at --p2p off a prefill all-reduce's reads doubled

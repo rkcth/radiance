@@ -171,6 +171,9 @@ TEST(generate_answers_with_the_mesh_file) {
     CHECK_EQ(s.gen.last().seed, (uint64_t)1234);
     CHECK_EQ(s.gen.last().steps, 0);
     CHECK(s.gen.last().dense);
+    /* A `model` field, which a process serving several models routes by, is taken and ignored. */
+    r = s.generate(Shapes::body({ { "model", "hunyuan3d-2" } }));
+    CHECK_EQ(r.status, 200);
 }
 
 /* A failed shape is the generator's reason, not a file. */

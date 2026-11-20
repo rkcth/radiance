@@ -2081,9 +2081,9 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     if (d->kind == RAD_DRAFT_NONE) return RAD_OK;   /* declaring nothing is declaring nothing */
 
     const char* nm = d->name && *d->name ? d->name : "(unnamed)";
-    if (d->kind != RAD_DRAFT_SERIAL && d->kind != RAD_DRAFT_BLOCK) {
-        err(RAD_E_INVAL, "declare_drafter '%s': kind %d is neither RAD_DRAFT_SERIAL nor "
-                         "RAD_DRAFT_BLOCK", nm, d->kind);
+    const bool history = d->kind == RAD_DRAFT_HISTORY;
+    if (d->kind != RAD_DRAFT_SERIAL && d->kind != RAD_DRAFT_BLOCK && !history) {
+        err(RAD_E_INVAL, "declare_drafter '%s': unknown kind %d", nm, d->kind);
         return RAD_E_INVAL;
     }
     if (prog_.drafter.kind != RAD_DRAFT_NONE) {
@@ -2093,9 +2093,16 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
             prog_.drafter_name.c_str(), nm);
         return RAD_E_STATE;
     }
-    if (d->depth <= 0) {
-        err(RAD_E_INVAL, "declare_drafter '%s': depth %d. A drafter that proposes nothing is not "
-                         "declared at all -- leave the call out.", nm, d->depth);
+    if (history && (d->depth != 0 || prog_.ctx.max_spec != 0 || d->proposal ||
+                    d->proposal_pitch || d->block || d->window || !prog_.ctx.calib_dir ||
+                    !*prog_.ctx.calib_dir || prog_.ctx.calib_tokens <= 0)) {
+        err(RAD_E_INVAL, "declare_drafter '%s': HISTORY requires calibration, max_spec 0 and "
+                         "no proposal or block", nm);
+        return RAD_E_INVAL;
+    }
+    if (!history && d->depth <= 0) {
+        err(RAD_E_INVAL, "declare_drafter '%s': depth %d. A speculative drafter must propose "
+                         "at least one token.", nm, d->depth);
         return RAD_E_INVAL;
     }
     if (prog_.ctx.max_spec > 0 && d->depth != prog_.ctx.max_spec) {
@@ -2171,7 +2178,7 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     /* A block drafter's proposal row holds its whole block's tokens, and the engine reads row s
      * at s * pitch (a short block fills only its front), so its pitch defaults to depth; a serial
      * one writes a token a pass, at pitch 1 by default. */
-    if (prog_.drafter.proposal_pitch == 0)
+    if (!history && prog_.drafter.proposal_pitch == 0)
         prog_.drafter.proposal_pitch = prog_.drafter.kind == RAD_DRAFT_BLOCK ? prog_.drafter.depth : 1;
     return RAD_OK;
 }

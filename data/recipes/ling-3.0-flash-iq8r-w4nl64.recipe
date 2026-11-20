@@ -1,0 +1,41 @@
+# ling-3.0-flash-iq8r-w4nl64.recipe -- Ling-3.0-flash or a fine-tune (Ling-3.0-flash-Sante) from its
+# bf16 checkpoint with an IQ8R trunk and four-bit rotated experts, served by bailing_hybrid.
+#
+#   CALIB=DIR rad-convert <Ling-3.0-flash bf16 checkpoint> \
+#       --recipe data/recipes/ling-3.0-flash-iq8r-w4nl64.recipe -o ling-3.0-flash-iq8r-w4nl64.rad
+#
+#   - The trunk as ling-3.0-tiny-iq8r.recipe: the KDA projections, the MLA output, the dense
+#     layers' feed-forward and the shared expert's gate/up as IQ8R, the shared expert's down
+#     projection int8 at one bf16 scale per (row, 128 of K), all rotated by fwht128.
+#   - The 512 routed experts of every layer as rotated u4 codes into the w4nl codebook with one E4M3
+#     scale a (row, 64 of K) under a fixed f32 of 2^-13 (w4nl64a8i8h, as nemotron74-w4nl64-gptq),
+#     read against the trunk's rotated int8 codes. DIR holds the experts' Grams for GPTQ; an empty
+#     DIR rounds them to nearest with a scale search.
+#   - Kept bf16: the KDA beta projection, the MLA's q and kv projections and its gate, the conv1d
+#     weights, the router, the embedding and the lm_head.
+#
+# Flash clamps its SwiGLU in its last layers (routed 35-41, shared 34-41): there the gated product
+# is the clamp into the bf16 plane and the rotating int8 quantiser after it.
+
+blk.*.attn_qkv.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_forget.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_gate.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight   rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+
+blk.*.ffn_*_exps.*.weight        gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+blk.*.ffn_down_shexp.weight      rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+# The shared blocks declare their gains and router correction as f32 planes (A_log and dt_bias
+# ship f32 in the checkpoint), so they keep the f32 form the plugin reads.
+blk.*.attn_norm.weight           cast dtype=f32
+blk.*.attn_kv_a_norm.weight      cast dtype=f32
+blk.*.ffn_norm.weight            cast dtype=f32
+blk.*.ssm_norm.weight            cast dtype=f32
+blk.*.ssm_a                      cast dtype=f32
+blk.*.ssm_dt_bias                cast dtype=f32
+blk.*.glm_router.weight          cast dtype=f32
+blk.*.glm_router.correction      cast dtype=f32
+output_norm.weight               cast dtype=f32

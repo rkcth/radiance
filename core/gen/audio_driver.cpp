@@ -342,11 +342,6 @@ void AudioDriver::shutdown(const char* why, int status) {
     for (auto& j : jobs_) j->req->ticket->finish(status, closed_why_);
 }
 
-bool AudioDriver::busy() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return !jobs_.empty();
-}
-
 int64_t AudioDriver::queued() const {
     std::lock_guard<std::mutex> lk(mu_);
     int64_t n = 0;

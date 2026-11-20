@@ -105,8 +105,7 @@ const char* level_json(Finding::Level l) {
 std::string card_lines(const CardFacts& c) {
     std::string o;
     std::string who = c.rank >= 0 ? fmt("rank %d (device %d)", c.rank, c.device)
-                    : c.device >= 0 ? fmt("device %d, outside this engine", c.device)
-                                    : "outside this engine";
+                    : c.device >= 0 ? fmt("device %d, not serving", c.device) : "not serving";
     o += fmt("  card %s  %s  %s%s%s  %s VRAM",
              c.bdf.c_str(), who.c_str(), c.gfx.empty() ? (c.vendor + ":" + c.pci_device).c_str() : c.gfx.c_str(),
              c.name.empty() ? "" : " ", c.name.empty() ? "" : ("\"" + c.name + "\"").c_str(),

@@ -376,6 +376,30 @@ extern "C" int halo_shape_grid_embed(const RadParam* p, int n_p, int operand, Ra
     HALO_PICK(l);
 }
 
+/* grid_embed's operands plus the prefix rows (RADIO's class and register tokens). */
+extern "C" int halo_shape_grid_embed_cpe(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), side = pi(p, n_p, "side");
+    const int64_t npre = rad_param_geti(p, n_p, "n_prefix", 1);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, side * side, n), opd_idx(4, M, side),
+                             opd(D, npre > 0 ? npre : 1, n) };
+    HALO_PICK(l);
+}
+
+/* grid_embed_pad's: the same operands and drawing as grid_embed's. */
+extern "C" int halo_shape_grid_embed_pad(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), side = pi(p, n_p, "side");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, side * side, n), opd_idx(4, M, side) };
+    HALO_PICK(l);
+}
+
+/* window_order declines: its `crd` rows, segment grids and `cu` boundaries must describe whole
+ * raster grids, and an index draw cannot; the emu and unit tests build them by hand. */
+extern "C" int halo_shape_window_order(const RadParam*, int, int, RadOpdDesc*) {
+    return RAD_E_UNSUPPORTED;
+}
+
 extern "C" int halo_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
     const uint32_t D = dt_act(p, n_p, "dtype");
@@ -421,6 +445,26 @@ extern "C" int halo_shape_kda_update(const RadParam* p, int n_p, int operand, Ra
         opd_idx(1, history, history + 1, -1, RAD_OPD_F_IDX_UNIQUE),
         opd_idx(2, 0, M, -1, RAD_OPD_F_IDX_CU),
         opd_idx(1, 0, 0, 1), opd_idx(1, 0, 0, 1), opd(D, M, H, V),
+    };
+    HALO_PICK(l);
+}
+
+extern "C" int halo_shape_ssd_update(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const char* form = rad_param_gets(p, n_p, "state_form", "");
+    if (!std::strcmp(form, "anchor")) return RAD_E_UNSUPPORTED;
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), P = pi(p, n_p, "head_dim");
+    const int64_t N = pi(p, n_p, "d_state"), G = pi(p, n_p, "groups");
+    if (G < 1 || H % G) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const char* mode = rad_param_gets(p, n_p, "mode", "");
+    const int64_t history = !std::strcmp(mode, "verify") ? M : 1;
+    const RadOpdDesc l[] = {
+        opd(D, M, H, P), opd(D, M, G, N), opd(D, M, G, N), opd(D, M, H),
+        opd((uint32_t)RAD_F32, H), opd((uint32_t)RAD_F32, H), opd((uint32_t)RAD_F32, H),
+        opd((uint32_t)RAD_F32, history + 1, H, P, N),
+        opd_idx(1, history, history + 1, -1, RAD_OPD_F_IDX_UNIQUE),
+        opd_idx(2, 0, M, -1, RAD_OPD_F_IDX_CU),
+        opd_idx(1, 0, 0, 1), opd_idx(1, 0, 0, 1), opd(D, M, H, P),
     };
     HALO_PICK(l);
 }
@@ -602,6 +646,13 @@ extern "C" int halo_shape_unary(const RadParam* p, int n_p, int operand,
     HALO_PICK(l);
 }
 
+extern "C" int halo_shape_vq_euclidean(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bins = pi(p, n_p, "bins");
+    if (M <= 0 || n <= 0 || bins <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {opd(RAD_F32, M, n), opd(RAD_F32, bins, n), opd(RAD_I32, 1, M)};
+    HALO_PICK(l);
+}
+
 extern "C" int halo_shape_silu_mul(const RadParam* p, int n_p, int operand,
                                   RadOpdDesc* out) {
 
@@ -616,6 +667,19 @@ extern "C" int halo_shape_silu_mul(const RadParam* p, int n_p, int operand,
 extern "C" int halo_shape_router_sigmoid_topk(const RadParam* p, int n_p, int operand,
                                              RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, ne), opd((uint32_t)RAD_F32, ne), opd_idx(M, k, ne),
+                             opd(D, M, k) };
+    HALO_PICK(l);
+}
+
+extern "C" int halo_shape_router_sigmoid_group_topk(const RadParam* p, int n_p, int operand,
+                                                   RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
+    const int64_t ng = pi(p, n_p, "n_group"), kg = pi(p, n_p, "topk_group");
+    if (ne <= 0 || ne > 512 || k <= 0 || ng <= 0 || ng > 32 || ne % ng || ne / ng < 2 || kg <= 0 ||
+        kg > ng || k > kg * (ne / ng))
+        return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = { opd(D, M, ne), opd((uint32_t)RAD_F32, ne), opd_idx(M, k, ne),
                              opd(D, M, k) };
@@ -665,6 +729,24 @@ extern "C" int halo_shape_mla_project(const RadParam* p, int n_p, int operand, R
     const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, absorb ? d : l),
                                 opd((uint32_t)RAD_BF16, h * 2 * d, l),
                                 opd((uint32_t)RAD_BF16, M, h, absorb ? l : d) };
+    HALO_PICK(list);
+}
+/* One sequence whose context is its query, as libref describes the op; a harness passes `ctx`. */
+extern "C" int halo_shape_mla_attn_paged(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), L = pi(p, n_p, "latent_dim"),
+                  R = pi(p, n_p, "rope_dim"), bs = pi(p, n_p, "block_size");
+    if (M <= 0 || h <= 0 || L <= 0 || R <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    int64_t ctx = pi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, M, h, R),
+                                opd((uint32_t)RAD_BF16, blocks, 1, bs, L + R),
+                                opd_idx(1, blocks, blocks),
+                                opd_idx(1, 0, 0, ctx),
+                                opd_idx(2, 0, M + 1, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+                                opd_none(),
+                                opd((uint32_t)RAD_BF16, M, h, L) };
     HALO_PICK(list);
 }
 extern "C" int halo_shape_dsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1036,6 +1118,20 @@ extern "C" int halo_shape_attn_paged(const RadParam* p, int n_p, int operand,
     HALO_PICK(l);
 }
 
+/* attn_paged_sink -- attn_paged's operands with `sinks` [n_head] f32 before `out`. */
+extern "C" int halo_shape_attn_paged_sink(const RadParam* p, int n_p, int operand,
+                                          RadOpdDesc* out) {
+    if (operand < 7) return halo_shape_attn_paged(p, n_p, operand, out);
+    if (operand == 8) return halo_shape_attn_paged(p, n_p, 7, out);
+    const int64_t nh = pi(p, n_p, "n_head");
+    if (nh <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd((uint32_t)RAD_F32, nh),
+    };
+    HALO_PICK(l);
+}
+
 /* attn_paged_gate_quant -- attn_paged's operands, then gate_quant_fp8's gate, codes and scales,
  * flat as gate_quant_fp8 describes them: one row per (token, head) pair, `head_dim` columns. */
 extern "C" int halo_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int operand,
@@ -1310,7 +1406,7 @@ extern "C" int halo_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, i
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", HALO_FP8_BLOCK);
-    if (g != HALO_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != HALO_FP8_BLOCK && g != HALO_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, n),      /* inout: the message and the input */
         opd((uint32_t)RAD_BF16, M, n),
@@ -1572,7 +1668,9 @@ extern "C" int halo_shape_moe_scatter_inv(const RadParam* p, int n_p, int operan
     HALO_PICK(l);
 }
 
-extern "C" int halo_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+/* `i8`: moe_gemm_i8a8's operands, int8 codes on both sides and the weight's scale per (row, group
+ * of K). */
+static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out, bool i8) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t N0 = pi(p, n_p, "N"), K0 = pi(p, n_p, "K");
     const int64_t N1 = pi(p, n_p, "N_odd", N0), K1 = pi(p, n_p, "K_odd", K0);
@@ -1589,27 +1687,38 @@ extern "C" int halo_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, Ra
      * in scatter order ("sorted"). */
     const char* ord = rad_param_gets(p, n_p, "a_order", nullptr);
     const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
+    const uint32_t C = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    auto srows = [&](int64_t n) { return i8 ? n : (n + g - 1) / g; };
+    const int64_t ag = pi(p, n_p, "a_group", g) > 0 ? pi(p, n_p, "a_group", g) : g;
     const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_F8E4M3, AR, K),                 /* a -- see `a_order` */
-        opd((uint32_t)RAD_F32, AR, (K + g - 1) / g),      /* a_scale */
+        opd(C, AR, K),                 /* a -- see `a_order` */
+        opd((uint32_t)RAD_F32, AR, (K + ag - 1) / ag),    /* a_scale */
         /* The weight operands are tables when issued, described here as one stacked plane; a
          * fixture cannot hold a pointer array, and the kernel reads both forms (halo_moe.hip,
          * wtab_at). */
-        opd((uint32_t)RAD_F8E4M3, ne0, N0, K0),           /* w -- the even experts */
-        opd((uint32_t)RAD_BF16, ne0, (N0 + g - 1) / g, (K0 + g - 1) / g),   /* w_scale */
+        opd(C, ne0, N0, K0),           /* w -- the even experts */
+        opd((uint32_t)RAD_BF16, ne0, srows(N0), (K0 + g - 1) / g),   /* w_scale */
         opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset -- see the note above */
-        opd((uint32_t)RAD_F8E4M3, ne1, N1, K1),           /* w_odd -- the odd experts */
-        opd((uint32_t)RAD_BF16, ne1, (N1 + g - 1) / g, (K1 + g - 1) / g),   /* w_odd_scale */
+        opd(C, ne1, N1, K1),           /* w_odd -- the odd experts */
+        opd((uint32_t)RAD_BF16, ne1, srows(N1), (K1 + g - 1) / g),   /* w_odd_scale */
         opd(D, M * k, N),                                 /* y, in sorted order */
+        opd_none(),                                       /* split -- optional, none here */
     };
     HALO_PICK(l);
 }
 
+extern "C" int halo_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return moe_gemm_q_shape(p, n_p, operand, out, false);
+}
+extern "C" int halo_shape_moe_gemm_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return moe_gemm_q_shape(p, n_p, operand, out, true);
+}
+
 /* The four-class form: class q holds the experts e with e % 4 == q at [N_q, K_q], defaulting to
  * class 0's, ceil((n - q) / 4) of them; `y` follows the last class. */
-extern "C" int halo_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operand,
-                                         RadOpdDesc* out) {
+static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                                 bool i8) {
     const int64_t M  = pi(p, n_p, "M");
     int64_t Nc[4], Kc[4];
     Nc[0] = pi(p, n_p, "N");
@@ -1633,20 +1742,32 @@ extern "C" int halo_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operan
     const uint32_t D = dt_act(p, n_p, "dtype");
     const char* ord = rad_param_gets(p, n_p, "a_order", nullptr);
     const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
-    auto wq = [&](int q) { return opd((uint32_t)RAD_F8E4M3, nq[q], Nc[q], Kc[q]); };
+    const uint32_t C = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    auto wq = [&](int q) { return opd(C, nq[q], Nc[q], Kc[q]); };
+    const int64_t ag = pi(p, n_p, "a_group", g) > 0 ? pi(p, n_p, "a_group", g) : g;
     auto sq = [&](int q) {
-        return opd((uint32_t)RAD_BF16, nq[q], (Nc[q] + g - 1) / g, (Kc[q] + g - 1) / g);
+        return opd((uint32_t)RAD_BF16, nq[q], i8 ? Nc[q] : (Nc[q] + g - 1) / g,
+                   (Kc[q] + g - 1) / g);
     };
     const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_F8E4M3, AR, K),                 /* a -- see `a_order` */
-        opd((uint32_t)RAD_F32, AR, (K + g - 1) / g),      /* a_scale */
+        opd(C, AR, K),                                    /* a -- see `a_order` */
+        opd((uint32_t)RAD_F32, AR, (K + ag - 1) / ag),    /* a_scale */
         wq(0), sq(0),                                     /* w, w_scale -- class 0 */
         opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
         wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
         opd(D, M * k, N),                                 /* y -- in SORTED order */
+        opd_none(),                                       /* split -- optional, none here */
     };
     HALO_PICK(l);
+}
+extern "C" int halo_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    return moe_gemm_q_mod4_shape(p, n_p, operand, out, false);
+}
+extern "C" int halo_shape_moe_gemm_i8_mod4(const RadParam* p, int n_p, int operand,
+                                          RadOpdDesc* out) {
+    return moe_gemm_q_mod4_shape(p, n_p, operand, out, true);
 }
 
 extern "C" int halo_shape_moe_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1727,6 +1848,52 @@ extern "C" int halo_shape_pair_argmax(const RadParam* p, int n_p, int operand, R
         opd((uint32_t)RAD_F32, M, n, 2),
         opd((uint32_t)RAD_I32, M),
         opd((uint32_t)RAD_F32, M),
+    };
+    HALO_PICK(l);
+}
+
+/* LiLiCorr's ops, described as libref describes them; lili_cand declines (its stats rows are no
+ * draw; avx_check_hand.cpp and tests/halo_emu build them). */
+extern "C" int halo_shape_lili_cand(const RadParam*, int, int, RadOpdDesc*) {
+    return RAD_E_UNSUPPORTED;
+}
+
+extern "C" int halo_shape_lili_attn(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), S = pi(p, n_p, "steps"), k = pi(p, n_p, "k");
+    const int64_t nh = pi(p, n_p, "n_head"), hd = pi(p, n_p, "head_dim");
+    if (M <= 0 || S <= 0 || k <= 0 || nh <= 0 || hd <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t rows = (M + S * k - 1) / (S * k) * (S * k);
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, rows, 3 * nh * hd),
+        opd((uint32_t)RAD_F32, nh, 2 * S + 1),
+        opd((uint32_t)RAD_F32, nh),
+        opd((uint32_t)RAD_BF16, rows, nh * hd),
+    };
+    HALO_PICK(l);
+}
+
+extern "C" int halo_shape_lili_factor(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), L = pi(p, n_p, "L"), n = pi(p, n_p, "n");
+    if (M <= 0 || L <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t rows = (M + L - 1) / L * L;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, rows, n),
+        opd((uint32_t)RAD_BF16, rows / L, n),
+        opd((uint32_t)RAD_BF16, rows, 3 * n),
+    };
+    HALO_PICK(l);
+}
+
+extern "C" int halo_shape_lili_walk(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), S = pi(p, n_p, "steps"), k = pi(p, n_p, "k");
+    const int64_t n = pi(p, n_p, "n");
+    if (M <= 0 || S <= 0 || k <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M * S * k, 2 * n),
+        opd((uint32_t)RAD_BF16, M, n),
+        opd_idx(M * S, k, 1000),
+        opd((uint32_t)RAD_I32, M, S),
+        opd((uint32_t)RAD_F32, M, S, k, k),
     };
     HALO_PICK(l);
 }
@@ -2066,7 +2233,7 @@ extern "C" int halo_shape_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int 
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", HALO_FP8_BLOCK);
     const uint32_t D = dt_act(p, n_p, "dtype");
-    if (g != HALO_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != HALO_FP8_BLOCK && g != HALO_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, n),
         opd(D, M, n),
@@ -2085,7 +2252,7 @@ extern "C" int halo_shape_gated_had_quant_i8g(const RadParam* p, int n_p, int op
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", HALO_FP8_BLOCK);
     const uint32_t D = dt_act(p, n_p, "dtype");
-    if (g != HALO_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != HALO_FP8_BLOCK && g != HALO_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, 2 * n),                   /* gate then up in one buffer */
         opd((uint32_t)RAD_I8, M, n),
@@ -2102,7 +2269,7 @@ extern "C" int halo_shape_gate_quant_fp8(const RadParam* p, int n_p, int operand
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", HALO_FP8_BLOCK);
     const uint32_t D = dt_act(p, n_p, "dtype");
-    if (g != HALO_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != HALO_FP8_BLOCK && g != HALO_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     /* A row is a (token, head) pair: `M` is tokens * n_head and `n` is head_dim, so the gate is a
      * fixed stride inside the [q|gate] projection and the scale plane lands where the out
      * projection reads it. In the engine the gate is a column slice; described flat. */
@@ -2174,4 +2341,35 @@ extern "C" int halo_shape_dflash_select(const RadParam* p, int n_p, int operand,
         opd((uint32_t)RAD_I32, M, steps),
     };
     HALO_PICK(l);
+}
+
+extern "C" int halo_shape_dflash_markov(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t steps = pi(p, n_p, "steps");
+    const int64_t R = pi(p, n_p, "rank");
+    const int64_t V = pi(p, n_p, "n_vocab");
+    const int64_t astr = pi(p, n_p, "anchor_stride", 1);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || astr < 1)
+        return RAD_E_UNSUPPORTED;
+    const int64_t tiles = (V + 63) / 64;
+    const int64_t rows = M * steps;
+    const RadOpdDesc l[] = {
+        opd(D, rows, V),
+        opd_idx((M - 1) * astr + 1, 0, V),
+        opd(D, V, R),
+        opd(D, V, R),
+        opd((uint32_t)RAD_F32, M, tiles),
+        opd_idx(M, tiles, V),
+        opd_idx(M, steps, V),
+    };
+    HALO_PICK(l);
+}
+
+extern "C" int halo_shape_dflash_markov_f32(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int rc = halo_shape_dflash_markov(p, n_p, operand, out);
+    if (rc == RAD_OK && operand == 0) out->dtype = RAD_F32;
+    return rc;
 }

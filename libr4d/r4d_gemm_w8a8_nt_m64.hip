@@ -234,7 +234,7 @@ __global__ __launch_bounds__(R4D_W8A8_BOUNDS(MT, NPW)) void r4dchain_gemm_w8a8_n
     const signed char* __restrict__ A, const float* __restrict__ Ascale,
     const unsigned* __restrict__ Wq, const unsigned short* __restrict__ Ws,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     r4d_gemm_w8a8_nt_m64_body<MT, NPW, NT>(A, Ascale, Wq, Ws, C, M, K, N, WV, SK);
     r4d_chain_done();
 }

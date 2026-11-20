@@ -225,7 +225,7 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
             else if (!w.is_discarded()) j[k] = std::move(w);
             else
                 RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "
-                         "array of ids; ignoring it", k, v);
+                         "array of ids; ignoring it", k, log_sanitize(v).c_str());
             continue;
         }
         if (std::strcmp(k, "suppress_tokens") == 0) {

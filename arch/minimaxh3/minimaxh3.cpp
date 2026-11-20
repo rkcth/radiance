@@ -2401,7 +2401,11 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.ve_fold_mul = join_list(fm);
     m.ve_fold_add = join_list(fa);
     m.b_epix32 = decl_b(b, nm.f("venc.pix32"), RAD_F32, { Rmax, 3 });
-    m.b_epix = decl_b(b, nm.f("venc.pix"), RAD_BF16, { Rmax, 3 });
+    /* conv_in and the k=1 projections run on the host. Their activation operands must be
+     * pinned host buffers too: joining a device queue does not make its VRAM CPU-readable.
+     * Device convolutions can read/write these boundary buffers over the link in place. */
+    m.b_epix = decl_b(b, nm.f("venc.pix"), RAD_BF16, { Rmax, 3 },
+                      RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
     m.b_egn = decl_b(b, nm.f("venc.gn"), RAD_F32, { G * (2 + 3 * 1024) });
     const rad_buf st = m.b_egn;
     /* The tiled encode's two planes and the quant_conv are declared ahead of the trunk, and the
@@ -2410,12 +2414,16 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
      * `b_eqt` the finished tiles' moments, so both lifetimes must span the trunk's ops (from
      * op_ve_pix's and op_ve_q's use to op_vt_crop and op_vt_join). */
     m.enc_tiles = max_tiles(kMaxArea);
-    m.b_tplan = decl_b(b, nm.f("venc.tplan"), RAD_I32, { m.enc_tiles, 22 }, RAD_BUF_PERSIST);
+    m.b_tplan = decl_b(b, nm.f("venc.tplan"), RAD_I32, { m.enc_tiles, 22 },
+                       RAD_BUF_PERSIST, RAD_DOMAIN_HOST);
     m.b_vtile = decl_b(b, nm.f("venc.vtile"), RAD_F32,
                        { m.enc_tiles * (int64_t)kEncMaxSide * kEncMaxSide, 3 });
-    m.b_eq48 = decl_b(b, nm.f("venc.q48"), RAD_BF16, { R[5], 48 });
-    m.b_eq2 = decl_b(b, nm.f("venc.q"), RAD_BF16, { R[5], 48 });
-    m.b_eqt = decl_b(b, nm.f("venc.qt"), RAD_BF16, { m.enc_tiles * (int64_t)kTile * kTile, 48 });
+    m.b_eq48 = decl_b(b, nm.f("venc.q48"), RAD_BF16, { R[5], 48 },
+                      RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
+    m.b_eq2 = decl_b(b, nm.f("venc.q"), RAD_BF16, { R[5], 48 },
+                     RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
+    m.b_eqt = decl_b(b, nm.f("venc.qt"), RAD_BF16, { m.enc_tiles * (int64_t)kTile * kTile, 48 },
+                     RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
     m.ve_qw = wt(nm.f("venc.q.weight"), nm.ckpt("vae.quant_conv.weight"), { 48, 48, 1, 1, 1 });
     m.ve_qb = wt(nm.f("venc.q.bias"), nm.ckpt("vae.quant_conv.bias"), { 48 });
     /* The whole-canvas pass writes b_eq2; the tiled pass writes a tile's slice of b_eqt, which
@@ -2448,7 +2456,8 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         const int64_t cout = (int64_t)dims[L], cin = L == 0 ? cout : (int64_t)dims[L - 1];
         const bool sc = L > 0 && cout != cin;
         E.cin = cin, E.cout = cout, E.rows = R[L], E.pf = PF[L], E.frames = tf[L];
-        E.a = decl_b(b, nm.f("venc.l%d.a", L), RAD_BF16, { R[L], cout });
+        E.a = decl_b(b, nm.f("venc.l%d.a", L), RAD_BF16, { R[L], cout },
+                     RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
         E.b = decl_b(b, nm.f("venc.l%d.b", L), RAD_BF16, { R[L], cout });
         E.c = decl_b(b, nm.f("venc.l%d.c", L), RAD_BF16, { R[L], cout });
         /* A level that changes the width takes its input in a buffer of that width, which the
@@ -2456,7 +2465,8 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
          * none. */
         if (sc) {
             const bool dn_in = (int64_t)sds[L - 1] == 2 || (int64_t)tds[L - 1] == 2;
-            E.in = dn_in ? decl_b(b, nm.f("venc.l%d.in", L), RAD_BF16, { R[L], cin })
+            E.in = dn_in ? decl_b(b, nm.f("venc.l%d.in", L), RAD_BF16, { R[L], cin },
+                                 RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST)
                          : m.v_lv[(size_t)L - 1].a;
             const char* sc_src = nm.ckpt("vae.encoder.down_blocks.%d.resnets.0.conv_shortcut", L);
             E.scw = wt(nm.f("venc.l%d.sc.weight", L), nm.ckpt("%s.weight", sc_src),

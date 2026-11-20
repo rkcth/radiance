@@ -133,7 +133,7 @@ __device__ __forceinline__ void ple_gate_body(PLE_GATE_PARAMS) {
 template <class CH>
 __global__ __launch_bounds__(kPgThreads)
 void ple_gate_kernel(PLE_GATE_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     ple_gate_body(k, q, v, wk, wq, wc, gv, gvn, n, hc, k_ld, q_ld, v_ld, g_ld, gn_ld, eps, wadd, geps, per_thread);
     if (CH::on) r4d_chain_done();
 }

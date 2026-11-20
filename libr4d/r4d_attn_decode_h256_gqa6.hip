@@ -732,7 +732,7 @@ template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
 __global__ __launch_bounds__(NWARPS * 32)
 void r4dchain_attn_decode(const R4DArgs a, int splits)
 {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
     r4d_chain_done();
 }
@@ -918,7 +918,7 @@ template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0>
 __global__ __launch_bounds__(32 * JPB)
 void r4dchain_attn_splitkv_combine_vec(const R4DArgs a, int splits, int tile)
 {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0>(a, splits, tile,
                                                                    R4DGateQuant{});
     r4d_chain_done();
@@ -1077,7 +1077,7 @@ template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4dchain_attn_splitkv_combine(const R4DArgs a, int splits, int tile)
 {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0>(a, splits, tile, R4DGateQuant{});
     r4d_chain_done();
 }

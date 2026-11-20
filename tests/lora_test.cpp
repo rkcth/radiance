@@ -1006,7 +1006,8 @@ TEST(a_transformed_or_rotated_weight_is_not_a_site) {
     const rad_weight wu = decl("blk.0.ffn_up.weight", "model.layers.0.mlp.up_proj.weight");
     REQUIRE(wq && wk && wv && wo && wu);
     REQUIRE(b.program().weights[wq].enc_known);
-    push_op(b, gemm_op("gemm_nt", 128, 256, "bf16", 1, 64, { wq }, { 1 }, false));
+    /* A quantised GEMM over the transformed weight: fed the rotated codes of its activation. */
+    push_op(b, gemm_op("gemm_nt_q", 128, 256, "mxfp4a8", 1, 64, { wq, wq }, { 2, 3 }, true));
     OpInfo parts = gemm_op("gemm_nt_q", 128, 256, "mxfp4a8", 1, 64, { wk, wk }, { 2, 3 }, true);
     parts.base.set_i("pb1", 64);
     push_op(b, parts);
@@ -1035,6 +1036,37 @@ TEST(a_transformed_or_rotated_weight_is_not_a_site) {
 /* Adapters serve the token steps of a model that writes logits, or a generator that names its
  * adapter keys: declare refuses a generator that names none, an embedding model and a program with
  * no logits by name, and lets a text model through. */
+/* A plain fp GEMM over a transform-basis weight is a site: it is fed plain activations, and the
+ * kernel library that serves it presents the weight in the plain basis at load (a plain row
+ * without such a relayout refuses the encoding at declare). */
+TEST(a_plain_gemm_over_a_transformed_weight_is_a_site) {
+    const RadModelMeta meta = llama_meta();
+    const RadBuildCtx ctx = ctx_for(0, 1);
+    Builder b(empty_registry(), meta, ctx);
+    b.set_sources([](const std::string& name, const Program&, WeightSource* out) {
+        if (name != "blk.0.attn_q.weight") return (int)RAD_E_NOTFOUND;
+        out->enc = rad_enc_plain(RAD_BF16);
+        rad_enc_copy_str(out->enc.transform, "fwht128");
+        out->rank = 2; out->shape[0] = 128; out->shape[1] = 256;
+        return (int)RAD_OK;
+    });
+    AR::map_copy(&b, "blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight");
+    RadWeightDecl d{};
+    d.dtype = RAD_BF16; d.rank = 2; d.shape[0] = 128; d.shape[1] = 256;
+    d.access = RAD_ACCESS_PER_TOKEN; d.shard = RAD_SHARD_NONE; d.group = AR::grp_layer(0);
+    const rad_weight wq = rad_decl_weight(&b, "blk.0.attn_q.weight", &d);
+    REQUIRE(wq);
+    REQUIRE(b.program().weights[wq].enc_known);
+    push_op(b, gemm_op("gemm_nt", 128, 256, "bf16", 1, 64, { wq }, { 1 }, false));
+    const lora::TargetSet t{ "q_proj" };
+    std::vector<lora::UnsupportedUse> un;
+    CHECK_EQ(lora::find_unsupported_uses(b.program(), t, &un), 0);
+    std::vector<lora::Site> s;
+    std::string err;
+    REQUIRE_EQ(lora::build_sites(b.program(), t, 16, &s, &err), RAD_OK);
+    CHECK_EQ(s.size(), (size_t)1);
+}
+
 TEST(declare_refuses_a_model_that_does_not_generate_text) {
     const RadModelMeta meta = llama_meta();
     const RadBuildCtx ctx = ctx_for(0, 1);

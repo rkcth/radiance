@@ -131,8 +131,9 @@ static int case_nan(int M, int n, int pad, int extra_rows) {
 
 /* norm_add_norm_route: norm_add_norm, then the router's row r = norm(x) * w_r * mult and the experts'
  * E4M3 codes q and scales qs of norm(x) * w_e. `zero_group`: w_e zero over the second 128 columns,
- * so that group's amax is 0 and its scale the quantiser's 1. */
-static int case_route(int M, int n, int pad, int extra_rows, bool zero_group = false) {
+ * so that group's amax is 0 and its scale the quantiser's 1. `i8` is norm_add_norm_route_i8g: q is
+ * the int8 codes of each group rotated by the 128-wide Hadamard (rmsnorm_had_quant_i8g's). */
+static int case_route(int M, int n, int pad, int extra_rows, bool zero_group = false, bool i8 = false) {
     const int ld = n + pad, R = M + extra_rows, G = n / 128, ldq = n + pad, lds = G + 3;
     const float eps = 1e-6f, mult = 1.0f / std::sqrt((float)n);
     auto a = randb((size_t)R * ld, 3.f), x = randb((size_t)R * ld, 1.f), y0 = randb((size_t)R * ld, 1.f);
@@ -150,12 +151,12 @@ static int case_route(int M, int n, int pad, int extra_rows, bool zero_group = f
                         rows(xd.data(), RAD_BF16, M, n, ld), vec(wy.data(), RAD_F32, n),
                         rows(yd.data(), RAD_BF16, M, n, ld), vec(wr.data(), RAD_F32, n),
                         rows(rd.data(), RAD_BF16, M, n, ld), vec(we.data(), RAD_F32, n),
-                        rows(qd.data(), RAD_F8E4M3, M, n, ldq), rows(sd.data(), RAD_F32, M, G, lds) };
+                        rows(qd.data(), i8 ? RAD_I8 : RAD_F8E4M3, M, n, ldq), rows(sd.data(), RAD_F32, M, G, lds) };
     RadParam p[6]{}; p[0] = {"M", RAD_P_INT, M}; p[1] = {"n", RAD_P_INT, n};
     p[2].key = "eps"; p[2].kind = RAD_P_F64; p[2].dval = eps; p[3].key = "dtype"; p[3].kind = RAD_P_STR; p[3].sval = "bf16";
     p[4].key = "mult"; p[4].kind = RAD_P_F64; p[4].dval = mult; p[5] = {"group", RAD_P_INT, 128};
     RadArgs ar{}; ar.t = t; ar.n_t = 10; ar.p = p; ar.n_p = 6;
-    if (halo_rad_norm_add_norm_route_bf16(&ar, nullptr) != RAD_OK) { std::puts("norm_add_norm_route: device launch failed"); return 1; }
+    if ((i8 ? halo_rad_norm_add_norm_route_i8g_bf16(&ar, nullptr) : halo_rad_norm_add_norm_route_bf16(&ar, nullptr)) != RAD_OK) { std::puts("norm_add_norm_route: device launch failed"); return 1; }
     t[2].data = xh.data(); t[4].data = yh.data(); t[6].data = rh.data(); t[8].data = qh.data(); t[9].data = sh.data();
     if (host_norm_add_norm_route(&ar) != RAD_OK) { std::puts("norm_add_norm_route: host launch failed"); return 1; }
     Tally tx, ty, tr;
@@ -186,12 +187,26 @@ static int case_route(int M, int n, int pad, int extra_rows, bool zero_group = f
         cmp(&rd[o], cr.data(), &rh[o], n, tr);
         for (int g = 0; g < G; ++g) {                                       /* rmsnorm_quant_fp8 */
             float h[128], am = 0.0f;
-            for (int j = 0; j < 128; ++j) { h[j] = rb((xv[(size_t)(g * 128 + j)] * f) * we[(size_t)(g * 128 + j)]); am = std::fmax(am, std::fabs(h[j])); }
-            const float sc = am > 0.0f ? am * (1.0f / 448.0f) : 1.0f, inv = 1.0f / sc;
+            for (int j = 0; j < 128; ++j) h[j] = rb((xv[(size_t)(g * 128 + j)] * f) * we[(size_t)(g * 128 + j)]);
+            if (i8)                                                         /* had_quant_act_i8g's rotation */
+                for (int st = 1; st < 128; st <<= 1)
+                    for (int j = 0; j < 128; ++j)
+                        if ((j & st) == 0) { const float u = h[j], w = h[j + st]; h[j] = u + w; h[j + st] = u - w; }
+            for (int j = 0; j < 128; ++j) am = std::fmax(am, std::fabs(h[j]));
+            const float top = i8 ? 127.0f : 448.0f;
+            const float sc = am > 0.0f ? am * (1.0f / top) : 1.0f, inv = 1.0f / sc;
             s_chain += sd[os + g] != sc;
             if (zero_group && g == 1 && sd[os + g] != 1.0f) ++s_chain;
             for (int j = 0; j < 128; ++j) {
                 const int i = g * 128 + j;
+                if (i8) {
+                    /* vs the host arm: a norm factor an ulp apart moves a few bf16 inputs by one, which
+                     * moves a rotated value and the group's amax each by less than a code step */
+                    q_chain += (int8_t)qd[oq + i] != (int8_t)std::rint(std::fmin(std::fmax(h[j] * inv, -127.0f), 127.0f));
+                    const double dv = std::fabs((double)(int8_t)qd[oq + i] * sd[os + g] - (double)(int8_t)qh[oq + i] * sh[os + g]);
+                    if (dv > 2.0 * (double)sc + 1e-30) ++q_host_bad;
+                    continue;
+                }
                 q_chain += qd[oq + i] != rad_f32_to_fp8e4m3(std::fmin(std::fmax(h[j] * inv, -448.0f), 448.0f));
                 /* vs the host arm: one code step is at most an eighth of its value, so at most an
                  * eighth of the group's amax; a scale an ulp off moves less */
@@ -203,8 +218,8 @@ static int case_route(int M, int n, int pad, int extra_rows, bool zero_group = f
     }
     const bool ok = tx.chain_bad == 0 && ty.chain_bad == 0 && tr.chain_bad == 0 && q_chain == 0 && s_chain == 0 &&
                     tx.host_bad == 0 && ty.host_bad == 0 && tr.host_bad == 0 && q_host_bad == 0 && touched == 0;
-    std::printf("norm_add_norm_route M %3d n %4d pitch %4d%s: vs chain x %ld y %ld r %ld q %ld scale %ld differ; vs host "
-                "arm %ld/%ld/%ld differ, %ld codes past a step; padding touched %ld -> %s\n", M, n, ld,
+    std::printf("norm_add_norm_route%s M %3d n %4d pitch %4d%s: vs chain x %ld y %ld r %ld q %ld scale %ld differ; vs host "
+                "arm %ld/%ld/%ld differ, %ld codes past a step; padding touched %ld -> %s\n", i8 ? "_i8g" : "", M, n, ld,
                 zero_group ? " (a zero group)" : "", tx.chain_bad, ty.chain_bad, tr.chain_bad, q_chain, s_chain,
                 tx.host_diff, ty.host_diff, tr.host_diff, q_host_bad, touched, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
@@ -280,6 +295,10 @@ int main() {
     for (int M : Ms) fails += case_route(M, 2816, M % 2 ? 64 : 0, 2);
     fails += case_route(2, 3072, 0, 1) + case_route(2, 3200, 16, 1) + case_route(3, 128, 8, 1);
     fails += case_route(2, 6144, 0, 0) + case_route(4, 2816, 0, 1, true);
+    /* the rotated int8 form at the same widths */
+    for (int M : { 1, 5 }) fails += case_route(M, 2816, M % 2 ? 64 : 0, 2, false, true);
+    fails += case_route(2, 3200, 16, 1, false, true) + case_route(3, 128, 8, 1, false, true);
+    fails += case_route(2, 6144, 0, 0, false, true) + case_route(4, 2816, 0, 1, true, true);
     std::printf("norm joins: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }

@@ -217,7 +217,8 @@ struct Mamba {
         if (!op_conv || !op_prefill || !op_verify || !op_gate || !op_norm || !op_gain)
             return RAD_E_INVAL;
         const char* on = nm.f("blk.%d.ssm_out", l);
-        RAD_ARCH_TRY(output.probe(b, nm, g, on, { nm.ckpt("%s.out_proj.weight", pre) }));
+        if (!output.mapped)
+            RAD_ARCH_TRY(output.probe(b, nm, g, on, { nm.ckpt("%s.out_proj.weight", pre) }));
         if (!output.reads_x) RAD_ARCH_TRY(out_quant.declare(b, g, w.core_out, W));
         RAD_ARCH_TRY(output.declare(b, nm, g, on, g.n_embd, W, RAD_SHARD_COL, grp,
                                     { nm.ckpt("%s.out_proj.weight", pre) }, w.core_out, w.out));
@@ -295,8 +296,10 @@ struct LatentMoe {
         RAD_ARCH_TRY(fc1.declare(b, nm, g, nm.f("blk.%d.ffn_latent_in", l), s.latent, g.n_embd,
                                  RAD_SHARD_NONE, grp,
                                  { nm.ckpt("%s.fc1_latent_proj.weight", pre) }, w.h, w.lat.x));
-        /* The routed arm reads the latent's codes unless its experts are bf16. */
-        if (!ms.cfg.expert_bf16) RAD_ARCH_TRY(lat_in.declare(b, g, w.lat, s.latent));
+        /* The routed arm reads the latent's E4M3 codes unless its experts are bf16 or rotated
+         * (rotated ones read the int8 copy MoeFP8 writes, `hr`). */
+        if (!ms.cfg.expert_bf16 && !ms.cfg.expert_rot)
+            RAD_ARCH_TRY(lat_in.declare(b, g, w.lat, s.latent));
         Geom ge = g;
         ge.n_embd = s.latent;
         ge.n_ff_all = s.ff[(size_t)l];
@@ -318,6 +321,9 @@ struct LatentMoe {
                                        RAD_SHARD_ROW, grp,
                                        { nm.ckpt("%s.shared_experts.up_proj.weight", pre) }, w.h,
                                        w.sup, 0, {}, sh_lo, sh_hi));
+            /* A down projection that reads the bf16 plane (an int8 one quantises it itself) takes
+             * the product alone, without codes no op would read. */
+            sh_act.silu_only = sh_down.reads_x;
             RAD_ARCH_TRY(sh_act.declare(b, g, w.sup, w.sff, sh_w, "relu2", 0, true, false));
             RAD_ARCH_TRY(sh_down.declare(b, nm, g, dn, g.n_embd, sh_w, RAD_SHARD_COL, grp,
                                          { nm.ckpt("%s.shared_experts.down_proj.weight", pre) },
@@ -367,6 +373,11 @@ struct Model {
     rad_kvgroup kv_attn = 0, kv_state = 0, kv_conv = 0;
     rad_buf x = 0, y = 0, final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
+    /* An int8 trunk (i8 codes with a bf16 scale a [1 x 128], or IQ8R's 256): every activation a
+     * trunk linear reads declares the int8 pair too, which that linear's own quant_act_i8g writes
+     * from the bf16 plane. From the first Mamba block's out projection, probed in declare(). */
+    bool    trunk_i8 = false;
+    int64_t trunk_g8 = RAD_FP8_BLOCK;
     Mamba::Wire mw{};
     AttnFP8::Wire aw{};
     LatentMoe::Wire ew{};
@@ -513,7 +524,10 @@ static int buffers(RadBuilder* b, Model& m) {
     m.x = bf("residual", { T, E });
     m.y = bf("mixer_delta", { T, E });
     m.act.x = bf("normed", { T, E });
-    RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E));
+    /* An int8 trunk's linears read the int8 pair, each quantising the bf16 plane itself, so the
+     * activations below declare no E4M3 pair. The block norms still write E4M3 codes here, which
+     * no linear of an int8 trunk reads: NormQuantFP8 has no unrotated int8 form. */
+    RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E, 0, m.trunk_i8, true, m.trunk_g8));
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
     m.logit_input = bf("logit_input", { g.max_logit_rows, E });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
@@ -528,7 +542,8 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.dt = bf("ssm_dt", { T, H });
     mw.y = bf("ssm_y", { T, W });
     mw.core_out.x = bf("ssm_out", { T, W });
-    RAD_ARCH_TRY(mw.core_out.declare_qs(b, nm, g, "ssm_out", W));
+    RAD_ARCH_TRY(mw.core_out.declare_qs(b, nm, g, "ssm_out", W, 0, m.trunk_i8, !m.trunk_i8,
+                                        m.trunk_g8));
 
     auto& aw = m.aw;
     aw.x = m.x;
@@ -536,7 +551,8 @@ static int buffers(RadBuilder* b, Model& m) {
     aw.qkv = bf("attn_qkv", { T, g.qkv_dim() });
     aw.q = bf("attn_q", { T, g.q_dim() });
     aw.attn.x = bf("attn_out", { T, g.q_dim() });
-    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "attn_out", g.q_dim()));
+    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.trunk_i8, !m.trunk_i8,
+                                    m.trunk_g8));
     return RAD_OK;
 }
 
@@ -552,13 +568,17 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
     };
     auto& ew = m.ew;
     ew.h = m.act;
+    /* The latent keeps its E4M3 pair on an int8 trunk too: MoeFP8 takes it as a prepared input
+     * and checks that it carries codes, also where rotated experts read their own copy `hr`
+     * and lat_in writes none. */
     ew.lat.x = bf("latent", { T, L });
-    RAD_ARCH_TRY(ew.lat.declare_qs(b, nm, g, "latent", L));
+    RAD_ARCH_TRY(ew.lat.declare_qs(b, nm, g, "latent", L, 0, m.trunk_i8, true, m.trunk_g8));
     ew.routed = m.y;
     if (sh_w > 0) {
         ew.sup = bf("shared_up", { T, sh_w });
         ew.sff.x = bf("shared_ff", { T, sh_w });
-        RAD_ARCH_TRY(ew.sff.declare_qs(b, nm, g, "shared_ff", sh_w));
+        RAD_ARCH_TRY(ew.sff.declare_qs(b, nm, g, "shared_ff", sh_w, 0, m.trunk_i8, !m.trunk_i8,
+                                       m.trunk_g8));
         ew.sout = bf("shared_out", { T, E });
     }
     Geom gl = g;
@@ -580,12 +600,20 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
         w.sorted = decl_b(b, nm.f("%s.expert_sorted", tag), RAD_I32, { rows * k });
         w.egu = bf(nm.f("%s.expert_up", tag), { rows * k, F });
         w.eff.x = bf(nm.f("%s.expert_ff", tag), { rows * k, F });
-        RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gl, nm.f("%s.expert_ff", tag), F, rows * k));
+        /* Rotated experts (w4nl64a8i8h and its kin) read rotated int8 codes, a scale per 128: the
+         * block input's rotated copy `hr` and the relu^2 product, each written by
+         * had_quant_act_i8g. This build has no rotated E4M3 quantiser. */
+        const bool i8arm = c.expert_rot != 0;
+        RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gl, nm.f("%s.expert_ff", tag), F, rows * k, i8arm,
+                                      !i8arm, RAD_FP8_BLOCK));
+        w.eff.q8_fed = w.eff.q8_rot = i8arm;
         w.edn = bf(nm.f("%s.expert_down", tag), { rows * k, L });
-        if (c.expert_rot) {
-            w.hr.q = decl_b(b, nm.f("%s.latent_rot.q", tag), RAD_F8E4M3, { T, L });
-            w.hr.s = decl_b(b, nm.f("%s.latent_rot.s", tag), RAD_F32, { T, L / RAD_FP8_BLOCK });
-            if (!w.hr.q || !w.hr.s) return RAD_E_INVAL;
+        if (i8arm) {
+            w.hr.q8 = decl_b(b, nm.f("%s.latent_rot.q8", tag), RAD_I8, { T, L });
+            w.hr.s8 = decl_b(b, nm.f("%s.latent_rot.s8", tag), RAD_F32, { T, L / RAD_FP8_BLOCK });
+            w.hr.g8 = RAD_FP8_BLOCK;
+            w.hr.q8_fed = w.hr.q8_rot = true;
+            if (!w.hr.q8 || !w.hr.s8) return RAD_E_INVAL;
         }
         if (!w.logits || !w.ids || !w.ew || !w.eoff || !w.ecnt || !w.sorted || !w.egu ||
             !w.eff.x || !w.edn)
@@ -692,16 +720,31 @@ static int declare_lilicorr(RadBuilder* b, const RadModelMeta* meta, const RadBu
     dw.attn    = decl_b(b, nm.f("df_attn"), A, {qr, qd});
     dw.gate_up = decl_b(b, nm.f("df_gate_up"), A, {qr, 2 * dg.n_ff});
     dw.ffn     = decl_b(b, nm.f("df_ffn"),  A, {qr, dg.n_ff});
-    dw.srcq    = decl_b(b, nm.f("df_srcq"), RAD_F8E4M3, {dg.max_tok, dc.n_taps * E});
-    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, fp8_blocks(dc.n_taps * E)});
-    dw.cq      = decl_b(b, nm.f("df_cq"),   RAD_F8E4M3, {dg.max_tok, E});
-    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32,    {dg.max_tok, fp8_blocks(E)});
-    dw.h2q     = decl_b(b, nm.f("df_h2q"),  RAD_F8E4M3, {qr, E});
-    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32,    {qr, fp8_blocks(E)});
-    dw.atq     = decl_b(b, nm.f("df_atq"),  RAD_F8E4M3, {qr, qd});
-    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32,    {qr, fp8_blocks(qd)});
-    dw.ffq     = decl_b(b, nm.f("df_ffq"),  RAD_F8E4M3, {qr, dg.n_ff});
-    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
+    /* The codes the backbone's linears read: int8 with one f32 scale per (row, group) for linears
+     * stored rotated int8, which the drafter's `fc` tells (Dflash2::probe_i8, as gemma4_bf16 asks
+     * it); E4M3 with a scale per 128 for block fp8 or MXFP4 ones (rad_fp8.h's DenseFP8). radiance
+     * 2.0 serves no block fp8, so a 2.0 container's backbone is the int8 form. */
+    RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
+    dc.fc_mapped = true;
+    const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (dc.act_i8 && ((dc.n_taps * E) % dqg || E % dqg || qd % dqg || dg.n_ff % dqg)) {
+        fprintf(stderr, "radiance: nemotronh: a rotated int8 LiLiCorr backbone takes widths in "
+                        "whole %lld-column scale groups; this one is n_embd %lld, q %lld, n_ff "
+                        "%lld\n", (long long)dqg, (long long)E, (long long)qd, (long long)dg.n_ff);
+        return RAD_E_INVAL;
+    }
+    auto dqs = [&](int64_t n) { return (n + dqg - 1) / dqg; };
+    dw.srcq    = decl_b(b, nm.f("df_srcq"), dqt,     {dg.max_tok, dc.n_taps * E});
+    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, dqs(dc.n_taps * E)});
+    dw.cq      = decl_b(b, nm.f("df_cq"),   dqt,     {dg.max_tok, E});
+    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32, {dg.max_tok, dqs(E)});
+    dw.h2q     = decl_b(b, nm.f("df_h2q"),  dqt,     {qr, E});
+    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32, {qr, dqs(E)});
+    dw.atq     = decl_b(b, nm.f("df_atq"),  dqt,     {qr, qd});
+    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32, {qr, dqs(qd)});
+    dw.ffq     = decl_b(b, nm.f("df_ffq"),  dqt,     {qr, dg.n_ff});
+    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32, {qr, dqs(dg.n_ff)});
     dw.sel_h   = decl_b(b, nm.f("df_selh"), A, {sr, E});
     /* The proposal buffer (RadDrafterDecl::proposal), written by the walk. */
     dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});
@@ -854,14 +897,37 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             c.n_ff_exp = s.ff[(size_t)l];
             for (int q = 0; q < 4; ++q) c.ff_lo4[q] = c.ff_hi4[q] = 0;
         }
-    /* The shared expert's slice: even, or slice_of's whole blocks. */
+    /* Whether the trunk is int8, from the first Mamba block's out projection, before the
+     * activations are declared: an int8 linear reads an int8 pair its input must hold. The probe
+     * makes that linear's name map, so Mamba::declare does not probe it again. */
+    m.layers.resize((size_t)s.n_layer);
+    for (int l = 0; l < (int)s.n_layer; ++l) {
+        if (s.kind[(size_t)l] != kMamba) continue;
+        LinearFP8& out = m.layers[(size_t)l].mamba.output;
+        RAD_ARCH_TRY(out.probe(b, nm, g, nm.f("blk.%d.ssm_out", l),
+                               { nm.ckpt("language_model.backbone.layers.%d.mixer.out_proj.weight",
+                                         l) }));
+        m.trunk_i8 = out.probed_i8;
+        m.trunk_g8 = out.probed_g8;
+        break;
+    }
+    /* The shared expert's slice: even, or slice_of's whole scale groups. Its down projection
+     * reads the slice along K, and an int8 trunk keeps one scale a group of K there: 128 columns,
+     * or IQ8R's 256 (asked after the probe above). Bolt's 5376 is 42 blocks of 128 but 21 groups
+     * of 256, so two ranks hold 11 and 10 groups, not 2688 columns each. */
+    const int64_t sg = m.trunk_i8 ? m.trunk_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (s.ff_shared % sg) {
+        fprintf(stderr, "radiance: nemotronh: the shared expert's %lld columns are not whole "
+                        "%lld-column scale groups\n", (long long)s.ff_shared, (long long)sg);
+        return RAD_E_UNSUPPORTED;
+    }
     int64_t sh_lo = 0, sh_hi = 0, sh_w = s.ff_shared / world;
     {
-        const int64_t sb = s.ff_shared / RAD_FP8_BLOCK;
+        const int64_t sb = s.ff_shared / sg;
         if (sb % world) {
             slice_of(sb, world, g.rank, 0, &sh_lo, &sh_hi);
-            sh_lo *= RAD_FP8_BLOCK;
-            sh_hi *= RAD_FP8_BLOCK;
+            sh_lo *= sg;
+            sh_hi *= sg;
             sh_w = sh_hi - sh_lo;
         }
     }
@@ -942,7 +1008,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
-    m.layers.resize((size_t)s.n_layer);
     for (int l = 0; l < (int)s.n_layer; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.kind = s.kind[(size_t)l];

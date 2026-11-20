@@ -1,0 +1,48 @@
+# Candidate Qwen3.8 Flash-Next: U4-trellis gate/up, W6NL down, BF16 PLE and vision.
+# Needs libquant's table=w6nl and libr4d's w6nl64a8h. No complete model has been converted with
+# this recipe.
+# CALIB: flat, verified BF16-domain expert and trunk RADGRAM2 files for this checkpoint.
+# MTP_CALIB: separately captured draft Grams (including the qg/k/v and shared-gate aliases).
+# First match wins. Unmatched source tensors, including vision and PLE key/value, stay BF16.
+# Gate/up uses pooled input Hessians; expert-specific down Grams have the converter's layer fallback.
+
+blk.34.ffn_*_exps.407.weight         cast dtype=bf16
+blk.34.ffn_*_exps.496.weight         cast dtype=bf16
+blk.44.ffn_*_exps.292.weight         cast dtype=bf16
+blk.44.ffn_*_exps.350.weight         cast dtype=bf16
+blk.46.ffn_*_exps.290.weight         cast dtype=bf16
+blk.46.ffn_*_exps.392.weight         cast dtype=bf16
+blk.47.ffn_*_exps.122.weight         cast dtype=bf16
+blk.47.ffn_*_exps.143.weight         cast dtype=bf16
+blk.47.ffn_*_exps.399.weight         cast dtype=bf16
+blk.47.ffn_*_exps.445.weight         cast dtype=bf16
+
+# The draft (MTP) layer, blk.48: its routed experts as u4 codes into the w4nl table, its attention
+# qg, k and v projections and its shared expert's gate/up as u4 trellis codes, all against
+# $MTP_CALIB.
+blk.48.ffn_*_exps.*.weight           gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$MTP_CALIB
+blk.48.attn_qg.weight                gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$MTP_CALIB tcq_order=1
+blk.48.attn_k.weight                 gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$MTP_CALIB tcq_order=1
+blk.48.attn_v.weight                 gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$MTP_CALIB tcq_order=1
+blk.48.ffn_gate_up_shexp.weight      gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$MTP_CALIB tcq_order=1
+
+blk.*.ffn_gate_up_exps.*.weight      gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$CALIB tcq_order=1
+blk.*.ffn_down_exps.*.weight         gptq table=w6nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+
+*_hc_down.weight                     rtn codes=fp8_e4m3 group=128 scale=f32
+*_hc_up.weight                       rtn codes=fp8_e4m3 group=80 scale=f32
+mtp.fc_hidden.weight                 rtn codes=fp8_e4m3 group=128 scale=f32
+mtp.fc_embedding.weight              rtn codes=fp8_e4m3 group=128 scale=f32
+
+blk.*.attn_qg.weight                 gptq codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.ssm_inz.weight                 gptq codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.attn_k.weight                  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_v.weight                  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight             rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ssm_out.weight                 rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down_shexp.weight          rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+output.weight                        rtn codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+blk.*.ple_ngram.weight               cast dtype=bf16
+mtp.draft_head.weight                rtn codes=u2 zero=u8 group=128 scale=f16

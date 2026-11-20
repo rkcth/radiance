@@ -885,7 +885,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_sp_kernel(R4D_ARQ8S_P
 }
 template <uint32_t EPT, uint32_t THR, int WS>
 __global__ __launch_bounds__(THR) void r4dchain_ar_rmsnorm_quant_i8_sp(R4D_ARQ8S_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     ar_rmsnorm_quant_i8_sp_body<EPT, THR, WS>(R4D_ARQ8S_ARGS);
     r4d_chain_done();
 }

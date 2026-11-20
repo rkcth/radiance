@@ -170,10 +170,21 @@ struct HyperConn {
      * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
      * two reads over half of them; reading a wide step in pieces computes what the narrower steps
      * did. */
-    void read_pieces(RadCtx* c_, int64_t T) const {
+    void read_pieces(RadCtx* c_, int64_t T) const { read_span(c_, T, 0, T); }
+    /* The same with a boundary at `cut` (a checkpoint inside the step, RadBatch::ckpt_cut): rows
+     * [0, cut) are read as a chunk of `cut` rows reads them, then [cut, T) on their own; 0 is
+     * none. */
+    void read_pieces(RadCtx* c_, int64_t T, int64_t cut) const {
+        if (cut <= 0 || cut >= T) { read_span(c_, T, 0, T); return; }
+        read_span(c_, T, 0, cut);
+        read_span(c_, T, cut, T);
+    }
+    /* Rows [a, b) in pieces of Config::read_rows from `a`; one read where they fit in one. */
+    void read_span(RadCtx* c_, int64_t T, int64_t a, int64_t b) const {
         const int64_t piece = c.read_rows;
-        if (piece <= 0 || T <= piece) { read(c_, T, 0, T); return; }
-        for (int64_t r0 = 0; r0 < T; r0 += piece) read(c_, T, r0, T - r0 < piece ? T - r0 : piece);
+        auto one = [&](int64_t r0, int64_t n) { read(c_, T, r0, n); };
+        if (piece <= 0 || b - a <= piece) { one(a, b - a); return; }
+        for (int64_t r0 = a; r0 < b; r0 += piece) one(r0, b - r0 < piece ? b - r0 : piece);
     }
 };
 

@@ -605,20 +605,27 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                { gate_up }, { a.x });
         if (!op) return RAD_E_INVAL;
         if (bf16) return RAD_OK;
-        const char* qn = rot ? "had_quant_act_fp8" : a.q8_fed ? "quant_act_i8g" : "quant_act_fp8";
+        /* Fed rotated int8 (ActFP8::q8_rot: a rotated down projection under an int8 routed
+         * arm), had_quant_act_i8g at the pair's group. */
+        const char* qn = rot ? "had_quant_act_fp8"
+                       : a.q8_fed ? (a.q8_rot ? "had_quant_act_i8g" : "quant_act_i8g")
+                                  : "quant_act_fp8";
         op_q = rw(b, RAD_OP(b, qn,
                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                                RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
                  { a.x }, { a.cq(), a.cs() });
         return op_q ? RAD_OK : RAD_E_INVAL;
     }
     if (clipped) {
-        /* No rotated int8 form: its quantiser would be quant_act_i8g, unrotated; and no clamp
-         * with `silu_only`. */
-        if (!gate_up || !a.x || n <= 0 || rot || silu_only || (a.q8_fed && a.q8_rot) ||
-            std::strcmp(act_name, "silu"))
+        /* The clamp writes the bf16 plane and a quantiser reads it: E4M3, plain int8, or the
+         * rotated int8 codes an i8a8h consumer reads (had_quant_act_i8g at that consumer's
+         * group, the quantiser the rotated trunk's other inputs use). Against the unclamped
+         * gated_had_quant_i8g that is one launch more, in the clamped layers only. No clamp
+         * with `silu_only`, and none into a rotated E4M3 consumer (`rot`). */
+        if (!gate_up || !a.x || n <= 0 || rot || silu_only || std::strcmp(act_name, "silu"))
             return RAD_E_INVAL;
+        const bool hi8 = a.q8_fed && a.q8_rot;
         const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
         if (fuse_clamped && !step && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
             rad_op_declared(b, "swiglu_clamped_quant_fp8")) {
@@ -644,9 +651,11 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                 { gate_up }, { a.x });
         if (!bf16) {
             if (!a.cq() || !a.cs()) return RAD_E_INVAL;
+            const char* qn = hi8 ? "had_quant_act_i8g" : a.q8_fed ? "quant_act_i8g"
+                                                                  : "quant_act_fp8";
             op_quant =
                 rw(b,
-                   RAD_OP(b, a.q8_fed ? "quant_act_i8g" : "quant_act_fp8",
+                   RAD_OP(b, qn,
                           RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
                                      RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),

@@ -251,46 +251,6 @@ Reply ask(LiveServer& s, const std::string& req, bool head_only = false) {
 
 /* ================================================================== the API key */
 
-TEST(shared_image_routes_authenticate_before_queue_admission) {
-    std::atomic<int> queue_calls{0};
-    LiveServer s(4, 1, [&](ServerOptions& o) {
-        o.api_key = "image-fixture-key";
-        o.trusted_proxies = {"127.0.0.1/32"};
-        o.queue_image = [&](const std::string&, size_t, size_t, size_t,
-                            const std::function<bool()>&, Deps::ImageEndpoint*,
-                            std::shared_ptr<void>*, ImageDispatchTiming*, std::string* why) {
-            ++queue_calls;
-            *why = "fixture image model not registered";
-            return RAD_E_NOTFOUND;
-        };
-    });
-    REQUIRE(s.srv->port() > 0);
-    const std::string body = R"({"model":"image-fixture","prompt":"a red square"})";
-    const std::string forwarded = "X-Forwarded-For: 192.0.2.1\r\n";
-    for (const char* path : {"/v1/images/generations", "/v1/images/edits"}) {
-        CHECK_EQ(ask(s, post(path, body, forwarded)).status, 401);
-        CHECK_EQ(ask(s, post(path, body, forwarded + "Authorization: Bearer wrong\r\n")).status, 401);
-    }
-    CHECK_EQ(queue_calls.load(), 0);
-    for (const char* path : {"/v1/images/generations", "/v1/images/edits"}) {
-        Reply reply;
-        const std::string log = stderr_of([&] {
-            reply = ask(s, post(path, body, forwarded +
-                               "Authorization: Bearer image-fixture-key\r\n"));
-        });
-        CHECK_EQ(reply.status, 404);
-        CHECK(has(reply.body, "fixture image model not registered"));
-        const auto message = log.find("fixture image model not registered");
-        REQUIRE(message != std::string::npos);
-        const auto line_start = log.rfind('\n', message);
-        const auto start = line_start == std::string::npos ? 0 : line_start + 1;
-        const auto line = log.substr(start, message - start);
-        CHECK(has(line, "req refused from 192.0.2.1:"));
-        CHECK(has(line, " -> 404 "));
-    }
-    CHECK_EQ(queue_calls.load(), 2);
-}
-
 /* With --api-key every route but the probes and the page asks for it, as `Authorization: Bearer`
  * (OpenAI's; the scheme is case-insensitive, RFC 9110) or `X-Api-Key` (Anthropic's), under any
  * capitalisation of the header names. A refusal is a 401 with an error object and the CORS

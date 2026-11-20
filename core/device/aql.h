@@ -72,6 +72,25 @@ void set_next_fence(uint8_t f);
 /* Whether the signal behind a rad_ride token could be handed out again now (tests/device_test.cpp). */
 bool ride_reusable(void* token);
 
+/* `pairs` launches of two chained kernels onto `stream`, one behind the other: the first stores
+ * i + 1 over the 64 words at `x`; the second loads x[0] the way a kernel loads a value all its
+ * lanes share (a scalar load) and each of its `blocks` blocks stores what it saw, at
+ * seen[i * blocks + block]. Every reader must have seen the store in front of it
+ * (tests/device_test.cpp). RAD_E_UNSUPPORTED in a build without the backend. */
+int chain_probe(void* stream, unsigned* x, unsigned* seen, unsigned pairs, unsigned blocks);
+
+/* `n` chained launches onto `stream`, launch i storing i + 1 at seen[i]: each takes where to
+ * store from its own arguments, so a launch that read another's leaves a word unwritten
+ * (tests/device_test.cpp). RAD_E_UNSUPPORTED in a build without the backend. */
+int chain_marks(void* stream, unsigned* seen, unsigned n);
+
+/* `n` chained launches onto `stream`, each a card-side copy of `bytes` (a multiple of 16) from
+ * `src` to `dst` that also stores at seen[i] whether it found a chain record in its argument
+ * slot: i + 1 if every block did, that with the top bit set if one did not. A block that found
+ * none still counts, so the launches behind it are not left waiting (tests/device_test.cpp).
+ * RAD_E_UNSUPPORTED in a build without the backend. */
+int chain_asks(void* stream, const void* src, void* dst, uint64_t bytes, unsigned* seen, unsigned n);
+
 }  // namespace aql
 }  // namespace rad
 
@@ -90,4 +109,10 @@ int rad_aql_blit_fill(void* dst, int value, uint64_t bytes, void* stream);
 /* rad_memcpy_ranges_async's kernel: `prefix` a multiple of 16, both bases 16-byte aligned. */
 int rad_aql_blit_ranges(void* dst, const void* src, uint64_t prefix, const RadCopyRange* ranges,
                         int n, void* stream);
+/* aql::chain_probe's two kernels, aql::chain_marks's one and aql::chain_asks's one. */
+int rad_aql_probe_store(unsigned* x, unsigned v, void* stream);
+int rad_aql_probe_load(const unsigned* x, unsigned* seen, unsigned blocks, void* stream);
+int rad_aql_probe_mark(unsigned* seen, unsigned v, void* stream);
+int rad_aql_probe_ask(const void* src, void* dst, uint64_t bytes, unsigned* seen, unsigned v,
+                      unsigned long long* ctr, void* stream);
 }

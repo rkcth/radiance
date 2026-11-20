@@ -73,6 +73,22 @@ TEST(server_and_memory_keys_reach_every_model) {
     CHECK(fc.log == Log::Debug);
     CHECK_EQ(fc.host_mib, 4096);
     CHECK_EQ(fc.disk_tier, "/var/cache/r");
+    CHECK(fc.card_headroom_mib.empty());
+}
+
+/* memory.card-headroom-mib: one card's reserve by ordinal, the others keep gpu-headroom-mib. */
+TEST(a_card_keeps_its_own_headroom) {
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("memory:\n  gpu-headroom-mib: 160\n  card-headroom-mib: {0: 4096, 2: 0}\n"
+                   "models:\n  a: {model: /m/a.rad}\n", &fc), RAD_OK);
+    CHECK_EQ(fc.card_headroom_mib.size(), 2u);
+    CHECK_EQ(fc.card_headroom_mib.at(0), 4096);
+    CHECK_EQ(fc.card_headroom_mib.at(2), 0);
+    CHECK_EQ(fc.models.front().cfg.gpu_headroom_mib, 160);
+    CHECK(refused("memory:\n  card-headroom-mib: 4096\nmodels:\n  a: {model: /m/a.rad}\n"));
+    CHECK(refused("memory:\n  card-headroom-mib: {gpu0: 4096}\nmodels:\n  a: {model: /m/a.rad}\n"));
+    CHECK(refused("memory:\n  card-headroom-mib: {0: -1}\nmodels:\n  a: {model: /m/a.rad}\n"));
+    CHECK(refused("models:\n  a: {model: /m/a.rad, card-headroom-mib: {0: 1}}\n"));
 }
 
 TEST(structured_values_are_spelled_for_their_flag) {
@@ -263,6 +279,32 @@ TEST(fleet_keys_on_a_model) {
     CHECK(refused("models:\n  q:\n    model: /m/q.rad\n    park: {restore: whole}\n"));
 }
 
+/* A model's own cards: a list among the fleet's, long enough for its ranks. They are not part of
+ * the engine's flag list, so two entries that differ only in them configure the same engine. */
+TEST(a_model_names_the_cards_it_may_use) {
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("models:\n  a: {model: /m/a.rad, cards: [1]}\n  b: {model: /m/b.rad, tp: 2, cards: [1, 0]}\n"
+                  "  c: {model: /m/c.rad}\n  d: {model: /m/d.rad, cards: all}\n", &fc), RAD_OK);
+    CHECK_EQ(fc.models[0].cards.size(), 1u);
+    CHECK_EQ(fc.models[0].cards[0], 1);
+    CHECK_EQ(fc.models[1].cards.size(), 2u);
+    CHECK_EQ(fc.models[1].cards[0], 1);
+    CHECK(fc.models[2].cards.empty());
+    CHECK(fc.models[3].cards.empty());
+    fleet::FleetConfig plain;
+    CHECK_EQ(yload("models:\n  a: {model: /m/a.rad}\n", &plain), RAD_OK);
+    CHECK(plain.models[0].args == fc.models[0].args);
+
+    CHECK_EQ(yload("cards: [0, 2]\nmodels:\n  a: {model: /m/a.rad, cards: [2]}\n", &fc), RAD_OK);
+    /* outside the fleet's cards, fewer than its ranks, twice, not a list, under defaults */
+    CHECK(refused("cards: [0, 2]\nmodels:\n  a: {model: /m/a.rad, cards: [1]}\n"));
+    CHECK(refused("models:\n  a: {model: /m/a.rad, tp: 2, cards: [1]}\n"));
+    CHECK(refused("models:\n  a: {model: /m/a.rad, cards: [1, 1]}\n"));
+    CHECK(refused("models:\n  a: {model: /m/a.rad, cards: 1}\n"));
+    CHECK(refused("models:\n  a: {model: /m/a.rad, cards: []}\n"));
+    CHECK(refused("defaults: {cards: [0]}\nmodels:\n  a: {model: /m/a.rad}\n"));
+}
+
 TEST(scheduler_cards_and_groups) {
     fleet::FleetConfig fc;
     CHECK_EQ(yload("cards: [0, 1]\nscheduler: {load-timeout: 90s, drain-timeout: 500ms, keepalive: 5s}\n"
@@ -391,6 +433,17 @@ TEST(command_line_becomes_yaml) {
     CHECK_EQ(m.cfg.chat_template_kwargs.at("enable_thinking"), "false");
     CHECK(fc.log == Log::Debug);
     CHECK(fc.log_set);
+
+    /* A cache this release refuses is written as the command line gave it, with what replaces it
+     * as a comment beside it; the file still loads as YAML, and the refusal comes from the key. */
+    const std::string packed = yaml_of({ "radiance", "--model", "/m/a.rad", "--kv-cache-dtype", "k6_v4" });
+    CHECK(packed.find("kv-cache-dtype: k6_v4   # not served: i8 is the 8-bit cache") != std::string::npos);
+    const std::string e4m3 = yaml_of({ "radiance", "--model", "/m/a.rad", "--kv-cache-dtype", "fp8" });
+    CHECK(e4m3.find("kv-cache-dtype: fp8   # served for few models") != std::string::npos);
+    fleet::FleetConfig fe;
+    CHECK_EQ(yload(e4m3, &fe), RAD_OK);
+    CHECK_EQ(fe.models[0].cfg.kv_cache_dtype, "fp8");
+    CHECK(y.find('#') == std::string::npos);
 }
 
 TEST(entry_name_keeps_a_checkpoint_name_whole) {

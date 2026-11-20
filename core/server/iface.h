@@ -116,6 +116,12 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
+    /* --draft-suffix: verifies that carried a suffix chain, their rows and accepted drafts, and the
+     * decode steps kept from being issued ahead by a recurring pattern. */
+    int64_t suffix_steps = 0;
+    int64_t suffix_rows = 0;
+    int64_t suffix_accepted = 0;
+    int64_t suffix_held_ahead = 0;
     /* Per-position draft acceptance. The pooled `draft_acceptance` cannot tell a drafter that
      * decays with depth from one whose later rounds are broken. Per position j: verifies that
      * reached j (every earlier position accepted) and how many of those took j. */

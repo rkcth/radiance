@@ -23,8 +23,11 @@ const held = (m: FleetModel) =>
 export function Overview() {
   const scope = useScope(fleetScope)
   const range = useRange()
-  const f = scope.live
-  if (!f) return <Empty className="m-6">{scope.error ?? "Waiting for data…"}</Empty>
+  const live = scope.live
+  if (!live) return <Empty className="m-6">{scope.error ?? "Waiting for data…"}</Empty>
+  // A served adapter is listed as a child of its model, with the model's state and counters: the
+  // overview counts and draws the models themselves.
+  const f = { ...live, models: live.models.filter((m) => m.adapter !== true) }
   const hueOf = new Map(f.models.map((m, i) => [m.id, hue(i)]))
   const resident = f.models.filter((m) => m.state === "resident")
   const parked = f.models.filter((m) => m.state === "parked")

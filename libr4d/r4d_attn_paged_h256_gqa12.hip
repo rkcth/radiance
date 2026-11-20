@@ -17,5 +17,9 @@
 // pages at 4 (RadKVGroupDecl takes the block size from the resolved kernel). A row saying 16 here
 // would refuse at issue rather than at declare.
 #define G8_BLOCK_SIZE 4
+/* The sparse launch's prefill form (r4d_attn_usel.h): the launcher's geometry (eight waves, a
+ * launch row each, staging for themselves), then the one r4d_selftest --perfusel times against it
+ * (sixteen rows a tile behind eight stager waves). */
+#define G8_USEL_GEOMS(X) X(0, 8, 0) X(1, 24, 8)
 
 #include "r4d_attn_paged_gqa8.hip"

@@ -118,6 +118,7 @@ void BatchBuilder::carve(Set& s, char* h) {
     pair(&s.h_acc,    &s.d_acc,    S);
     pair(&s.h_cktok,  &s.d_cktok,  S);
     pair(&s.h_ckslot, &s.d_ckslot, S);
+    pair(&s.h_ckcu,   &s.d_ckcu,   4);
     pair(&s.h_out,    &s.d_out,    O);
     pair(&s.h_dout,   &s.d_dout,   S);
     pair(&s.h_rows,   &s.d_rows,   4 * S);
@@ -214,13 +215,17 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
     }
     RAD_TRY(rad_dev_set(ranks_[0].device));
 
-    /* The ring holds three worst-case builds before a long-context prefill waits on an upload two
-     * builds back. A decode build's span is far smaller, so hundreds fit. */
+    /* The ring holds kRingBuilds worst-case builds. A speculative step takes four or more builds
+     * (history pass, draft rounds, the next verify), and reserve() must not wait on an upload of
+     * the step being issued (that would hold step_next back until the card ran this step's draft
+     * uploads): two steps of builds fit with room over. A decode build's span is far smaller than
+     * the worst case, so many more fit; this is pinned host memory only, the device slab stays
+     * one build. */
     int64_t worst_pay = 0;
     for (const Group& g : s.groups) worst_pay += max_seqs_ * g.max_blocks * (int64_t)sizeof(int32_t);
     const int64_t worst_ranges = worst_pay / k_range_max + max_seqs_ * (int64_t)s.groups.size() + 1;
     ranges_.reserve((size_t)worst_ranges);
-    ring_.bytes = 3 * (s.host_bytes + worst_ranges * (int64_t)sizeof(RadCopyRange) + k_carve_align);
+    ring_.bytes = kRingBuilds * (s.host_bytes + worst_ranges * (int64_t)sizeof(RadCopyRange) + k_carve_align);
     ring_.host = static_cast<char*>(rad_dev_alloc(ring_.bytes, RAD_MEM_HOST_PINNED));
     if (!ring_.host) {
         RAD_ERR("step batch staging: could not reserve %s of pinned host staging",
@@ -486,6 +491,10 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
 
     mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
     bidi_on_ = prog.encoder.modalities != 0 && prog.encoder.bidirectional != 0;
+    bidi_grp_ = -1;
+    for (size_t i = 0; bidi_on_ && bidi_grp_ < 0 && i < prog.kv_groups.size(); ++i)
+        if (prog.kv_groups[i].decl.kind == RAD_KV_WINDOW && !prog.kv_groups[i].drafter)
+            bidi_grp_ = (int32_t)i;
     lora_on_ = cfg.lora.enabled();
     pw_cap_ = prog.plugin_words;
     return RAD_OK;
@@ -970,6 +979,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
      * band for separately issued decode rows. */
     int32_t max_q_dec = 0, max_q_pf = 0;
     int n_ck = 0;
+    int32_t ck_cut = 0;      /* RadBatch::ckpt_cut */
     int64_t n_out = 0, n_dout = 0;
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
@@ -1068,11 +1078,20 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
          * chunk's where a run longer than any step was cut (Scheduler::bidi_fit). */
         if (bidi_on_ && plan.draft_pass == 0 && shift == 0 && e.req && e.req->media) {
             const mm::PromptMedia& pm = *e.req->media;
+            /* The run's rows are attended again on sliding layers, over the window group's block
+             * table. That table starts at first_block_pos once the window has recycled the blocks
+             * below it (trim_window after each chunk), and the group's seqused counts from there
+             * (build_groups). bidi_used counts the same way, after the loop: the absolute end would
+             * point the rows past the keys this pass wrote, so a picture after the first chunk was
+             * read as nothing. A full group starts at 0, so without a window group the end stays
+             * absolute. */
+            const int64_t w0 = bidi_grp_ >= 0 ? kv.first_block_pos(e.seq, bidi_grp_) : 0;
+            const int64_t n0 = n_bidi;
             const int64_t c0 = e.ctx_len, c1 = c0 + e.n_tokens, T = max_tok_;
             /* RopeLayout::runs is documented ascending and pairwise disjoint, and the slice
              * bound (h_bidi is 4*max_tok_ wide, one slot per token this step can carry) leans
-             * on exactly that: overlapping runs would count one token twice. The layout is now
-             * fed from request-side placement, so the promise is checked here rather than
+             * on exactly that: overlapping runs would count one token twice. The layout comes
+             * from request-side placement, so the promise is checked here rather than
              * trusted -- an overlapping run drops its media rows' bidirectionality, which the
              * acceptance path treats as an ordinary miss, where a slot overrun is a fault. */
             int64_t prev_b = c0;
@@ -1104,6 +1123,14 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 s.h_bidi[3 * T + n_bidi] = (int32_t)i;
                 ++n_bidi;
             }
+            for (int64_t q = n0; q < n_bidi; ++q) s.h_bidi[q] -= (int32_t)w0;
+        }
+        if (e.ckpt_tok >= 0 && e.ckpt_slot >= 0 && e.ckpt_tok + 1 < e.n_tokens &&
+            plan.draft_pass == 0) {
+            /* A checkpoint inside the chunk (RadBatch::ckpt_cut), where the step is the one shape
+             * a plugin snapshots inside: one prefill alone (the scheduler plans a linear-state
+             * one nowhere else). A window snapshot inside a chunk needs no cut. */
+            if (ckpt_cut_on_ && n_seq == 1 && e.is_prefill) ck_cut = e.ckpt_tok + 1;
         }
         if (e.ckpt_tok >= 0 && e.ckpt_slot >= 0) {
             /* checkpoint_tok indexes this step's tokens: the sequence's base plus the offset the
@@ -1172,6 +1199,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 (long long)n_tok, (long long)k);
         return nullptr;
     }
+    /* The two pieces' bounds of a checkpoint inside the step. */
+    s.h_ckcu[0] = 0;
+    s.h_ckcu[1] = ck_cut;
+    s.h_ckcu[2] = (int32_t)n_tok;
+    s.h_ckcu[3] = 0;
 
     /* Scored rows (Request::score): one per token of a scoring entry's prefill chunk, in entry
      * order (the order Engine::score_rows maps back). Appended after the sampled rows so the
@@ -1354,6 +1386,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.n_checkpoints = n_ck;
         B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
         B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
+        B.ckpt_cut = ck_cut;
+        B.ckpt_cu = ck_cut > 0 ? on_rank(base, b0, s.d_ckcu) : nullptr;
         B.n_ahead = n_ahead;
     }
     /* Record the flight behind everything reading this span: the upload and the derivation

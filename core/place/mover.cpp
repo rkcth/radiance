@@ -8,6 +8,7 @@
 #include "../device/device.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -93,7 +94,6 @@ Mover::~Mover() {
         if (stage_) rad_dev_free(stage_, RAD_MEM_HOST_PINNED);
         if (file_vram_) rad_dev_free(file_vram_, RAD_MEM_DEVICE);
         if (windows_) rad_dev_free(windows_, RAD_MEM_HOST_PINNED);
-        if (calm_) rad_dev_free(calm_, RAD_MEM_HOST_PINNED);
     }
     /* The pageable region is always ours: Pools has no pageable pool, since pageable memory is
      * not a device-visible budget and nothing else contends for it. */
@@ -175,6 +175,12 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         cp.n_work = shadow + sc.n_stage;
         cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
                                       shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
+        /* Under MoverConfig::turnover_adaptive the kept-free count starts at its floor: a fresh
+         * placement fills what it can at once, and the first burst of swaps lands in the shadow
+         * slots and these while balance() frees the rest. */
+        cp.turn_now = cfg.turnover_adaptive
+                          ? std::min<int64_t>(cp.n_turn, std::max(cfg.turnover_floor, 0))
+                          : cp.n_turn;
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
         total_slab += slab_slots;
@@ -370,8 +376,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
      * record per slot the demotion could never be in flight beside its promotion, so the resident
      * set would only grow. The floor lets a one-shadow plan still hold a swap. */
     const int64_t n_records = std::max<int64_t>(2 * (total_shadow + total_turn), 4);
-    base_move_records_ = (size_t)n_records;
-    moves_.assign(base_move_records_, Move{});
+    moves_.assign((size_t)n_records, Move{});
     for (Move& m : moves_) RAD_TRY(rad_event_create_local(&m.ev));
 
     /* ---- publish the initial addresses ------------------------------------------------------ */
@@ -381,9 +386,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         republish(u);
     }
 
-    RAD_INFO("mover: %lld slab slots (%lld shadow, %lld more kept free out of a loan), %lld pinned "
-             "pool slots, %s static vram%s",
-             (long long)total_slab, (long long)total_shadow, (long long)total_turn,
+    RAD_INFO("mover: %lld slab slots (%lld shadow, %s%lld more kept free out of a loan%s), %lld "
+             "pinned pool slots, %s static vram%s",
+             (long long)total_slab, (long long)total_shadow, cfg.turnover_adaptive ? "up to " : "",
+             (long long)total_turn, cfg.turnover_adaptive ? " as swaps ask for them" : "",
              (long long)total_pool,
              humanb(static_bytes_).c_str(), file_.ok() ? ", file tier open" : "");
     /* The pageable region is charged to no budget, so this is the only place it is reported. */
@@ -1128,7 +1134,13 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
         if (promote) {
             const int64_t slot = cp.slab.take();
-            if (slot < 0) { ++stats_.starved_slab; return false; }
+            if (slot < 0) {
+                ++stats_.starved_slab;
+                /* The slots kept free were too few for this step's swaps: all of them, for a
+                 * while (balance). */
+                if (cfg_.turnover_adaptive) turn_boost_ = kTurnBoost;
+                return false;
+            }
             if (promote_to(unit, slot) < 0) { cp.slab.add_free(slot); return false; }
             return true;
         }
@@ -1173,7 +1185,6 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
 /* ------------------------------------------------------------------ the loan */
 static const char* lender_name(int lender) {
-    if (lender == Mover::kLendImage) return "image model";
     return lender == Mover::kLendKV ? "KV cache" : lender == Mover::kLendArena ? "activation arena"
                                                                              : "fleet's free VRAM";
 }
@@ -1181,18 +1192,6 @@ static const char* lender_name(int lender) {
 static char* align_down_ptr(char* p) {
     const uintptr_t v = (uintptr_t)p;
     return (char*)(v - v % (uintptr_t)RAD_ALIGN_UNIT);
-}
-
-int64_t Mover::lendable_host_bytes() const {
-    if (!plan_ || !plan_->dynamic) return 0;
-    int64_t bytes = 0;
-    for (size_t u = 0; u < unit_.size(); ++u) {
-        const auto& us = unit_[u];
-        if (us.klass >= 0 && us.tier == Tier::HostPinned && us.pool_slot >= 0 &&
-            plan_->units[u].movable)
-            bytes += pools_[(size_t)us.klass].stride;
-    }
-    return bytes;
 }
 
 int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
@@ -1253,31 +1252,9 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
         }
     }
 
-    /* Keep move records at the high-water mark when a model is switched: a record past the
-     * current need can still be in use by another lender. Allocate events before any pointer
-     * becomes visible so a failure cannot leave a partially registered loan. */
-    size_t required_records = base_move_records_;
-    int64_t n_new = 0, bytes_new = 0;
-    for (size_t c = 0; c < nc; ++c) {
-        n_new += (int64_t)cuts[c].size();
-        bytes_new += (int64_t)cuts[c].size() * pools_[c].stride;
-        required_records += pools_[c].flex_ptr.size() + cuts[c].size();
-    }
-    if (n_new == 0) return RAD_OK;
-    const size_t had = moves_.size();
-    if (required_records > had) {
-        moves_.resize(required_records);
-        for (size_t i = had; i < required_records; ++i) {
-            const int st = rad_event_create_local(&moves_[i].ev);
-            if (st >= 0) continue;
-            for (size_t j = had; j < i; ++j) rad_event_destroy(moves_[j].ev);
-            moves_.resize(had);
-            return st;
-        }
-    }
-
     /* Smallest loan first, so any loan covers a prefix of the slots and the deepest slot, which
      * the owner wants back first, is given back first. */
+    int64_t n_new = 0, bytes_new = 0;
     for (size_t c = 0; c < nc; ++c) {
         if (cuts[c].empty()) continue;
         ClassPools& cp = pools_[c];
@@ -1287,33 +1264,31 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
         l.lender = lender;
         l.seg = cp.slab.add_segment((int64_t)cuts[c].size());
         l.first = cp.slab.seg_lo(l.seg);
-        /* Segments and pointers are appended in the same order. */
+        /* Segments are appended in the same order as their pointers, so slot_ptr's
+         * `slot - n_fixed` indexes flex_ptr directly. */
+        if (l.first != cp.n_fixed + (int64_t)cp.flex_ptr.size()) {
+            RAD_ERR("mover: a lent segment starts at slot %lld with %zu lent slots before it",
+                    (long long)l.first, cp.flex_ptr.size());
+            return RAD_E_STATE;
+        }
         for (const Cut& k : cuts[c]) { cp.flex_ptr.push_back(k.p); l.need.push_back(k.need); }
         cp.lent.push_back(std::move(l));
+        n_new += (int64_t)cuts[c].size();
+        bytes_new += (int64_t)cuts[c].size() * cp.stride;
     }
+    if (n_new <= 0) return RAD_OK;
+
+    /* A record for every lendable slot. A fill promotes into every free slot at once and a recall
+     * drops every unit past the loan at once, each holding a record until its barrier clears;
+     * with only the shadow count, records rather than the link would limit how fast a loan is
+     * used. */
+    const size_t had = moves_.size();
+    moves_.resize(had + (size_t)n_new);
+    for (size_t i = had; i < moves_.size(); ++i) RAD_TRY(rad_event_create_local(&moves_[i].ev));
 
     RAD_INFO("mover: %lld slots can be lent out of the %s (%s), filled as it lends them",
              (long long)n_new, lender_name(lender),
              humanb(bytes_new).c_str());
-    count_flex();
-    return RAD_OK;
-}
-
-int Mover::detach_image_loan() {
-    if (loan_[kLendImage] != 0 || loan_held(kLendImage) != 0) return RAD_E_STATE;
-    for (const ClassPools& cp : pools_) {
-        for (const ClassPools::Lent& l : cp.lent) {
-            if (l.lender == kLendImage &&
-                (&l != &cp.lent.back() || !cp.slab.can_remove_last_segment(l.seg)))
-                return RAD_E_STATE;
-        }
-    }
-    for (ClassPools& cp : pools_) {
-        if (cp.lent.empty() || cp.lent.back().lender != kLendImage) continue;
-        cp.flex_ptr.resize((size_t)(cp.lent.back().first - cp.n_fixed));
-        cp.slab.remove_last_segment();
-        cp.lent.pop_back();
-    }
     count_flex();
     return RAD_OK;
 }
@@ -1464,11 +1439,7 @@ int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
         if (us.klass != (int32_t)klass || us.pool_slot < 0 || us.slab_slot < 0) continue;
         if (us.tier != Tier::VRAM || us.site != Site::Device || !cp.slab.covered(us.slab_slot))
             continue;
-        const bool kv_slot = std::any_of(cp.lent.begin(), cp.lent.end(), [&](const auto& l) {
-            return l.lender == kLendKV && us.slab_slot >= cp.slab.seg_lo(l.seg) &&
-                   us.slab_slot < cp.slab.target(l.seg);
-        });
-        if (!kv_slot || (heat && heat->busy(u)) || unit_in_flight(u)) continue;
+        if ((heat && heat->busy(u)) || unit_in_flight(u)) continue;
         const int64_t g = us.pool_slot;
         us.pool_slot = -1;
         ++cp.n_donated;
@@ -1668,7 +1639,19 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             if (unit_[(size_t)m.unit].klass != (int32_t)c || !cp.slab.covered(m.slab_slot)) continue;
             if (m.frees_slab()) ++pending;
         }
-        const int64_t turn = turnover ? cp.n_turn : 0;
+        if (cfg_.turnover_adaptive) {
+            /* Three steps of the mean swaps a step (a swap holds its slot about three steps,
+             * RAD_PLACE_TURNOVER_SLOTS), between the floor and the configured count; all of
+             * them while a starved promotion is recent. The mean is over every class, so a
+             * class keeps a little more than its own share asks for. */
+            const int64_t floor_ = std::min<int64_t>(cp.n_turn, std::max(cfg_.turnover_floor, 0));
+            const int64_t want = turn_boost_ > 0 ? cp.n_turn : std::min<int64_t>(
+                cp.n_turn, std::max<int64_t>(floor_, (int64_t)std::lround(3.0f * demand_mean_)));
+            cp.turn_now = want >= cp.turn_now ? want : std::max(want, cp.turn_now - kTurnShrink);
+        } else {
+            cp.turn_now = cp.n_turn;
+        }
+        const int64_t turn = turnover ? cp.turn_now : 0;
         int64_t short_by = cp.n_work + turn - (cp.slab.n_free() + pending);
         if (short_by > 0) {
             drop_cand_.clear();
@@ -1724,6 +1707,12 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
     }
     count_flex();
     return flush_moves();
+}
+
+void Mover::swap_demand(int64_t proposed) {
+    if (!cfg_.turnover_adaptive) return;
+    demand_mean_ += ((float)std::max<int64_t>(proposed, 0) - demand_mean_) / kTurnMean;
+    if (turn_boost_ > 0) --turn_boost_;
 }
 
 int Mover::idle_tick(HeatEngine* heat) {

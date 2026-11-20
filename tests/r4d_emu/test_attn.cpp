@@ -51,7 +51,7 @@ static Fn pick(int hd, int gqa, bool i8, bool ahead) {
         return nullptr;
     }
 #define P(H, G) if (hd == H && gqa == G) return i8 ? r4d_rad_attn_window_h##H##_gqa##G##_i8 : r4d_rad_attn_window_h##H##_gqa##G##_bf16;
-    P(128, 1) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
+    P(128, 1) P(128, 4) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
     P(512, 16)
 #undef P
     return nullptr;
@@ -237,6 +237,21 @@ int main(int argc, char** argv) {
          0, 0, 512, 1},
         {"wmma h128 gqa1 swa w1024 ragged", 128, 1, 1, false, true, true, false, 1024, {150, 70},
          {300, 70}, -1, 0, 0, 0, 1},
+        /* LFM3: h128, 16 query heads over 4 KV heads; full layers and a 256-token sliding window.
+         * Prefill and chunked prefill past the decode leg's band, ragged steps with decode rows, a
+         * query whose window starts inside the context, int8 cache */
+        {"h128 gqa4 kvh4 full verify17 split", 128, 4, 4, false, true, false, false, 0, {17}, {300}, -1, 262144, s128},
+        {"h128 gqa4 kvh4 swa w256 ragged", 128, 4, 4, false, true, true, false, 256, {1, 5, 40}, {600, 77, 300}},
+        {"h128 gqa4 kvh2 swa w256 i8+descale split", 128, 4, 2, true, true, false, true, 256, {20}, {700}, -1, 4096, s128},
+        {"h128 gqa4 kvh4 noncausal missing-block", 128, 4, 4, false, false, true, false, 0, {4, 2}, {37, 20}, 1},
+        {"wmma h128 gqa4 kvh4 full prefill 200 of 900", 128, 4, 4, false, true, false, false, 0, {200}, {900},
+         -1, 0, 0, 0, 1},
+        {"wmma h128 gqa4 kvh4 swa w256 prefill 300 of 900", 128, 4, 4, false, true, false, false, 256, {300},
+         {900}, -1, 0, 0, 0, 1},
+        {"wmma h128 gqa4 kvh4 swa w256 ragged + decode rows", 128, 4, 4, false, true, true, false, 256,
+         {150, 1, 70}, {500, 50, 70}, -1, 0, 0, 0, 1},
+        {"wmma h128 gqa4 kvh2 swa w256 i8+descale", 128, 4, 2, true, true, true, true, 256, {100, 90},
+         {400, 90}, -1, 0, 0, 0, 1},
         /* Gemma 4 sliding: h256 gqa2, causal, windowed; a ragged mixed step */
         {"h256 gqa2 swa w64 ragged bf16", 256, 2, 2, false, true, true, false, 64, {1, 5, 40}, {200, 77, 140}},
         {"h256 gqa2 swa w64 ragged i8+descale", 256, 2, 2, true, true, true, true, 64, {1, 5, 40}, {200, 77, 140}},

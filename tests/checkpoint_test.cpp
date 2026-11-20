@@ -138,7 +138,7 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
 
 /* The index is checkpoint-supplied data like the tensors, and its weight_map values are paths:
  * a poisoned one must not lead the loader to open files outside the model dir as the serving
- * user. hfget screens the listing's names; nothing screened the index's until here. */
+ * user. */
 TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
     auto dir_with_index = [](const char* shard) -> std::string {
         const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
@@ -160,6 +160,20 @@ TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
         Checkpoint ck;
         CHECK(ck.open(dir_with_index(bad)) < 0);
     }
+}
+
+/* A Hugging Face cache snapshot is a directory of symbolic links into the cache's blob store,
+ * which lies outside it. The shard's name is under the model directory; where its link points is
+ * the operator's layout, and the loader follows it. */
+TEST(a_shard_that_is_a_link_out_of_the_model_dir_opens) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
+    const std::string blob = dir + ".blob";
+    REQUIRE(std::rename((dir + "/model.safetensors").c_str(), blob.c_str()) == 0);
+    REQUIRE(::symlink(blob.c_str(), (dir + "/model.safetensors").c_str()) == 0);
+    Checkpoint ck;
+    CHECK_EQ(ck.open(dir), RAD_OK);
+    std::remove((dir + "/model.safetensors").c_str());
+    std::remove(blob.c_str());
 }
 
 TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
@@ -2002,6 +2016,26 @@ TEST(config_json_fills_the_model_meta_as_each_family_spells_it) {
           "lfm2", 0, 1024, 16, 8, 64, 0, 0, 0, 0, 0, 0, 1e-5, 1e4,
           { { "layer_types", "conv full_attention conv" }, { "hidden_size", "7" },
             { "vision_config.hidden_size", "768" } } },
+        { "LFM3: the rotary per attention class with its partial factor, the window, booleans; the "
+          "typed theta is the default, which the plugin does not read",
+          R"({"model_type":"lfm3","hidden_size":2048,"num_attention_heads":16,
+              "num_key_value_heads":4,"head_dim":128,"num_hidden_layers":4,
+              "intermediate_size":7680,"norm_eps":1e-05,"vocab_size":128000,
+              "max_position_embeddings":262144,"conv_L_cache":7,"conv_bias":false,
+              "use_sandwich_norm":true,"tie_word_embeddings":true,"sliding_window":256,
+              "layer_types":["conv","full_attention","sliding_attention","conv"],
+              "rope_parameters":{"full_attention":{"partial_rotary_factor":0.5,
+                                                   "rope_theta":1000000.0,"rope_type":"default"},
+                                 "sliding_attention":{"rope_theta":10000,"rope_type":"default"}}})",
+          "lfm3", 4, 2048, 16, 4, 128, 7680, 128000, 262144, 0, 0, 0, 1e-5, 1e4,
+          { { "layer_types", "conv full_attention sliding_attention conv" },
+            { "rope_parameters.full_attention.rope_theta", "1000000" },
+            { "rope_parameters.full_attention.partial_rotary_factor", "0.5" },
+            { "rope_parameters.full_attention.rope_type", "default" },
+            { "rope_parameters.sliding_attention.rope_theta", "10000" },
+            { "rope_parameters.sliding_attention.partial_rotary_factor", nullptr },
+            { "sliding_window", "256" }, { "conv_L_cache", "7" }, { "conv_bias", "0" },
+            { "use_sandwich_norm", "1" }, { "tie_word_embeddings", "1" } } },
         { "Gemma 4 12B: the unified wrapper maps to gemma4, its model_type stays, null experts",
           R"({"model_type":"gemma4_unified","eos_token_id":[1,106],
               "text_config":{"model_type":"gemma4_unified_text","hidden_size":3840,

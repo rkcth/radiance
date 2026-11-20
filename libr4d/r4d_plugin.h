@@ -161,6 +161,8 @@ int64_t r4d_rad_attn_qrow_h128_gqa8_scratch(const RadArgs*);
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */
 int     r4d_rad_attn_window_h128_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h128_gqa1_i8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h128_gqa4_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h128_gqa4_i8 (const RadArgs*, RadStream);
 /* h128 gqa16: Muse Glimmer's 32 query heads over 2 KV heads. */
 int     r4d_rad_attn_window_h128_gqa16_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h128_gqa16_i8 (const RadArgs*, RadStream);

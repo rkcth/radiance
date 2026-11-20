@@ -38,6 +38,7 @@
 #include "halo_args.h"
 #include "halo_common.h"
 #include "halo_moe_sort.h"
+#include "halo_chain.h"
 #include "halo_moe_gather.h"
 
 namespace halo_moe {
@@ -474,7 +475,7 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
     const unsigned gy = (unsigned)((n + 255) / 256);
     int rc2;
     if (ew->dtype == RAD_F32)
-        rc2 = HALO_EMIT(s, (gather_kernel<256, true>), dim3((unsigned)M, gy), dim3(256), 0,
+        rc2 = HALO_EMIT(s, (halo_chain_flag() ? gather_kernel<256, true, r4dchain> : gather_kernel<256, true, HaloUnchained>), dim3((unsigned)M, gy), dim3(256), 0,
                         (const uint16_t*)ye->data, ew->data, inv, (uint16_t*)Y->data,
                         (uint32_t)M, (uint32_t)n, (uint32_t)top_k, (uint32_t)ye_ld,
                         (uint32_t)ew_ld, (uint32_t)y_ld,
@@ -483,7 +484,7 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
                         sh ? (const uint16_t*)sg->data : nullptr,
                         (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
     else
-        rc2 = HALO_EMIT(s, (gather_kernel<256>), dim3((unsigned)M, gy), dim3(256), 0,
+        rc2 = HALO_EMIT(s, (halo_chain_flag() ? gather_kernel<256, false, r4dchain> : gather_kernel<256, false, HaloUnchained>), dim3((unsigned)M, gy), dim3(256), 0,
                         (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
                         (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
                         (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
@@ -524,9 +525,11 @@ extern "C" int64_t halo_rad_moe_gather_scratch(const RadArgs* a) {
 }
 
 extern "C" int halo_rad_moe_gather(const RadArgs* a, RadStream s) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 1024));   /* halo_chain.h */
     return halo_moe::moe_gather_body(a, s, false);
 }
 
 extern "C" int halo_rad_moe_gather_inv(const RadArgs* a, RadStream s) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 1024));   /* halo_chain.h */
     return halo_moe::moe_gather_body(a, s, true);
 }

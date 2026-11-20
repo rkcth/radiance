@@ -93,11 +93,31 @@ __device__ __forceinline__ void rotate(const uint16_t* __restrict__ nb, uint16_t
 // One head into the paged cache at element offset `off` (halo_model_bf16.hip's kv_store kernels):
 // KV 1 an E4M3 cache, four columns a lane as kv_store_fp8_kernel converts them; KV 2 a bf16 cache,
 // the values as they are. `src` is the head in LDS, complete before the call.
+//
+// KV 3, the int8 cache (libr4d's KV 1 since the E4M3 cache left it): the head's int8 codes at byte
+// offset `off` and its f16 scale (absmax / 127, the codes taken against the rounded scale) at byte
+// offset `soff`, as kv_store_i8 writes them; `red` is a wave's slot each for the block's absmax, and
+// the call holds a barrier, so the whole block makes it.
 template <uint32_t HD, int KV>
 __device__ __forceinline__ void kv_put(void* __restrict__ kv, size_t off,
-                                       const uint16_t* __restrict__ src, float inv) {
+                                       const uint16_t* __restrict__ src, float inv,
+                                       size_t soff = 0, float* red = nullptr) {
     const uint32_t t = threadIdx.x;
-    if (KV == 1) {
+    if (KV == 3) {
+        (void)inv;
+        const float f = bf2f(src[t]);
+        float am = halo_wave_max(fabsf(f));
+        if ((t & 31u) == 0u) red[t >> 5] = am;
+        __syncthreads();
+        am = 0.0f;
+#pragma unroll
+        for (uint32_t w = 0; w < HD / kWave; ++w) am = fmaxf(am, red[w]);
+        const __fp16 s16 = (__fp16)fminf(am / 127.0f, 515.0f);
+        const float sc = (float)s16;
+        const float r = sc > 0.0f ? rintf(f / sc) : 0.0f;
+        ((uint8_t*)kv)[off + t] = (uint8_t)(int8_t)(int)fminf(fmaxf(r, -127.0f), 127.0f);
+        if (t == 0u) *(uint16_t*)((uint8_t*)kv + soff) = __builtin_bit_cast(uint16_t, s16);
+    } else if (KV == 1) {
         if (t < HD / 4) {
             const uint32_t d = t * 4u;
             float f[4];
@@ -119,9 +139,10 @@ __device__ __forceinline__ void kv_put(void* __restrict__ kv, size_t off,
 // blockIdx.y: [0, nq) a query head, [nq, nq+nkv) a key head (and with VK its value, from the raw
 // key), [nq+nkv, nq+2nkv) a value head normalised in place (without VK).
 //
-// KV 1 or 2 also stores each k and v head into the paged cache [n_blocks, nkv, block_size, 2*HD]
-// at slot[m] (k at column 0, v at HD), for rows m < n_slot whose slot is in range; KV 0 stores
-// nothing and ignores the cache arguments.
+// KV 1, 2 or 3 also stores each k and v head into the paged cache [n_blocks, nkv, block_size, row]
+// at slot[m] (k at column 0, v at HD; row 2*HD, or 2*HD + 4 at the int8 cache (KV 3), whose two
+// scales follow the codes), for rows m < n_slot whose slot is in range; KV 0 stores nothing and
+// ignores the cache arguments.
 // The body: its blocks return early (rows past the cliff, value heads), so the chained form
 // (halo_chain.h) wraps it below rather than bracketing it in place.
 template <uint32_t HD, bool WF32, bool VK, int KV>
@@ -143,7 +164,8 @@ __device__ __forceinline__ void qkv_norm_rope_body(
     // rope rotates only the rows its positions cover; a row past them is normed and not rotated
     const float p0 = m < n_pos ? (float)pos[m] / div : 0.0f;
     // The row's cache slot, as kv_store reads it: a negative or out-of-range slot stores nothing.
-    // Uniform over the block, so the barriers below are too.
+    // Uniform over the block, so the barriers below are too. ROW is a token's row in a head.
+    constexpr size_t ROW = KV == 3 ? 2 * HD + 4 : 2 * HD;
     size_t base = 0;
     bool put = false;
     if (KV && m < n_slot) {
@@ -151,10 +173,10 @@ __device__ __forceinline__ void qkv_norm_rope_body(
         if (sl >= 0 && (uint32_t)sl / block_size < n_blocks) {
             put = true;
             base = ((size_t)((uint32_t)sl / block_size) * nkv * block_size +
-                    (size_t)((uint32_t)sl % block_size)) * 2 * HD;
+                    (size_t)((uint32_t)sl % block_size)) * ROW;
         }
     }
-    const size_t head_step = (size_t)block_size * 2 * HD;
+    const size_t head_step = (size_t)block_size * ROW;
 
     if (hh >= nq + nkv) {   // a value head, in place: rmsnorm_p (or, without v_norm, only stored)
         const uint32_t h = hh - nq - nkv;
@@ -172,7 +194,8 @@ __device__ __forceinline__ void qkv_norm_rope_body(
         }
         if (KV && put) {
             __syncthreads();
-            kv_put<HD, KV>(kvc, base + (size_t)h * head_step + HD, sb, v_inv);
+            const size_t r0 = base + (size_t)h * head_step;
+            kv_put<HD, KV>(kvc, r0 + HD, sb, v_inv, r0 + 2 * HD + 2, l1);
         }
         return;
     }
@@ -202,8 +225,9 @@ __device__ __forceinline__ void qkv_norm_rope_body(
     else for (uint32_t i = t; i < HD; i += HD) { x[i] = nb[i]; if (st) st[i] = nb[i]; }
     if (KV && !isq && put) {
         __syncthreads();   // the stored head (and VK's value) complete in LDS
-        kv_put<HD, KV>(kvc, base + (size_t)h * head_step, sb, k_inv);
-        if (VK) kv_put<HD, KV>(kvc, base + (size_t)h * head_step + HD, vb, v_inv);
+        const size_t r0 = base + (size_t)h * head_step;
+        kv_put<HD, KV>(kvc, r0, sb, k_inv, r0 + 2 * HD, l1);
+        if (VK) kv_put<HD, KV>(kvc, r0 + HD, vb, v_inv, r0 + 2 * HD + 2, l2);
     }
 }
 
@@ -259,7 +283,9 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     const long long vn  = halo_geti_or(a, "v_norm", 1);
     if (hd != 128 && hd != 256 && hd != 512) return HALO_NO(RAD_E_SHAPE);
     if (vk && !vn) return HALO_NO(RAD_E_INVAL);   // v from k is v's norm
-    if (nq < 0 || nkv <= 0 || rot <= 0 || rot > hd || (rot & 1)) return HALO_NO(RAD_E_SHAPE);
+    /* rot 0 is the NoPE layer: the norm still runs, and `rotate` with half = 0 only copies the
+     * unrotated tail, which is the whole head. */
+    if (nq < 0 || nkv <= 0 || rot < 0 || rot > hd || (rot & 1)) return HALO_NO(RAD_E_SHAPE);
     if (halo_numel(qw) != hd || halo_numel(kw) != hd) return HALO_NO(RAD_E_SHAPE);
     const char* mode = halo_gets(a, "mode");
     if (mode && std::strcmp(mode, "neox")) return HALO_NO(RAD_E_UNSUPPORTED);
@@ -302,7 +328,7 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     const bool chain = halo_geti_or(a, "chain", 0) != 0 && M <= 64;   /* RadKernelChainFn, decode */
 
     // The store's geometry, checked as kv_store_geom checks it (halo_model_bf16.hip).
-    int kvw = 0;   // 0 none, 1 E4M3, 2 bf16
+    int kvw = 0;   // 0 none, 1 E4M3, 2 bf16, 3 the int8 cache
     const RadTensor* sm = nullptr;
     const RadTensor* kv = nullptr;
     long long bs = 0, nblk = 0, nslot = 0;
@@ -314,7 +340,7 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
         if (sm->dtype != RAD_I32 || !halo_contig(sm) || !halo_contig(kv)) return HALO_NO(RAD_E_STRIDE);
         bs = halo_geti_or(a, "block_size", 0);
         if (bs <= 0 || kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs ||
-            kv->shape[3] != 2 * hd)
+            kv->shape[3] != (kv->dtype == RAD_I8 ? 2 * hd + 4 : 2 * hd))
             return HALO_NO(RAD_E_SHAPE);
         nblk  = kv->shape[0];
         nslot = halo_numel(sm);
@@ -327,6 +353,8 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
             kvw = 1;
         } else if (kv->dtype == RAD_BF16) {
             kvw = 2;
+        } else if (kv->dtype == RAD_I8) {
+            kvw = 3;
         } else {
             return HALO_NO(RAD_E_DTYPE);
         }
@@ -341,7 +369,7 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     (uint32_t)nslot, (uint32_t)bs, (uint32_t)nblk, kinv, vinv, (uint32_t)(vn ? 1 : 0))
 #define HALO_QNR_KV(HD, WF, VK)                                                                          \
     do { if (kvw == 1) HALO_QNR_T(HD, WF, VK, 1); else if (kvw == 2) HALO_QNR_T(HD, WF, VK, 2);           \
-         else HALO_QNR_T(HD, WF, VK, 0); } while (0)
+         else if (kvw == 3) HALO_QNR_T(HD, WF, VK, 3); else HALO_QNR_T(HD, WF, VK, 0); } while (0)
 #define HALO_QNR(HD)                                                                                     \
     do { if (qw->dtype == RAD_F32) { if (vk) HALO_QNR_KV(HD, true, true);  else HALO_QNR_KV(HD, true, false); } \
          else                      { if (vk) HALO_QNR_KV(HD, false, true); else HALO_QNR_KV(HD, false, false); } } while (0)

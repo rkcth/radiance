@@ -27,6 +27,9 @@ enum { SC_LOGITS = 0, SC_QUERY = 1, SC_U = 2, SC_DRAW = 3 };
 struct Fp8Ops {
     const RadTensor *a, *ascale, *b, *bscale, *y;
     long long M, N, K, nkb;
+    /* The scale group along K: HALO_FP8_BLOCK, or HALO_I8_GROUP_WIDE for an int8 row-scale weight
+     * whose op says `group` 256 (IQ8R). Both scale planes have K / group columns. */
+    long long group;
     long a_ld, sa_ld, w_ld, sw_ld;    /* a_ld / w_ld in elements here; see the note at each use */
 };
 
@@ -65,13 +68,23 @@ static inline int fp8_ops(const RadArgs* a, Fp8Ops* g, int want_ascale,
      * a mismatch would be a silently wrong scale grid. */
     const long long blk = halo_gemm_fp8a8_block();
     if (blk != HALO_FP8_BLOCK) return HALO_NO(RAD_E_SHAPE);
-    g->nkb = (g->K + blk - 1) / blk;
-    /* Check the scale plane's extents: a wrong grid still reads plausible numbers. */
-    if (g->bscale->shape[0] != (wscale == FP8_OPS_ROW_SCALE ? g->N : (g->N + blk - 1) / blk))
-        return HALO_NO(RAD_E_SHAPE);
-    if (g->bscale->shape[1] != g->nkb) return HALO_NO(RAD_E_SHAPE);
+    g->group = wscale == FP8_OPS_ROW_SCALE ? halo_geti_or(a, "group", blk) : blk;
+    if (g->group != blk && g->group != HALO_I8_GROUP_WIDE) return HALO_NO(RAD_E_SHAPE);
+    if (g->group != blk && g->K % g->group) return HALO_NO(RAD_E_SHAPE);
+    g->nkb = (g->K + g->group - 1) / g->group;
+    /* Check the scale plane's extents: a wrong grid still reads plausible numbers. A two-level
+     * scale (IQ8R's E4M3 per row per group under a second level) is a view of two planes, declared
+     * at the weight's logical extents [N][K] (which no one-level scale is); its layout widens it to
+     * the bf16 [N][K/group] a one-level scale is, at that plane's pitch (libr4d's r4d_fp8_args.h). */
+    const bool two = wscale == FP8_OPS_ROW_SCALE && g->bscale->shape[0] == g->N &&
+                     g->bscale->shape[1] == g->K;
+    if (!two) {
+        if (g->bscale->shape[0] != (wscale == FP8_OPS_ROW_SCALE ? g->N : (g->N + blk - 1) / blk))
+            return HALO_NO(RAD_E_SHAPE);
+        if (g->bscale->shape[1] != g->nkb) return HALO_NO(RAD_E_SHAPE);
+    }
 
-    const long long wp = halo_row_pitch(g->b), sp = halo_row_pitch(g->bscale);
+    const long long wp = halo_row_pitch(g->b), sp = two ? g->nkb : halo_row_pitch(g->bscale);
     const long long yp = halo_row_pitch(g->y);
     if (wp < 0 || sp < 0 || yp < 0) return HALO_NO(RAD_E_STRIDE);
     /* The output has no pitch argument -- libhalo writes C[r*N + c]. */

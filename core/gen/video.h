@@ -140,7 +140,6 @@ struct VideoRequest {
      * (Engine::gen_lora_acquire), -1 for none, and the hold that keeps it until the request is
      * done. */
     int32_t  lora_slot = -1;
-    std::shared_ptr<void> dispatch_hold; /* released after the LoRA slot at retirement */
     std::shared_ptr<void> lora_hold;
     std::shared_ptr<VideoTicket> ticket;
 };

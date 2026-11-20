@@ -7,7 +7,6 @@
 #include "util/json.h"
 
 #include <algorithm>
-#include <climits>
 #include <filesystem>
 #include <cctype>
 #include <cmath>
@@ -566,19 +565,6 @@ int Checkpoint::open_gguf(const std::string& path) {
     return RAD_OK;
 }
 
-/* Whether the file `p` really is -- symlinks resolved -- lives inside `dir`. Screening the NAME
- * is not enough: a model dir can carry a symlink whose honest-looking name resolves outside
- * it, and the index can name exactly that file. (A legit symlink that stays inside the dir
- * still passes: the resolution is inside too. Both sides resolve, so a dir path that itself
- * runs through a symlink compares against its own real location.) */
-static bool resolves_under(const std::string& dir, const std::string& p) {
-    char rd[PATH_MAX], rp[PATH_MAX];
-    if (::realpath(dir.c_str(), rd) == nullptr) return false;
-    if (::realpath(p.c_str(), rp) == nullptr) return false;
-    const size_t n = std::strlen(rd);
-    return rp[n] == '/' && std::strncmp(rp, rd, n) == 0;
-}
-
 int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
                           const std::unordered_map<std::string, std::string>* owner) {
     shards_.push_back(std::make_unique<SafeTensorsFile>());
@@ -617,11 +603,12 @@ int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
 
 namespace {
 
-/* The index's shard names are checkpoint-supplied data. They must stay under `dir`: hfget
- * screens the LISTING's names, but the index is one of the listed files, and a weight_map of
- * "../../etc/passwd" passes that screen as easily as it escapes the model dir -- the engine
- * would open the named file, outside the dir, as the serving user. Relative subdirs are legal
- * in real repos; an empty component, "." or ".." is not. */
+/* Whether an index may name `f` as a shard. The index is data the checkpoint supplies, and its
+ * names are joined under the model directory and opened as the serving user, so a name must stay
+ * under that directory: relative, with no empty component, "." or "..". Subdirectories are legal.
+ * Only the name is screened. A shard that is a symbolic link is followed like any file the
+ * operator points the engine at: a Hugging Face cache snapshot is a directory of links into its
+ * blob store. */
 bool shard_name_ok(const std::string& f) {
     if (f.empty() || f.front() == '/') return false;
     size_t i = 0;
@@ -636,10 +623,10 @@ bool shard_name_ok(const std::string& f) {
     return true;
 }
 
-/* Every shard an index names, once each and in name order, or the one model.safetensors; `map`
- * is the index's weight_map, empty without one. */
 static bool path_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
 
+/* Every shard an index names, once each and in name order, or the one model.safetensors; `map`
+ * is the index's weight_map, empty without one. */
 int shard_list(const std::string& dir, const std::string& index, bool index_given,
                std::vector<std::string>* out, std::unordered_map<std::string, std::string>* map) {
     const int s = st_load_index(index, map);
@@ -655,26 +642,10 @@ int shard_list(const std::string& dir, const std::string& index, bool index_give
             }
         std::sort(out->begin(), out->end());
         for (auto& f : *out) f = dir + "/" + f;
-        /* The join is honest; the FILE may not be: an honest name can be a symlink planted in
-         * the dir that resolves outside it. Refuse before any open of it. (Containment reads
-         * relative to the dir actually being loaded, which is why it lives here and not in
-         * add_shard: a drafter's shards legitimately join under the DRAFT's dir.) */
-        for (const std::string& f : *out)
-            if (path_exists(f) && !resolves_under(dir, f)) {
-                RAD_ERR("%s: the shard '%s' resolves outside the model directory; refusing it",
-                        index.c_str(), log_sanitize(f).c_str());
-                return RAD_E_FORMAT;
-            }
         return RAD_OK;
     }
     if (s != RAD_E_NOTFOUND || index_given) return s;
     out->push_back(dir + "/model.safetensors");
-    if (!resolves_under(dir, out->back())) {
-        RAD_ERR("%s: %s resolves outside the model directory; refusing it",
-                index.c_str(), log_sanitize(out->back()).c_str());
-        out->pop_back();
-        return RAD_E_FORMAT;
-    }
     return RAD_OK;
 }
 
@@ -2069,8 +2040,7 @@ int Checkpoint::add_lora(const std::string& path, double strength,
     }
     std::vector<std::string> files;
     std::error_code ec;
-    const bool scanned = std::filesystem::is_directory(path, ec);
-    if (scanned) {
+    if (std::filesystem::is_directory(path, ec)) {
         for (const auto& e : std::filesystem::directory_iterator(path, ec))
             if (e.path().extension() == ".safetensors") files.push_back(e.path().string());
         std::sort(files.begin(), files.end());
@@ -2093,14 +2063,6 @@ int Checkpoint::add_lora(const std::string& path, double strength,
 
     int n_merged = 0;
     for (const std::string& f : files) {
-        /* A scanned name can be a symlink planted in the adapter dir resolving outside it --
-         * same rule as the model dir's shards. A file the operator named outright needs no
-         * screen: following its symlink is where they pointed it. */
-        if (scanned && !resolves_under(path, f)) {
-            RAD_ERR("lora: %s resolves outside the adapter directory; refusing it",
-                    log_sanitize(f).c_str());
-            return RAD_E_FORMAT;
-        }
         SafeTensorsFile st;
         if (st.open(f) != RAD_OK) return RAD_E_FORMAT;
         std::vector<Pair> pairs;
@@ -3639,9 +3601,9 @@ int Checkpoint::bailingmoe3_layouts() {
      * lie inside the stack: negative opens a walk of twice the range, beyond the end is a
      * container that means nothing by it. The head and rank caps are the same discipline one
      * order down: the rebuild's products (heads * (nope + rope) rows, heads * 256 * latent
-     * bytes of fused kv) are computed in int64 and handed to vectors sized through size_t --
-     * on the 32-bit tier an overflowed product truncates to a small allocation the copy then
-     * overruns. No family model is near 4096 heads or ranks; 256 rope dimensions is already
+     * bytes of fused kv) are computed in int64 and handed to vectors sized through size_t, and
+     * a product past that type's range truncates to a small allocation the copy then overruns.
+     * No family model is near 4096 heads or ranks; 256 rope dimensions is already
      * far past what the rope kernel addresses. */
     if (n_layer < 1 || n_layer > 4096 || dense < 0 || dense > n_layer ||
         group < 2 || group > n_layer || heads < 1 || heads > 4096 ||

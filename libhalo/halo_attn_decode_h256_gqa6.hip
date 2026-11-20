@@ -45,6 +45,7 @@
 #include "halo_common.h"
 #include "halo_dt16.h"
 #include "halo_q8.h"
+#include "halo_fwht.h"   // GQ 3's width-128 Hadamard (attn_paged_gate_had_quant)
 #include "halo_chain.h"
 #include "halo_attn_args.h"
 #include <algorithm>
@@ -76,6 +77,12 @@
 // k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
 #define O_V4    33554432
 #define O_K6    67108864
+// O_I8 (with O_V4 | O_K6, whose staging it takes): the int8 cache, int8 K and V with one f16 scale
+// each per token and head (a RAD_I8 group, abi/rad_builder.h). The codes are a byte wide and a key
+// has one scale where k6_v4 has one per 32 dims; they widen to value * scale the same way.
+#define O_I8    1073741824
+// The int8 cache's bits together, for a launcher's option set.
+#define O_KVI8  (O_V4 | O_K6 | O_I8)
 // The two views of HaloArgs compiled in only where a row asks for them:
 //   QLD    q rows at HaloArgs::q_ld (attn_paged_qrow), not dense.
 //   KVREP  query group g reads cache head g / HaloArgs::kv_rep, descales per cache head.
@@ -85,6 +92,11 @@
 //        union of their pages and HaloArgs::umask which of a page's tokens each row attends to; the
 //        mask replaces the causal limit (halo_attn_qsa_union in the paged unit).
 #define O_UNION 536870912
+// TREE: a tree verify (attn_paged_qrow_tree; HaloArgs::spec_parent). A row whose entry is not -2
+// sees, inside its sequence's query block, only itself and its ancestors, and its window is
+// measured from the block's first position plus its depth. Compiled in only where a row asks
+// (libr4d's O_TREE, at a bit this library's option sets leave free).
+#define O_TREE  65536
 
 __host__ __device__ __forceinline__ int halo_attn_tiles(int ctx, int tile) {
     return (ctx + tile - 1) / tile;
@@ -137,14 +149,18 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
     constexpr int LDSB  = (OPT & O_LDSB) ? 1 : 0;
     constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
     constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    constexpr int I8    = ((OPT & O_I8) && K6) ? 1 : 0;
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = HEAD_DIM * 5 / 4;
+    constexpr int ROWB  = I8 ? 2 * HEAD_DIM + 4
+                        : K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int VOFF  = I8 ? HEAD_DIM : K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
+    constexpr int VSOFF = I8 ? 2 * HEAD_DIM + 2 : K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = I8 ? 2 * HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int QLD   = (OPT & O_QLD)   ? 1 : 0;
     constexpr int KVREP = (OPT & O_KVREP) ? 1 : 0;
     constexpr int UNION = (OPT & O_UNION) ? 1 : 0;
+    constexpr int TREE  = (OPT & O_TREE)  ? 1 : 0;
+    static_assert(!(TREE && UNION), "a tree verify is not a union launch");
     static_assert(!UNION || (BS == 4 && TILE % 16 == 0 && !WIN && !KVREP),
                   "the union mask is a word a 4-token page, four pages a 16-key m-tile");
     static_assert(CTG, "gfx1151 reads the paged cache in the contiguous layout (KSTR HEAD_DIM + 8)");
@@ -222,6 +238,16 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
     if (t_lo >= ntl) return;
     const int t_hi = min(t_lo + tps, ntl);
 
+    // TREE: the block's parents staged once, so each row's walk below reads LDS rather than a
+    // chain of dependent global loads. Every early return above is uniform across the block.
+    __shared__ int s_tpar[TREE ? 64 : 1];
+    if constexpr (TREE) {
+        if (a.spec_parent) {
+            for (int r = tid; r < qlen && r < 64; r += NTHR) s_tpar[r] = a.spec_parent[qoff + r];
+            __syncthreads();
+        }
+    }
+
     // Row tile and head slice; at DS 1 the wave is the row tile, as before the split.
     const int rw = DS > 1 ? warp % NWARPS : warp, dh = DS > 1 ? warp / NWARPS : 0;
     const int row = rw * 16 + c;
@@ -268,8 +294,28 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
     const int klimit = cz ? pos
                           : ((WIN && a.window > 0) ? min(ctx - 1, pos + a.window - 1)
                                                    : ctx - 1);
-    const int wlo    = (WIN && a.window > 0) ? (pos - a.window + 1 > 0
-                                               ? pos - a.window + 1 : 0) : 0;
+    // A tree verify's row (TREE): a bit per row of the block for itself and each ancestor, and
+    // its depth, from which its window is measured. Parents precede children, so the walk ends.
+    const int tbase = ctx - qlen;
+    uint64_t tmask = 0;
+    int tdep = 0;
+    bool trow = false;
+    if (TREE && a.spec_parent && qrow < 64) {
+        int pj = s_tpar[qrow];
+        if (pj != -2) {
+            trow  = true;
+            tmask = 1ull << qrow;
+            for (int at = qrow; pj >= 0 && pj < at; ) {
+                tmask |= 1ull << pj;
+                ++tdep;
+                at = pj;
+                pj = s_tpar[pj];
+            }
+        }
+    }
+    const int wpos   = (TREE && trow) ? tbase + tdep : pos;
+    const int wlo    = (WIN && a.window > 0) ? (wpos - a.window + 1 > 0
+                                               ? wpos - a.window + 1 : 0) : 0;
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
     float l_i   = 0.0f;
@@ -287,7 +333,8 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
     // The pair's two scales stay apart until storeV4 packs them: packed here, the fetch is waited
     // on right after it is issued. fp8_v4 packs here, as libr4d's prefill unit does.
     constexpr int OLDV4 = V4 && !K6;
-    uint32_t v4c[U4][2], v4s[U4][2];
+    // i8: a key's 8 dims are two code words, so a pair's are four.
+    uint32_t v4c[U4][I8 ? 4 : 2], v4s[U4][2];
     auto fetchV4 = [&](int k0, const int* blks) {
 #pragma unroll
         for (int r = 0; r < U4; ++r) {
@@ -306,8 +353,15 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
                     const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
                                         + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
-                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
-                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                    if constexpr (I8) {
+                        const uint2 cw = *(const uint2*)(base + VOFF + o * 8);
+                        v4c[r][2 * j]     = cw.x;
+                        v4c[r][2 * j + 1] = cw.y;
+                        sc[j]             = *(const uint16_t*)(base + VSOFF);
+                    } else {
+                        v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
+                        sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                    }
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
                 else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
@@ -323,13 +377,18 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
                 || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
                                   : u < NP4)) : u < NP4)) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
-                // Two's complement nibbles; ^ 8 makes them offset binary (value + 8).
-                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                // Two's complement nibbles; ^ 8 makes them offset binary (value + 8). i8: bytes,
+                // ^ 0x80 (value + 128); `n` is a key's dims 0-3 of the octet and `m` its dims 4-7.
+                const uint32_t n0 = I8 ? v4c[r][0] ^ 0x80808080u
+                                       : (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m0 = I8 ? v4c[r][1] ^ 0x80808080u
+                                       : ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t n1 = I8 ? v4c[r][I8 ? 2 : 1] ^ 0x80808080u
+                                       : (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m1 = I8 ? v4c[r][I8 ? 3 : 1] ^ 0x80808080u
+                                       : ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+                const h2 bias = { (_Float16)(I8 ? 1152.0f : 1032.0f), (_Float16)(I8 ? 1152.0f : 1032.0f) };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp
                                       + (VSK ? 16 * (o & 3) + 8 * ((o >> 2) & 1) + 128 * (o >> 2) : 0)];
 #pragma unroll
@@ -339,8 +398,9 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
                     const uint32_t hi = __builtin_amdgcn_perm(m1, m0, sel) | 0x64006400u;
                     const h2 vl = (__builtin_bit_cast(h2, lo) - bias) * s2;
                     const h2 vh = (__builtin_bit_cast(h2, hi) - bias) * s2;
-                    *(uint32_t*)(dst + (2 * b) * VSTR)     = __builtin_bit_cast(uint32_t, vl);
-                    *(uint32_t*)(dst + (2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
+                    // The octet's rows: nibbles interleave the dims (2b, 2b+1), bytes run b, 4+b.
+                    *(uint32_t*)(dst + (I8 ? b : 2 * b) * VSTR)         = __builtin_bit_cast(uint32_t, vl);
+                    *(uint32_t*)(dst + (I8 ? 4 + b : 2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
                 }
             }
         }
@@ -514,6 +574,8 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
                      + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB)
                      * (KVP ? 2 : 1);
             }
+            // i8: the key's one K scale, read once an m-tile.
+            const uint32_t ksb = I8 ? (uint32_t)*(const uint16_t*)(grow + KSOFF) : 0u;
             v8f s = (v8f){0,0,0,0,0,0,0,0};
 #pragma unroll
             for (int g = 0; g < NKD; g += PF) {
@@ -536,6 +598,14 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
                                                  D::from_bf16w(u0.z), D::from_bf16w(u0.w),
                                                  D::from_bf16w(u1.x), D::from_bf16w(u1.y),
                                                  D::from_bf16w(u1.z), D::from_bf16w(u1.w) };
+                        kb[j] = D::mk(w8);
+                    } else if constexpr (I8) {
+                        // i8: this lane's sixteen dims (16t ..) as bytes, times the key's scale --
+                        // both halves, since a gfx1151 lane holds the whole run (halo_dt16.h).
+                        uint32_t w8[8];
+                        const uint4 cw = *(const uint4*)(grow + 16 * t);
+                        i8x8_to_f16x4w(make_uint2(cw.x, cw.y), ksb | (ksb << 16), w8 + 0);
+                        i8x8_to_f16x4w(make_uint2(cw.z, cw.w), ksb | (ksb << 16), w8 + 4);
                         kb[j] = D::mk(w8);
                     } else if constexpr (K6) {
                         // k6_v4: this lane's sixteen dims (16t ..) from their low nibbles, the
@@ -595,11 +665,15 @@ void halo_attn_decode_body(const HaloArgs& a, int splits)
                 for (int e = 0; e < 8; ++e)
                     sc[e] = mr[e >> 1] > (uint32_t)(2 * (e & 1) + h) ? sc[e] : -INFINITY;
             } else
-            if (!MSKIP || wave_any(kbase + 15 > klimit) || (WIN && wave_any(kbase < wlo))) {
+            if (!MSKIP || wave_any(kbase + 15 > klimit) || (WIN && wave_any(kbase < wlo)) ||
+                (TREE && wave_any(trow && kbase + 15 >= tbase))) {
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const int key = kbase + 2 * e + h;
-                    sc[e] = ((key <= klimit) && (!WIN || key >= wlo)) ? sc[e] : -INFINITY;
+                    sc[e] = ((key <= klimit) && (!WIN || key >= wlo) &&
+                             (!TREE || !trow || key < tbase ||
+                              ((tmask >> (key - tbase)) & 1ull)))
+                          ? sc[e] : -INFINITY;
                 }
             }
             float smax = sc[0];
@@ -730,6 +804,11 @@ struct HaloGateQuant {
     float*          s;          // one scale per 128 columns, row `job` at s + job * s_ld
     unsigned        g_ld, q_ld, s_ld;
     int             i8;         // read by the launcher only: which combine to instantiate
+    // GQ 3 (attn_paged_gate_had_quant): the int8 form with the width-128 Hadamard between the
+    // bf16 product and the absmax, byte-identical to gate_had_quant_i8g: `out` keeps the unrotated
+    // product, and the stages run by ascending stride as halo_fwht_wave's do, whose butterflies
+    // give the same bits under any thread map. Read by the launcher only, as `i8`.
+    int             rot;
 };
 constexpr int kHaloGqGroup = 128;
 
@@ -795,21 +874,27 @@ void splitkv_combine_vec_body(const HaloArgs& a, int splits, int tile, const Hal
             for (int j = 0; j < DPL; ++j) {
                 o_.w[j] = halo_gq_gate(gi.w[j], ob[j]);
                 v[j] = bf16_to_f32(o_.w[j]);
-                m = fmaxf(m, fabsf(v[j]));
+                if constexpr (GQ != 3) m = fmaxf(m, fabsf(v[j]));
             }
             if (DPL == 8) *(uint4*)outp = o_.u4; else *(uint2*)outp = o_.u2;
+            if constexpr (GQ == 3) {
+                /* the rotated codes: the absmax is taken over the transformed values */
+                halo_fwht_part<DPL, LPG>(v, lane);
+#pragma unroll
+                for (int j = 0; j < DPL; ++j) m = fmaxf(m, fabsf(v[j]));
+            }
             if constexpr (LPG > 16) m = fmaxf(m, halo_xor_lane<16>(m));
             if constexpr (LPG > 8)  m = fmaxf(m, halo_xor_lane<8>(m));
             m = fmaxf(m, halo_xor_lane<4>(m));
             m = fmaxf(m, halo_xor_lane<2>(m));
             m = fmaxf(m, halo_xor_lane<1>(m));
-            const float sc  = m > 0.0f ? m * (1.0f / q8_top<GQ == 2>()) : 1.0f;
+            const float sc  = m > 0.0f ? m * (1.0f / q8_top<GQ >= 2>()) : 1.0f;
             const float inv = 1.0f / sc;
             if ((lane % LPG) == 0) gq.s[(size_t)job * gq.s_ld + (lane * DPL) / kHaloGqGroup] = sc;
             uint32_t pk[DPL / 4];
 #pragma unroll
             for (int w = 0; w < DPL / 4; ++w)
-                pk[w] = q8_pack4<GQ == 2>(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3],
+                pk[w] = q8_pack4<GQ >= 2>(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3],
                                           inv);
             uint8_t* qp = gq.q + (size_t)job * gq.q_ld + lane * DPL;
             if (DPL == 8) *(uint2*)qp = make_uint2(pk[0], pk[DPL / 4 - 1]);
@@ -969,7 +1054,21 @@ void splitkv_combine_body(const HaloArgs& a, int splits, int tile, const HaloGat
             constexpr int WPG = kHaloGqGroup / 32;         // waves a scale group
             const uint16_t h = halo_gq_gate(gq.g[(size_t)job * gq.g_ld + d], ob);
             *op = h;
-            const float v = bf16_to_f32(h);
+            float v = bf16_to_f32(h);
+            if constexpr (GQ == 3) {
+                /* Strides 1 to 16 pair lanes of the wave; 32 and 64 pair waves of the group, two
+                 * exchanges through `red`, each read behind the barrier after its store and ahead
+                 * of the next. */
+                halo_fwht_part<1, 32>(&v, d & 31);
+#pragma unroll
+                for (int hs = 32; hs < kHaloGqGroup; hs <<= 1) {
+                    red[d] = v;
+                    __syncthreads();
+                    const float o = red[d ^ hs];
+                    v = __int_as_float(__float_as_int(v) ^ ((d & hs) ? 0x80000000u : 0u)) + o;
+                    __syncthreads();
+                }
+            }
             const float m = halo_wave_max(fabsf(v));
             if ((d & 31) == 0) red[d / 32] = m;
             __syncthreads();
@@ -977,10 +1076,10 @@ void splitkv_combine_body(const HaloArgs& a, int splits, int tile, const HaloGat
             float gm = red[g0];
 #pragma unroll
             for (int w = 1; w < WPG; ++w) gm = fmaxf(gm, red[g0 + w]);
-            const float sc  = gm > 0.0f ? gm * (1.0f / q8_top<GQ == 2>()) : 1.0f;
+            const float sc  = gm > 0.0f ? gm * (1.0f / q8_top<GQ >= 2>()) : 1.0f;
             const float inv = 1.0f / sc;
             if ((d % kHaloGqGroup) == 0) gq.s[(size_t)job * gq.s_ld + d / kHaloGqGroup] = sc;
-            if constexpr (GQ == 2) {
+            if constexpr (GQ >= 2) {
                 gq.q[(size_t)job * gq.q_ld + d] =
                     (uint8_t)(int)rintf(fminf(fmaxf(v * inv, -127.0f), 127.0f));
             } else {
@@ -1095,6 +1194,8 @@ __attribute__((used)) static void* const kHaloGqInst[] = {
     (void*)&halo_attn_splitkv_combine_vec_gq_kernel<256, 4, 1, 2, 0, 2>,
     (void*)&halo_attn_splitkv_combine_gq_kernel<256, 4, 1, 0, 1>,
     (void*)&halo_attn_splitkv_combine_gq_kernel<256, 4, 1, 0, 2>,
+    (void*)&halo_attn_splitkv_combine_vec_gq_kernel<256, 4, 1, 2, 0, 3>,
+    (void*)&halo_attn_splitkv_combine_gq_kernel<256, 4, 1, 0, 3>,
 };
 
 // ---- host helpers shared by the paged decode dispatches -----------------------------------------
@@ -1278,14 +1379,20 @@ static int decode_common(const RadArgs* a, HaloArgs* r, long long row = 0, int r
 // always takes the plain launch, as libr4d's does.
 //
 // Returns 0, a negative code for a shape this instantiation does not serve, or -100 - hipError_t.
-template <int HEAD_DIM, int GQA, int BS, int OPT, int KVP, int WIN = 0>
+//
+// MAXR: the q_len * gqa rows one workgroup may hold, 64 (four row tiles) unless the geometry's unit
+// raises it to 128, which takes eight row tiles past four (gqa 16: a verify of seven drafts in the
+// decode kernel); a row tile past the last query row computes a copy of it and stores nothing.
+template <int HEAD_DIM, int GQA, int BS, int OPT, int KVP, int WIN = 0, int MAXR = 64>
 static int decode_launch(const HaloArgs* a, hipStream_t s, const HaloGateQuant* gq = nullptr) {
+    static_assert(MAXR == 64 || (MAXR == 128 && halo_dec_ds(HEAD_DIM) == 1) || MAXR < 64,
+                  "eight row tiles only where a row tile is one wave");
     constexpr int TILE = HALO_D_TILE, JPB = HALO_D_JPB, VECMIN = HALO_D_VECMIN;
     constexpr int PF16 = (OPT & O_PF16) ? 1 : 0;
     if (a->head_dim != HEAD_DIM || a->block_size != BS) return -1;
     if (a->q_heads / a->kv_heads != GQA) return -2;
     const int rows = a->q_len * GQA;
-    if (rows > 64) return -4;                   // verify width 64 / gqa, i.e. q_len <= 64 / GQA
+    if (rows > MAXR) return -4;                 // verify width MAXR / gqa, i.e. q_len <= 64 / GQA
     const int nw = (rows + 15) / 16;            // gqa-aligned height (split-D rounds it below)
     const int splits = WIN ? halo_decode_splits_win(a, TILE) : halo_decode_splits(a, TILE);
 
@@ -1303,9 +1410,11 @@ static int decode_launch(const HaloArgs* a, hipStream_t s, const HaloGateQuant* 
     // dead tile's WMMAs are not hidden behind the KV stream. A three-tile one is six waves, which
     // fit a WGP worse than eight: 6-7% slower at q_len 5-8 and 16K, 2% at 2K.
     constexpr int NW1 = halo_dec_ds(HEAD_DIM) > 1 ? 2 : 1, NW3 = halo_dec_ds(HEAD_DIM) > 1 ? 4 : 3;
+    constexpr int NW8 = (MAXR > 64) ? 8 : 4;   // five to eight row tiles take eight (MAXR 128)
     if      (nw == 1) { HALO_D_LAUNCH(NW1); }
     else if (nw == 2) { HALO_D_LAUNCH(2); }
     else if (nw == 3) { HALO_D_LAUNCH(NW3); }
+    else if (MAXR > 64 && nw > 4) { HALO_D_LAUNCH(NW8); }
     else              { HALO_D_LAUNCH(4); }
 #undef HALO_D_LAUNCH
     hipError_t e = hipGetLastError();
@@ -1318,7 +1427,16 @@ static int decode_launch(const HaloArgs* a, hipStream_t s, const HaloGateQuant* 
     const int jobs3  = halo_q_total(*a) * a->q_heads;
     const bool vec   = splits <= 64 && jobs3 >= VECMIN;
     const int blocks = (jobs3 + JPB - 1) / JPB;
-    if (gq) {
+    if (gq && gq->rot) {
+        /* GQ 3: the rotated int8 quantiser (attn_paged_gate_had_quant) */
+        if (vec)
+            hipLaunchKernelGGL((halo_attn_splitkv_combine_vec_gq_kernel<HEAD_DIM, 4, PF16, JPB, WIN, 3>),
+                               dim3(blocks), dim3(32 * JPB), 0, s, *a, splits, TILE, *gq);
+        else
+            hipLaunchKernelGGL((halo_attn_splitkv_combine_gq_kernel<HEAD_DIM, 4, PF16, WIN, 3>),
+                               dim3(jobs3), dim3(HEAD_DIM), splits * sizeof(float), s, *a,
+                               splits, TILE, *gq);
+    } else if (gq) {
         if (vec && gq->i8)
             hipLaunchKernelGGL((halo_attn_splitkv_combine_vec_gq_kernel<HEAD_DIM, 4, PF16, JPB, WIN, 2>),
                                dim3(blocks), dim3(32 * JPB), 0, s, *a, splits, TILE, *gq);

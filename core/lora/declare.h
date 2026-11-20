@@ -18,7 +18,6 @@ class Builder;
 struct LoraDeclare {
     const LoraConfig*        cfg = nullptr;
     lora::TargetSet          targets;
-    bool                     image_only = false;
     /* The real declare's sites, for the adapter loader; null on a sizing declare. */
     std::vector<lora::Site>* sites_out = nullptr;
 };

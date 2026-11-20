@@ -552,7 +552,7 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
 
     /* The indexer runs first because the attention reads its selection; `w.h` is already final,
      * written by the connection above. */
-    qsa.step(c, attn.w.h, batch, qsa_win_cu);
+    qsa.step(c, attn.w.h, batch, qsa_win_cu, attn.qsa_use(batch));
     attn.step(c, batch);
 
     hc_attn.write(c, T, 0, T);

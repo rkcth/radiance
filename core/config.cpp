@@ -4,6 +4,7 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "sched/draft_depth.h"   /* the --draft-depth-load lists */
 #include "kld.h"
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
@@ -44,21 +45,6 @@ static const std::string g_draft_window_help =
 static const Flag g_flags[] = {
     { "--model",              "PATH",   "the .rad container, a checkpoint served as it stands, or a\n"
                                         "Hugging Face repo id (owner/name), fetched before startup" },
-    { "--supplemental-text-model", "PATH", "serve a resident local text checkpoint on a separate device" },
-    { "--supplemental-text-device", "N", "device ordinal for the resident supplemental text model" },
-    { "--supplemental-text-host-pool-mib", "N", "pinned expert pool for the supplemental text model (default 0)" },
-    { "--image-model",        "PATH",   "serve this local image checkpoint alongside --model on the same cards" },
-    { "--image-text-rank",    "N",      "run shared images on one card, at zero-based text rank N" },
-    { "--image-model-reserve","PATH",   "also budget for this local image checkpoint (repeatable)" },
-    { "--image-reload-headroom-mib", "N", "extra VRAM per generator rank for shared model reloads (default 0)" },
-    { "--unloaded-image-expert-pool-mib", "N", "temporary expert VRAM per generator rank after unload (default 0)" },
-    { "--image-embedding-placement", "WHERE", "shared image embedding: auto (default), ram or vram" },
-    { "--video-tower-placement", "WHERE", "shared video encoder tower: vram (default) or ram" },
-    { "--image-model-fifo",    "",       "serve queued image requests in strict arrival order" },
-    { "--image-lora-snapshot-mib", "N",  "host budget for shared image LoRA source snapshots (default 2048)" },
-    { "--image-snapshot-memory", "MODE", "shared generator weight snapshots: pageable (default) or pinned" },
-    { "--no-image-weight-loan", nullptr, "keep generator weights in VRAM and lend only transient activation memory" },
-    { "--image-model-cache-mib", "N",   "host budget for active and inactive image weight snapshots (default 0)" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
     { "--model-revision",     "REV",    "the hub revision -- a branch, tag, full commit sha or refs/pr/N --\n"
@@ -67,7 +53,6 @@ static const Flag g_flags[] = {
                                         "homes separated by ':' are searched in order, the first winning" },
     { "--kernels",            "LIST",   "the kernel libraries to use, separated by ',' or ':', first wins; unnamed ones are not loaded. Default: every library found" },
 
-    { "--device-ordinal",     "N",      "backend device ordinal for a rank, repeat once per rank" },
     { "--tp",                 "N",      "tensor-parallel ranks" },
     { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
                                         "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 3\n"
@@ -95,6 +80,9 @@ static const Flag g_flags[] = {
     { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
                                         "step. The scheduler learns an aggregate prefill cap from\n"
                                         "completed mixed steps; 0 (default) is off" },
+    { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
+                                        "decode position fits beside every runner; off (the default)\n"
+                                        "admits a prompt when its first chunk fits" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -190,10 +178,33 @@ static const Flag g_flags[] = {
     { "--checkpoint-interval","N",      "linear-attention state checkpoint interval, in tokens" },
     { "--prefill-span",       "N",      "checkpoint intervals one step may carry of a prefill alone\n"
     "                                    in its step, from the prompt's second interval on (default\n"
-    "                                    1); needs --max-num-batched-tokens of N intervals. Every\n"
+    "                                    1); needs --max-num-batched-tokens of N intervals. Prompts\n"
+    "                                    prefilling side by side with nothing decoding take such\n"
+    "                                    steps one at a time, the fewest tokens left first. Every\n"
     "                                    other step is planned at the budget less the extra\n"
     "                                    intervals, and the checkpoints inside a span are not\n"
     "                                    written" },
+    { "--prefill-span-pass",  "MODE",   "piece (default) | step -- the routed (MoE) block's pass of a\n"
+    "                                    spanned step: a pass an interval, or one pass over the\n"
+    "                                    whole step where the model runs such a step serially\n"
+    "                                    (Flash-Next at one or two ranks). Each expert's weight is\n"
+    "                                    then read once for all the step's rows; the arena grows by\n"
+    "                                    the expert planes' extra rows and the output differs from\n"
+    "                                    piece passes at tie level. Needs --prefill-span above 1" },
+    { "--prefill-tail-snapshot", "MODE", "on (default): a prompt's last chunk ends where the\n"
+    "                                    next turn's linear-state snapshot goes (prefix resume\n"
+    "                                    nearest), leaving its last tokens a step of their own (a\n"
+    "                                    lone spanned prefill on a model that snapshots inside a step\n"
+    "                                    takes it inside the chunk, no step more); off: the last chunk\n"
+    "                                    runs to the prompt's end, one step fewer, and a next turn\n"
+    "                                    resumes up to an interval earlier" },
+    { "--prefill-span-first", "MODE",   "off (default) | on -- whether a lone prefill may span from\n"
+    "                                    its first token; on: the first interval rides the span (its\n"
+    "                                    rows read QSA's selection, the same keys as the dense pass\n"
+    "                                    below the exactness bound, summed in another order)" },
+    { "--prefill-span-min",   "N",     "the shortest prompt, in tokens, a prefill spans for: auto\n"
+    "                                    (default) is 8 intervals where routed experts are read from\n"
+    "                                    host memory and 0 elsewhere; 0 spans every lone prefill" },
     /* A total, not per sequence: the snapshot store is one pool of N slots
      * (KVManager::set_checkpoint_store). */
     { "--checkpoint-slots",   "N",      "linear-state or sliding-window snapshots the server holds in\n"
@@ -232,6 +243,63 @@ static const Flag g_flags[] = {
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
     "                                    requests, the same output law, other tokens than off for a fixed\n"
     "                                    seed" },
+    { "--draft-verify",       "MODE",   "token (default, alias rowwise) | block | traversal -- how a coupled draft chain is\n"
+    "                                    verified: token decides each row on its own (maximal coupling);\n"
+    "                                    block decides the whole chain at once (Block Verification, arXiv\n"
+    "                                    2403.10444; switches --draft-coupling on); traversal decides a\n"
+    "                                    root-to-leaf path bottom-up (Traversal Verification, arXiv\n"
+    "                                    2505.12398; needs --draft-coupling on). The same output law in\n"
+    "                                    every mode, more drafts accepted per step in block and traversal" },
+    { "--draft-depth",        "MODE",   "fixed (default) | adaptive -- a coupled serial chain stops within\n"
+    "                                    the step once the product of the head's probabilities along it falls\n"
+    "                                    below --draft-depth-stop, and the next verify carries only the drafts\n"
+    "                                    made (1 .. --draft-depth-max). Same output law (the rule reads the\n"
+    "                                    draft's own laws only); switches --draft-coupling on (an explicit\n"
+    "                                    off is refused) and needs --draft-window fixed (both choose the\n"
+    "                                    depth, so they are not served together)" },
+    { "--draft-depth-max",    "N",      "--draft-depth adaptive: the deepest chain (default 0 =\n"
+                                        "num-speculative-tokens)" },
+    { "--draft-depth-min",    "N",      "--draft-depth adaptive: rounds that always run (default 1)" },
+    { "--draft-depth-stop",   "P",      "--draft-depth adaptive: the chain goes on while its confidence\n"
+                                        "is at least P (default 0.85)" },
+    { "--draft-depth-lag",    "K",      "--draft-depth adaptive: rounds the decision trails the chain,\n"
+                                        "0 or 1 (default 1: the host decides while the next round runs)" },
+    { "--draft-depth-stat",   "S",      "--draft-depth adaptive: top (default, each round's largest\n"
+                                        "probability) | path (the probability of the token it drew)" },
+    { "--draft-depth-load",   "MODE",   "off (default) | on -- --draft-depth adaptive with several sequences\n"
+    "                                    in a step: draft round j only for the rows whose expected accepted\n"
+    "                                    drafts pay their verify\n"
+    "                                    rows, the kernel tile they open and the round, at the measured\n"
+    "                                    throughput; fewer sequences than --draft-depth-load-from keep the\n"
+    "                                    stop rule. Same output law" },
+    { "--draft-depth-load-from", "N",   "--draft-depth-load: the fewest drafting sequences of a step the\n"
+                                        "load-aware rule decides (default 5)" },
+    { "--draft-depth-load-min", "N",    "--draft-depth-load: rounds a load-aware step always runs (default 2)" },
+    { "--draft-depth-load-late", "MODE", "on (default) | off -- --draft-depth-load: choose each row's verified\n"
+                                        "drafts again when the next verify is issued, from the laws read by then" },
+    { "--draft-depth-load-calib", "MODE", "--draft-depth-load: online (default; acceptance by confidence,\n"
+    "                                    throughput and row/round/tile prices follow the running server) |\n"
+    "                                    static (the built-in or given tables only)" },
+    { "--draft-depth-load-tok-ms", "LIST", "--draft-depth-load: tokens a millisecond by drafting sequences\n"
+                                        "1..8, comma-separated (a short list repeats its last; default built in)" },
+    { "--draft-depth-load-row-ms", "LIST", "--draft-depth-load: a verify row's milliseconds, by drafting\n"
+                                        "sequences 1..8" },
+    { "--draft-depth-load-round-ms", "LIST", "--draft-depth-load: a draft round's milliseconds, by drafting\n"
+                                        "sequences 1..8" },
+    { "--draft-depth-load-jump-ms", "LIST", "--draft-depth-load: what a verify of more than 16, 32, 48, 64\n"
+                                        "rows costs on top, in milliseconds (four numbers)" },
+    { "--draft-suffix",       "MODE",   "off (default) | on -- SuffixDecoding as a step selector on a serial head's chain: when the\n"
+                                        "sequence's last --draft-suffix-min-match tokens occurred earlier in\n"
+                                        "its own prompt ++ output, a host-built step verifies the earlier\n"
+                                        "continuation (a chain, up to --draft-suffix-max rows) instead of the\n"
+                                        "head's draft. Lossless; works beside the fixed chain, --draft-verify\n"
+                                        "traversal and --draft-depth adaptive, not --draft-verify block" },
+    { "--draft-suffix-min-match", "L",  "shortest suffix match that selects a suffix step (default 6)" },
+    { "--draft-suffix-max",   "N",      "most rows of a suffix step (default 7; the verify window becomes\n"
+                                        "max(--num-speculative-tokens, N), the head still drafts its own)" },
+    { "--draft-suffix-min-score", "D",  "cut the suffix chain where its path score (the product of the\n"
+                                        "follower frequencies along it, SuffixDecoding's D) falls under D\n"
+                                        "(default 0.3)" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -248,8 +316,9 @@ static const Flag g_flags[] = {
     "                                    never access; repeatable" },
     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
-                                        "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
-                                        "serves text only and keeps the tower off the card" },
+                                        "pixels). Default `auto`: 16384 when the container carries a vision tower (0 in a build\n"
+                                        "without a media decoder, which would refuse every media part). 0 serves text\n"
+                                        "only and keeps the tower off the card" },
     { "--image-gen-max-pixels", "N",    "an image generator's largest image, in pixels (1048576: 1024 x 1024).\n"
       "                              Default: the model's. Its per-image buffers, and the activation\n"
       "                              arena with them, are sized for it; larger requests are refused" },
@@ -607,66 +676,11 @@ int config_parse(int argc, char** argv, Config* c) {
 
         if (S("-v"))                           log_set_level(Log::Debug);
         else if (S("-vv"))                     log_set_level(Log::Trace);
-        else if (S("--supplemental-text-model")) {
-            if (!(v = need(i)) || !*v) return RAD_E_INVAL;
-            c->supplemental_text_model = v;
-        }
-        else if (S("--supplemental-text-device")) {
-            if (!num(0, INT32_MAX, &c->supplemental_text_device)) return RAD_E_INVAL;
-        }
-        else if (S("--supplemental-text-host-pool-mib")) {
-            if (!num(0, INT64_MAX >> 23, &c->supplemental_text_host_pool_mib)) return RAD_E_INVAL;
-        }
-        else if (S("--image-model"))           { if (!(v = need(i))) return RAD_E_INVAL; c->image_model = v; }
-        else if (S("--image-text-rank"))       { if (!num(0, INT32_MAX, &c->image_text_rank)) return RAD_E_INVAL; }
-        else if (S("--image-model-reserve"))   { if (!(v = need(i))) return RAD_E_INVAL; c->image_model_reserve.emplace_back(v); }
-        else if (S("--unloaded-image-expert-pool-mib")) { if (!num(0, INT64_MAX >> 20, &c->unloaded_image_expert_pool_mib)) return RAD_E_INVAL; }
-        else if (S("--image-reload-headroom-mib")) { if (!num(0, INT64_MAX >> 20, &c->image_reload_headroom_mib)) return RAD_E_INVAL; }
-        else if (S("--image-embedding-placement")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if (!parse_table_placement(v, &c->image_embedding_placement) ||
-                c->image_embedding_placement == TablePlacement::Disk) {
-                RAD_ERR("--image-embedding-placement takes auto, ram or vram");
-                return RAD_E_INVAL;
-            }
-        }
-        else if (S("--video-tower-placement")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if (!parse_table_placement(v, &c->video_tower_placement) ||
-                (c->video_tower_placement != TablePlacement::Ram &&
-                 c->video_tower_placement != TablePlacement::Vram)) {
-                RAD_ERR("--video-tower-placement takes ram or vram");
-                return RAD_E_INVAL;
-            }
-        }
-        else if (S("--image-model-fifo"))      c->image_model_fifo = true;
-        else if (S("--no-image-weight-loan")) c->image_weight_loan = false;
-        else if (S("--image-lora-snapshot-mib")) { if (!num(1, INT64_MAX >> 20, &c->image_lora_snapshot_mib)) return RAD_E_INVAL; }
-        else if (S("--image-snapshot-memory")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if (std::strcmp(v, "pageable") == 0) c->image_snapshot_pageable = true;
-            else if (std::strcmp(v, "pinned") == 0) c->image_snapshot_pageable = false;
-            else {
-                RAD_ERR("--image-snapshot-memory takes pinned or pageable");
-                return RAD_E_INVAL;
-            }
-        }
-        else if (S("--image-model-cache-mib")) { if (!num(0, INT64_MAX >> 20, &c->image_model_cache_mib)) return RAD_E_INVAL; }
         else if (S("--model"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->model = v; }
         else if (S("--download-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->download_dir = v; }
         else if (S("--model-revision"))        { if (!(v = need(i))) return RAD_E_INVAL; c->model_revision = v; }
         else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
         else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = rad_split_kernel_list(v); }
-        else if (S("--device-ordinal")) {
-            int ordinal;
-            if (!num(0, INT32_MAX, &ordinal)) return RAD_E_INVAL;
-            if (std::find(c->device_ordinals.begin(), c->device_ordinals.end(), ordinal) !=
-                c->device_ordinals.end()) {
-                RAD_ERR("--device-ordinal %d was specified more than once", ordinal);
-                return RAD_E_INVAL;
-            }
-            c->device_ordinals.push_back(ordinal);
-        }
         else if (S("--tp"))                    { if (!num(1, INT32_MAX, &c->tp)) return RAD_E_INVAL; }
         else if (S("--tp-wire")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -718,6 +732,12 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
         }
         else if (S("--mixed-step-target-ms"))  { if (!num(0, 60000, &c->mixed_step_target_ms)) return RAD_E_INVAL; }
+        else if (S("--prefill-room-gate")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))   c->prefill_room_gate = true;
+            else if (!std::strcmp(v, "off"))  c->prefill_room_gate = false;
+            else { RAD_ERR("--prefill-room-gate takes on or off -- got '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
@@ -745,7 +765,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--gpu-headroom-mib") || S("--gpu-headroom"))
                                                { if (!num(0, INT64_MAX, &c->gpu_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--gpu-memory-mib"))         { if (!num(1, INT64_MAX, &c->gpu_memory_mib)) return RAD_E_INVAL; }
-        else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX >> 20, &c->host_headroom_mib)) return RAD_E_INVAL; }
+        else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "fp8_v4") || !std::strcmp(v, "k6_v4")) {
@@ -905,6 +925,38 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
         else if (S("--prefill-span"))          { if (!num(1, INT32_MAX, &c->prefill_span)) return RAD_E_INVAL; }
+        else if (S("--prefill-span-pass")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "piece")) c->prefill_span_step = false;
+            else if (!std::strcmp(v, "step"))  c->prefill_span_step = true;
+            else {
+                RAD_ERR("--prefill-span-pass takes piece or step, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-tail-snapshot")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->prefill_tail_snapshot = true;
+            else if (!std::strcmp(v, "off")) c->prefill_tail_snapshot = false;
+            else {
+                RAD_ERR("--prefill-tail-snapshot takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-span-first")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->prefill_span_first = true;
+            else if (!std::strcmp(v, "off")) c->prefill_span_first = false;
+            else {
+                RAD_ERR("--prefill-span-first takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-span-min")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->prefill_span_min = -1;
+            else if (!parse_int(a.c_str(), v, 0, INT64_MAX, &c->prefill_span_min)) return RAD_E_INVAL;
+        }
         else if (S("--checkpoint-slots")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "auto")) {
@@ -973,6 +1025,107 @@ int config_parse(int argc, char** argv, Config* c) {
                 RAD_ERR("--draft-coupling takes off or on, not '%s'", v);
                 return RAD_E_INVAL;
             }
+        }
+        else if (S("--draft-verify")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "token") || !std::strcmp(v, "rowwise")) {
+                c->draft_verify_block = false;
+                c->draft_verify_traversal = false;
+            }
+            else if (!std::strcmp(v, "block"))     { c->draft_verify_block = true;  c->draft_verify_traversal = false; }
+            else if (!std::strcmp(v, "traversal")) { c->draft_verify_block = false; c->draft_verify_traversal = true; }
+            else {
+                RAD_ERR("--draft-verify takes token (rowwise), block or traversal, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "fixed"))    c->draft_depth_adaptive = false;
+            else if (!std::strcmp(v, "adaptive")) c->draft_depth_adaptive = true;
+            else {
+                RAD_ERR("--draft-depth takes fixed or adaptive, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-max"))       { if (!num(0, 16, &c->draft_depth_max)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-min"))       { if (!num(1, 16, &c->draft_depth_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-lag"))       { if (!num(0, 1, &c->draft_depth_lag)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-stop")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (!(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--draft-depth-stop must be a probability in [0, 1], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_depth_stop = d;
+        }
+        else if (S("--draft-depth-stat")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "top"))  c->draft_depth_stat = 0;
+            else if (!std::strcmp(v, "path")) c->draft_depth_stat = 1;
+            else {
+                RAD_ERR("--draft-depth-stat takes top or path, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-load") || S("--draft-depth-load-late")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            bool b = false;
+            if      (!std::strcmp(v, "off")) b = false;
+            else if (!std::strcmp(v, "on"))  b = true;
+            else { RAD_ERR("%s takes off or on, not '%s'", a.c_str(), v); return RAD_E_INVAL; }
+            (S("--draft-depth-load") ? c->draft_depth_load : c->draft_depth_load_late) = b;
+        }
+        else if (S("--draft-depth-load-from")) { if (!num(2, 64, &c->draft_depth_load_from)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-min"))  { if (!num(1, 16, &c->draft_depth_load_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-calib")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "online")) c->draft_depth_load_online = true;
+            else if (!std::strcmp(v, "static")) c->draft_depth_load_online = false;
+            else {
+                RAD_ERR("--draft-depth-load-calib takes online or static, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-load-tok-ms") || S("--draft-depth-load-row-ms") ||
+                 S("--draft-depth-load-round-ms") || S("--draft-depth-load-jump-ms")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const bool jump = S("--draft-depth-load-jump-ms");
+            double probe[DraftDepthCfg::kLoadSeqs];
+            const int cap = jump ? (int)DraftDepthCfg::kJumps : (int)DraftDepthCfg::kLoadSeqs;
+            /* a price may be zero (a tile that costs nothing); a rate may not */
+            if (*v && draft_depth_parse_list(v, probe, cap, jump ? 0.0 : 1e-6, 1000.0) < 1) {
+                RAD_ERR("%s takes 1..%d comma-separated %s numbers, not '%s'", a.c_str(), cap,
+                        jump ? "non-negative" : "positive", v);
+                return RAD_E_INVAL;
+            }
+            (S("--draft-depth-load-tok-ms") ? c->draft_depth_load_tok_ms
+             : S("--draft-depth-load-row-ms") ? c->draft_depth_load_row_ms
+             : S("--draft-depth-load-round-ms") ? c->draft_depth_load_round_ms
+             : c->draft_depth_load_jump_ms) = v;
+        }
+        else if (S("--draft-suffix")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off")) c->draft_suffix = false;
+            else if (!std::strcmp(v, "on"))  c->draft_suffix = true;
+            else {
+                RAD_ERR("--draft-suffix takes off or on, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-suffix-min-match")) { if (!num(1, 12, &c->draft_suffix_min_match)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-max"))       { if (!num(1, 32, &c->draft_suffix_max)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-min-score")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* end = nullptr;
+            const double d = std::strtod(v, &end);
+            if (end == v || *end || !(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--draft-suffix-min-score takes a number in [0, 1], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_suffix_min_score = (float)d;
         }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
@@ -1292,11 +1445,6 @@ int config_parse(int argc, char** argv, Config* c) {
         c->given[S("--gpu-headroom") ? "--gpu-headroom-mib" : a] = "command line";
     }
 
-    if (!c->device_ordinals.empty() && c->device_ordinals.size() != (size_t)c->tp) {
-        RAD_ERR("--device-ordinal must be specified once per rank (--tp %d)", c->tp);
-        return RAD_E_INVAL;
-    }
-
     /* Both variables are read as the tools read them (rad_home() and rad_hierarchy_from_env() in
      * tools/iface.cpp), so a plugin validated with rad-kbench or rad-tune serves the same way. Set
      * but empty is unset, as for RADIANCE_KERNELS: an empty home would load no plugin at all. */
@@ -1319,66 +1467,6 @@ int config_parse(int argc, char** argv, Config* c) {
      * the named libraries, in its order. */
     if (c->model.empty()) {
         RAD_ERR("--model is required");
-        return RAD_E_INVAL;
-    }
-
-    if (!c->supplemental_text_model.empty() || c->supplemental_text_device >= 0) {
-        if (c->supplemental_text_model.empty() || c->supplemental_text_device < 0) {
-            RAD_ERR("--supplemental-text-model and --supplemental-text-device require each other");
-            return RAD_E_INVAL;
-        }
-        if (c->kld() || c->calib() || c->debug_graph) {
-            RAD_ERR("supplemental text requires HTTP serving");
-            return RAD_E_INVAL;
-        }
-    }
-    if (c->given.count("--supplemental-text-host-pool-mib") && c->supplemental_text_model.empty()) {
-        RAD_ERR("--supplemental-text-host-pool-mib requires a supplemental text model and device");
-        return RAD_E_INVAL;
-    }
-    if (c->image_text_rank >= 0 && (c->image_model.empty() || c->image_text_rank >= c->tp)) {
-        RAD_ERR("--image-text-rank requires --image-model and a text rank below --tp (%d)", c->tp);
-        return RAD_E_INVAL;
-    }
-    if (!c->image_model_reserve.empty() && c->image_model.empty()) {
-        RAD_ERR("--image-model-reserve requires --image-model");
-        return RAD_E_INVAL;
-    }
-
-    if (c->given.count("--image-reload-headroom-mib") && c->image_model.empty()) {
-        RAD_ERR("--image-reload-headroom-mib requires --image-model");
-        return RAD_E_INVAL;
-    }
-    if (c->given.count("--image-embedding-placement") && c->image_model.empty()) {
-        RAD_ERR("--image-embedding-placement requires --image-model");
-        return RAD_E_INVAL;
-    }
-    if (c->given.count("--video-tower-placement") && c->image_model.empty()) {
-        RAD_ERR("--video-tower-placement requires --image-model");
-        return RAD_E_INVAL;
-    }
-    if (c->image_model_fifo && c->image_model.empty()) {
-        RAD_ERR("--image-model-fifo requires --image-model");
-        return RAD_E_INVAL;
-    }
-    if (c->given.count("--image-lora-snapshot-mib") && (c->image_model.empty() || !c->lora.enabled())) {
-        RAD_ERR("--image-lora-snapshot-mib requires --image-model and LoRA support");
-        return RAD_E_INVAL;
-    }
-    if (c->given.count("--unloaded-image-expert-pool-mib") && c->image_model.empty()) {
-        RAD_ERR("--unloaded-image-expert-pool-mib requires --image-model");
-        return RAD_E_INVAL;
-    }
-    if (!c->image_weight_loan && c->image_model.empty()) {
-        RAD_ERR("--no-image-weight-loan requires --image-model");
-        return RAD_E_INVAL;
-    }
-    if (c->given.count("--image-snapshot-memory") && c->image_model.empty()) {
-        RAD_ERR("--image-snapshot-memory requires --image-model");
-        return RAD_E_INVAL;
-    }
-    if (c->given.count("--image-model-cache-mib") && c->image_model.empty()) {
-        RAD_ERR("--image-model-cache-mib requires --image-model");
         return RAD_E_INVAL;
     }
 
@@ -1546,6 +1634,69 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* --prefill-span-pass step and --prefill-span-min shape a span, so they need one. */
+    if (c->prefill_span_step && c->prefill_span <= 1) {
+        RAD_ERR("--prefill-span-pass step is the routed pass of a spanned step and needs "
+                "--prefill-span above 1");
+        return RAD_E_INVAL;
+    }
+    if (c->prefill_span_min >= 0 && c->prefill_span <= 1) {
+        RAD_ERR("--prefill-span-min is the shortest prompt a span is taken for and needs "
+                "--prefill-span above 1");
+        return RAD_E_INVAL;
+    }
+    /* --draft-depth adaptive reads the coupled chain's laws and chooses the chain's depth itself. */
+    if (c->draft_depth_adaptive) {
+        if (c->given.count("--draft-coupling") && !c->draft_coupling) {
+            RAD_ERR("--draft-depth adaptive needs the coupled drafting (--draft-coupling on): the "
+                    "stop rule reads the law each draft was drawn from");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_window == DraftWindow::Adaptive) {
+            RAD_ERR("--draft-depth adaptive and --draft-window adaptive both choose the chain's "
+                    "depth; serve one of them");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_verify_block) {
+            RAD_ERR("--draft-depth adaptive is verified token by token or by traversal "
+                    "(--draft-verify token | traversal), not as a fixed block");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_depth_min > 1 && c->draft_depth_max > 0 && c->draft_depth_min > c->draft_depth_max) {
+            RAD_ERR("--draft-depth-min is above --draft-depth-max");
+            return RAD_E_INVAL;
+        }
+        c->draft_coupling = true;
+    }
+    /* --draft-depth-load weighs the adaptive chain's rounds; its late choice reads each round's
+     * largest probability, the one statistic that is not the drawn token's own. */
+    if (c->draft_depth_load) {
+        if (!c->draft_depth_adaptive) {
+            RAD_ERR("--draft-depth-load on needs --draft-depth adaptive: it decides the adaptive "
+                    "chain's rounds for a step of several sequences");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_depth_stat != 0) {
+            RAD_ERR("--draft-depth-load on needs --draft-depth-stat top: its tables and the late "
+                    "choice of the verify's rows read each round's largest probability");
+            return RAD_E_INVAL;
+        }
+    }
+    /* --draft-verify block verifies a linear chain with the coupled drafting's states, so it
+     * switches the coupling on; traversal needs it and says so rather than switching it on. */
+    if (c->draft_verify_block) {
+        if (c->given.count("--draft-coupling") && !c->draft_coupling) {
+            RAD_ERR("--draft-verify block needs the coupled drafting (--draft-coupling on); "
+                    "--draft-coupling off contradicts it");
+            return RAD_E_INVAL;
+        }
+        c->draft_coupling = true;
+    }
+    if (c->draft_verify_traversal && !c->draft_coupling) {
+        RAD_ERR("--draft-verify traversal requires --draft-coupling on: the walk needs the draft's "
+                "law Q, which only a coupled draft carries");
+        return RAD_E_INVAL;
+    }
     /* --host-pool-mib is what the model pins for its weights in all; Config::host_pool_mib is a
      * rank's share of it, whichever of the two options came first. */
     if (pool_all) c->host_pool_mib /= std::max(c->tp, 1);
@@ -1584,30 +1735,6 @@ struct ShowRow { const char* flag; Show show; };
  * at startup" (-1, 0, empty) are shown by meaning; the engine's decisions replace them. */
 const ShowRow kShow[] = {
     { "--model",              [](const Config& c) { return c.model; } },
-    { "--supplemental-text-model", [](const Config& c) { return c.supplemental_text_model; } },
-    { "--supplemental-text-device", [](const Config& c) {
-          return c.supplemental_text_device < 0 ? "none" : num(c.supplemental_text_device); } },
-    { "--supplemental-text-host-pool-mib", [](const Config& c) { return num(c.supplemental_text_host_pool_mib); } },
-    { "--image-model",        [](const Config& c) { return c.image_model; } },
-    { "--image-text-rank", [](const Config& c) {
-          return c.image_text_rank < 0 ? "match text ranks" : num(c.image_text_rank); } },
-    { "--image-reload-headroom-mib", [](const Config& c) { return num(c.image_reload_headroom_mib); } },
-    { "--unloaded-image-expert-pool-mib", [](const Config& c) { return num(c.unloaded_image_expert_pool_mib); } },
-    { "--image-model-reserve", [](const Config& c) {
-          std::string paths;
-          for (const auto& path : c.image_model_reserve)
-              paths += (paths.empty() ? "" : ", ") + path;
-          return paths; } },
-    { "--image-embedding-placement", [](const Config& c) {
-          return std::string(table_placement_name(c.image_embedding_placement)); } },
-    { "--video-tower-placement", [](const Config& c) {
-          return std::string(table_placement_name(c.video_tower_placement)); } },
-    { "--image-model-fifo",    [](const Config& c) { return onoff(c.image_model_fifo); } },
-    { "--no-image-weight-loan", [](const Config& c) { return onoff(!c.image_weight_loan); } },
-    { "--image-lora-snapshot-mib", [](const Config& c) { return num(c.image_lora_snapshot_mib); } },
-    { "--image-snapshot-memory", [](const Config& c) -> std::string {
-          return c.image_snapshot_pageable ? "pageable" : "pinned"; } },
-    { "--image-model-cache-mib", [](const Config& c) { return num(c.image_model_cache_mib); } },
     { "--download-dir",       [](const Config& c) { return or_none(c.download_dir, "the XDG cache (~/.cache/radiance/hf)"); } },
     { "--model-revision",     [](const Config& c) { return or_none(c.model_revision, "the repo's main branch"); } },
     { "--radiance-home",      [](const Config& c) { return c.radiance_home; } },
@@ -1615,10 +1742,6 @@ const ShowRow kShow[] = {
           std::string s;
           for (const std::string& k : c.kernel_hierarchy) s += (s.empty() ? "" : ",") + k;
           return or_none(s, "every library found"); } },
-    { "--device-ordinal",     [](const Config& c) {
-          std::string s;
-          for (int d : c.device_ordinals) s += (s.empty() ? "" : ",") + num(d);
-          return or_none(s, "automatic device selection"); } },
     { "--tp",                 [](const Config& c) { return num(c.tp); } },
     { "--tp-wire",            [](const Config& c) { return std::string(c.tp_wire_exact ? "exact" : "wht6"); } },
     { "--tp-attn-split",      [](const Config& c) { return std::string(c.tp_attn_rows ? "rows" : "heads"); } },
@@ -1636,6 +1759,8 @@ const ShowRow kShow[] = {
                                           : std::string("off"); } },
     { "--mixed-step-target-ms", [](const Config& c) {
           return c.mixed_step_target_ms > 0 ? num(c.mixed_step_target_ms) : std::string("off"); } },
+    { "--prefill-room-gate", [](const Config& c) {
+          return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
@@ -1682,6 +1807,11 @@ const ShowRow kShow[] = {
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },
+    { "--prefill-span-pass",  [](const Config& c) { return std::string(c.prefill_span_step ? "step" : "piece"); } },
+    { "--prefill-tail-snapshot", [](const Config& c) { return onoff(c.prefill_tail_snapshot); } },
+    { "--prefill-span-first", [](const Config& c) { return onoff(c.prefill_span_first); } },
+    { "--prefill-span-min",   [](const Config& c) {
+          return c.prefill_span_min < 0 ? std::string("auto") : num(c.prefill_span_min); } },
     { "--checkpoint-slots",   [](const Config& c) {
           return c.checkpoint_slots < 0 ? std::string("auto") : num(c.checkpoint_slots); } },
     { "--no-prefix-cache",    [](const Config& c) {
@@ -1699,6 +1829,29 @@ const ShowRow kShow[] = {
           return c.draft_short_from < 0 ? std::string("auto")
                : c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
+    { "--draft-verify",       [](const Config& c) {
+          return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },
+    { "--draft-depth",        [](const Config& c) { return std::string(c.draft_depth_adaptive ? "adaptive" : "fixed"); } },
+    { "--draft-depth-max",    [](const Config& c) {
+          return c.draft_depth_max > 0 ? num(c.draft_depth_max) : std::string("auto"); } },
+    { "--draft-depth-min",    [](const Config& c) { return num(c.draft_depth_min); } },
+    { "--draft-depth-stop",   [](const Config& c) { return fnum(c.draft_depth_stop); } },
+    { "--draft-depth-lag",    [](const Config& c) { return num(c.draft_depth_lag); } },
+    { "--draft-depth-stat",   [](const Config& c) { return std::string(c.draft_depth_stat == 1 ? "path" : "top"); } },
+    { "--draft-depth-load",   [](const Config& c) { return onoff(c.draft_depth_load); } },
+    { "--draft-depth-load-from", [](const Config& c) { return num(c.draft_depth_load_from); } },
+    { "--draft-depth-load-min", [](const Config& c) { return num(c.draft_depth_load_min); } },
+    { "--draft-depth-load-late", [](const Config& c) { return onoff(c.draft_depth_load_late); } },
+    { "--draft-depth-load-calib", [](const Config& c) {
+          return std::string(c.draft_depth_load_online ? "online" : "static"); } },
+    { "--draft-depth-load-tok-ms", [](const Config& c) { return or_none(c.draft_depth_load_tok_ms, "builtin"); } },
+    { "--draft-depth-load-row-ms", [](const Config& c) { return or_none(c.draft_depth_load_row_ms, "builtin"); } },
+    { "--draft-depth-load-round-ms", [](const Config& c) { return or_none(c.draft_depth_load_round_ms, "builtin"); } },
+    { "--draft-depth-load-jump-ms", [](const Config& c) { return or_none(c.draft_depth_load_jump_ms, "builtin"); } },
+    { "--draft-suffix",       [](const Config& c) { return onoff(c.draft_suffix); } },
+    { "--draft-suffix-min-match", [](const Config& c) { return num(c.draft_suffix_min_match); } },
+    { "--draft-suffix-max",   [](const Config& c) { return num(c.draft_suffix_max); } },
+    { "--draft-suffix-min-score", [](const Config& c) { return fnum(c.draft_suffix_min_score); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

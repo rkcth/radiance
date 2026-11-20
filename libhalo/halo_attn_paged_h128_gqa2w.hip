@@ -34,14 +34,14 @@ using std::max;
 #define P_TILE   48
 #define P_OPT    3430923
 
-template <int KVP>
+template <int KVP, int XOPT = 0>
 static int prefill_launch_h128_gqa2w(const HaloArgs* a, hipStream_t s) {
     if (a->head_dim != B_HEAD_DIM || a->block_size != B_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != B_GQA) return -2;
     constexpr int BQ = (P_NWARPS * 16) / B_GQA;
     dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
     hipLaunchKernelGGL((halo_attn_prefill_kernel<P_NWARPS, P_TILE, B_HEAD_DIM, B_GQA,
-                                                 B_BLOCK_SIZE, KVP, P_OPT, 1>),
+                                                 B_BLOCK_SIZE, KVP, P_OPT | XOPT, 1>),
                        grid, dim3(P_NWARPS * 32), 0, s, *a);
     CHK4();
     return 0;
@@ -52,6 +52,9 @@ extern "C" int halo_attn_prefill_h128_gqa2w_fp8kv(const HaloArgs* a, hipStream_t
 }
 extern "C" int halo_attn_prefill_h128_gqa2w_bf16kv(const HaloArgs* a, hipStream_t s) {
     return prefill_launch_h128_gqa2w<1>(a, s);
+}
+extern "C" int halo_attn_prefill_h128_gqa2w_i8kv(const HaloArgs* a, hipStream_t s) {
+    return prefill_launch_h128_gqa2w<0, O_KVI8>(a, s);
 }
 
 /* Prefill RadArgs wrappers. Absent descales mean 1.0 (fill_paged leaves them null). */
@@ -66,6 +69,13 @@ extern "C" int halo_rad_attn_prefill_h128_gqa2w_bf16(const RadArgs* a, RadStream
     int rc = fill_paged(a, &r, B_HEAD_DIM);
     if (rc != RAD_OK) return rc;
     return halo_attn_prefill_h128_gqa2w_bf16kv(&r, (hipStream_t)s);
+}
+/* The int8 cache: a token's row is 2 * 128 + 4 bytes. */
+extern "C" int halo_rad_attn_prefill_h128_gqa2w_i8(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    int rc = fill_paged_row(a, &r, B_HEAD_DIM, 2 * B_HEAD_DIM + 4);
+    if (rc != RAD_OK) return rc;
+    return halo_attn_prefill_h128_gqa2w_i8kv(&r, (hipStream_t)s);
 }
 
 // ============================================================== the split-KV decode leg
@@ -91,6 +101,10 @@ extern "C" int halo_attn_decode_h128_gqa2w_fp8kv(const HaloArgs* a, hipStream_t 
 extern "C" int halo_attn_decode_h128_gqa2w_bf16kv(const HaloArgs* a, hipStream_t s) {
     return decode_launch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1, 1>(a, s);
 }
+// The int8 cache: K is widened from the paged cache a fragment at a time.
+extern "C" int halo_attn_decode_h128_gqa2w_i8kv(const HaloArgs* a, hipStream_t s) {
+    return decode_launch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT | O_KVI8, 0, 1>(a, s);
+}
 
 /* ---- the plugin ABI entry points of the decode band */
 
@@ -108,4 +122,13 @@ extern "C" int halo_rad_attn_decode_h128_gqa2w_bf16(const RadArgs* a, RadStream 
     int rc = decode_common<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, &r);
     if (rc != RAD_OK) return rc;
     return halo_attn_decode_h128_gqa2w_bf16kv(&r, (hipStream_t)s);
+}
+extern "C" int64_t halo_rad_attn_decode_h128_gqa2w_i8_scratch(const RadArgs* a) {
+    return decode_scratch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, 2 * B_HEAD_DIM + 4);
+}
+extern "C" int halo_rad_attn_decode_h128_gqa2w_i8(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    int rc = decode_common<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, &r, 2 * B_HEAD_DIM + 4);
+    if (rc != RAD_OK) return rc;
+    return halo_attn_decode_h128_gqa2w_i8kv(&r, (hipStream_t)s);
 }

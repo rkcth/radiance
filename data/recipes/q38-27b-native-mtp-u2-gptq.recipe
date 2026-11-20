@@ -1,0 +1,12 @@
+# Optional companion to the dense Qwen3.8-27B IQ4R-S-V4 recipe, with a GPTQ-calibrated native U2 draft head.
+# Capture the MTP layer input using --calib-corpus with --calib-layers 64:65; this overlay consumes
+# gram.r0.mtp.draft_head.bin through MTP_CALIB. The block-64 linears remain RTN W8A8; only the U2 head
+# uses the captured MTP activations. The target trunk and vocabulary-weighted output head stay
+# governed by their separate recipe.
+blk.64.attn_qg.weight      rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.attn_k.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.attn_v.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.attn_output.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.ffn_gate_up.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128
+mtp.draft_head.weight      gptq codes=u2 zero=u8 group=128 scale=f16 damp=0.01 calib=$MTP_CALIB

@@ -20,6 +20,7 @@
 //
 #include "halo.h"
 #include "halo_args.h"
+#include "halo_chain.h"
 #include "halo_emit.h"
 #include "halo_common.h"
 #include "halo_fp8_wmma.h"   // halo_fp8::cvt_pk_fp8_f32 (no fp8-conversion-insts on gfx1151)
@@ -64,20 +65,23 @@ struct QkKvStore {
 /* The cache forms KV selects. The two streamed forms are the same store into two planes, E4M3
  * and bf16. */
 enum { QK_KV_NONE = 0, QK_KV_FP8 = 1, QK_KV_BF16 = 2, QK_KV_F8V4 = 3, QK_KV_K6V4 = 4,
-       QK_KV_STREAMED = 5, QK_KV_STREAMED_BF16 = 6 };
+       QK_KV_STREAMED = 5, QK_KV_STREAMED_BF16 = 6, QK_KV_I8 = 7, QK_KV_STREAMED_I8 = 8 };
 
 /* KV folds kv_store in: a k head's block, holding the token's rotated k one element per lane, also
  * writes that element and the head's v element into the cache at the token's slot, as E4M3 with
  * kv_store_fp8's arithmetic or as bf16 like kv_store_bf16 (see the store at the end). */
+//
+// The body is a function so the chained form (halo_chain.h, libr4d's) can bracket it: its blocks
+// return early (a padding row's), and every block must reach halo_chain_done once.
+#define HALO_QK_NORM_ROPE_GATE_PARAMS                                                            \
+    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,                \
+    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,                           \
+    __hip_bfloat16* __restrict__ GO, const void* __restrict__ WQ,                               \
+    const void* __restrict__ WK, const void* __restrict__ CS, const void* __restrict__ POS,     \
+    long cs_rows, int nq, int nkv, int rot, float eps, float wadd, int qg_pitch,                \
+    int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs
 template <int HD, int KV = QK_KV_NONE>
-__global__ __launch_bounds__(256) void halo_qk_norm_rope_gate_kernel(
-    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
-    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
-    __hip_bfloat16* __restrict__ GO,
-    const void* __restrict__ WQ, const void* __restrict__ WK,
-    const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
-    int nq, int nkv, int rot, float eps, float wadd,
-    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
+__device__ __forceinline__ void halo_qk_norm_rope_gate_body(HALO_QK_NORM_ROPE_GATE_PARAMS) {
   constexpr int THR = 256;
   __shared__ float lds[THR / 32];
   const int tok = blockIdx.x, h = blockIdx.y;
@@ -159,7 +163,60 @@ __global__ __launch_bounds__(256) void halo_qk_norm_rope_gate_kernel(
   // element a lane gives the same byte. The bf16 form stores the values as kv_store_bf16 does.
   // Layout [n_blocks, kv_heads, block_size, 2*head_dim], k then v; a negative or out-of-range slot
   // stores nothing.
-  if constexpr (KV != QK_KV_NONE) {
+  if constexpr (KV == QK_KV_I8 || KV == QK_KV_STREAMED_I8) {
+    // The int8 cache (kv_store_i8's bytes): the head's k and v each as int8 codes against one f16
+    // scale, the head's absmax / 127, taken over the block through LDS. `isk` is uniform over the
+    // block, so every thread of a k head's block meets the barrier.
+    if (isk) {
+      __shared__ float s_m[2][THR / 32];
+      const bool in = t < HD;
+      const float kf = in ? __bfloat162float(__float2bfloat16(res)) : 0.0f;
+      const float vf =
+          in ? __bfloat162float(kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t]) : 0.0f;
+      float km = halo_wave_max(fabsf(kf)), vm = halo_wave_max(fabsf(vf));
+      if ((t & 31) == 0) { s_m[0][t >> 5] = km; s_m[1][t >> 5] = vm; }
+      __syncthreads();
+      km = 0.0f; vm = 0.0f;
+#pragma unroll
+      for (int wv = 0; wv < THR / 32; ++wv) {
+        km = fmaxf(km, s_m[0][wv]);
+        vm = fmaxf(vm, s_m[1][wv]);
+      }
+      const int32_t sl = kvs.slot[tok];
+      constexpr bool STREAMED = KV == QK_KV_STREAMED_I8;
+      const uint32_t id_space = (uint32_t)(STREAMED ? kvs.blocks : kvs.n_blocks);
+      if (in && sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < id_space) {
+        const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
+        const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
+        const size_t rowb = (size_t)(2 * HD + 4);
+        const __fp16 k16 = (__fp16)fminf(km / 127.0f, 515.0f);
+        const __fp16 v16 = (__fp16)fminf(vm / 127.0f, 515.0f);
+        const float ksc = (float)k16, vsc = (float)v16;
+        const float kr = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
+        const float vr = vsc > 0.0f ? rintf(vf / vsc) : 0.0f;
+        const unsigned char kc = (unsigned char)(signed char)(int)fminf(fmaxf(kr, -127.0f), 127.0f);
+        const unsigned char vc = (unsigned char)(signed char)(int)fminf(fmaxf(vr, -127.0f), 127.0f);
+        auto put = [&](unsigned char* c) {
+          c[t]      = kc;
+          c[HD + t] = vc;
+          if (t == 0) {
+            *(uint16_t*)(c + 2 * HD)     = __builtin_bit_cast(uint16_t, k16);
+            *(uint16_t*)(c + 2 * HD + 2) = __builtin_bit_cast(uint16_t, v16);
+          }
+        };
+        if constexpr (STREAMED) {
+          const size_t o = ((size_t)lh * kvs.block_size + off) * rowb;
+          const size_t brow = (size_t)nkv * kvs.block_size * rowb;
+          put((unsigned char*)kvs.host + (size_t)blk * brow + o);
+          const int32_t rs = kvs.res[blk];
+          if (rs >= 0 && (uint32_t)rs < (uint32_t)kvs.n_blocks)
+            put((unsigned char*)kvs.cache + (size_t)rs * brow + o);
+        } else {
+          put((unsigned char*)kvs.cache + (((size_t)blk * nkv + lh) * kvs.block_size + off) * rowb);
+        }
+      }
+    }
+  } else if constexpr (KV != QK_KV_NONE) {
     if (isk && t < HD) {
       const int32_t sl = kvs.slot[tok];
       /* A streamed group's cache is the ring and its truth is the host mirror: the token goes to
@@ -277,6 +334,18 @@ __global__ __launch_bounds__(256) void halo_qk_norm_rope_gate_kernel(
   }
 }
 
+// The kernel around the body: CH `r4dchain` is the chained form (halo_chain.h), HaloUnchained the
+// plain one, which is the kernel this was before the chained form existed.
+template <int HD, int KV, class CH>
+__global__ __launch_bounds__(256)
+void halo_qk_norm_rope_gate_kernel(HALO_QK_NORM_ROPE_GATE_PARAMS) {
+  if (CH::on) halo_chain_wait();
+  halo_qk_norm_rope_gate_body<HD, KV>(QG, K, QO, KO, GO, WQ, WK, CS, POS, cs_rows, nq, nkv, rot,
+                                      eps, wadd, qg_pitch, k_pitch, cs_f32, pos_i64, w_f32, kvs);
+  if (CH::on) halo_chain_done();
+}
+#undef HALO_QK_NORM_ROPE_GATE_PARAMS
+
 // ============================================================ the cos/sin table
 //
 // The fused kernel reads a precomputed table instead of theta, and this fills it: one launch per
@@ -291,9 +360,10 @@ __global__ __launch_bounds__(256) void halo_qk_norm_rope_gate_kernel(
 // bit-identical: `1.0f / powf(theta, 2i/den)` with `den` the ladder's width (`rot` for `rotary`,
 // `head_dim` for `head`), the position divided by `rscale` in f32, `sincosf`, and the products
 // consumed in f32 by the caller. Changing any of it changes the model's output.
-__global__ __launch_bounds__(64) void halo_qk_rope_table_kernel(
-    const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, int den, float theta,
-    float rscale, int cs_f32, int pos_i64, RadYarn yarn) {
+#define HALO_QK_ROPE_TABLE_PARAMS                                                                \
+    const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, int den,           \
+    float theta, float rscale, int cs_f32, int pos_i64, RadYarn yarn
+__device__ __forceinline__ void halo_qk_rope_table_body(HALO_QK_ROPE_TABLE_PARAMS) {
   const int m = blockIdx.x;
   const long pp = pos_i64 ? ((const long*)POS)[m] : (long)((const int*)POS)[m];
   // A padded row addresses no table row, and a position at or past the table's height writes
@@ -317,6 +387,16 @@ __global__ __launch_bounds__(64) void halo_qk_rope_table_kernel(
     }
   }
 }
+
+// The kernel around the body: CH `r4dchain` is the chained form (halo_chain.h).
+template <class CH>
+__global__ __launch_bounds__(64)
+void halo_qk_rope_table_kernel(HALO_QK_ROPE_TABLE_PARAMS) {
+  if (CH::on) halo_chain_wait();
+  halo_qk_rope_table_body(POS, CS, rows, rot, den, theta, rscale, cs_f32, pos_i64, yarn);
+  if (CH::on) halo_chain_done();
+}
+#undef HALO_QK_ROPE_TABLE_PARAMS
 
 // The two launches, as the plugin ABI's RadLaunchFn. See the note at the head of
 // halo_quant_act_i8.hip on the argument list and status return.
@@ -379,12 +459,15 @@ static int qk_body(const RadArgs* args, RadStream stream, const QkKvStore& kvs) 
   const int nh = (int)(nq + nkv);
   // One block per (token, head), 256 threads, one element per lane. The width is fixed at 256, not
   // fitted to the head count, so the sum of squares matches halo_rmsnorm_bf16 (see the kernel).
-#define HALO_QKG_L(H) emit_rc = HALO_EMIT(stream, (halo_qk_norm_rope_gate_kernel<H, KVF>), \
+  const bool chain = halo_geti_or(args, "chain", 0) != 0 && M <= 64;   // the chained form (halo_chain.h), at decode heights
+#define HALO_QKG_E(H, CH_) emit_rc = HALO_EMIT(stream, (halo_qk_norm_rope_gate_kernel<H, KVF, CH_>), \
     dim3((int)M, nh), dim3(256), 0, (const __hip_bfloat16*)halo_p(qg), \
     (const __hip_bfloat16*)halo_p(k), (__hip_bfloat16*)halo_wp(qo), (__hip_bfloat16*)halo_wp(ko), \
     (__hip_bfloat16*)halo_wp(go), halo_p(wq), halo_p(wk), halo_p(cs), halo_p(po), (long)cs_rows, \
     (int)nq, (int)nkv, (int)rot, eps, wadd, (int)qg_pitch, (int)k_pitch, cs_f32, pos_i64, w_f32, \
     kvs)
+#define HALO_QKG_L(H) \
+    do { if (chain) HALO_QKG_E(H, r4dchain); else HALO_QKG_E(H, HaloUnchained); } while (0)
   int emit_rc = RAD_OK;
   switch (hd) {
     case 64:  HALO_QKG_L(64); break;
@@ -392,6 +475,7 @@ static int qk_body(const RadArgs* args, RadStream stream, const QkKvStore& kvs) 
     default:  HALO_QKG_L(256); break;
   }
 #undef HALO_QKG_L
+#undef HALO_QKG_E
   return emit_rc;
 }
 
@@ -413,15 +497,17 @@ extern "C" int halo_rad_qk_norm_rope_gate_kv_store(const RadArgs* args, RadStrea
   const char* kvd = halo_gets(args, "kv_dtype");
   const uint32_t want = kvd ? rad_dtype_parse(kvd) : (uint32_t)RAD_DT_INVALID;
   if (v->dtype != RAD_BF16 || sm->dtype != RAD_I32 || kv->dtype != want ||
-      (kv->dtype != RAD_F8E4M3 && kv->dtype != RAD_BF16))
+      (kv->dtype != RAD_F8E4M3 && kv->dtype != RAD_BF16 && kv->dtype != RAD_I8))
     return HALO_NO(RAD_E_DTYPE);
   if (!halo_contig(sm) || !halo_contig(kv)) return HALO_NO(RAD_E_STRIDE);
+  const bool i8 = kv->dtype == RAD_I8;   /* the int8 cache: a row of 2 * HD + 4 bytes */
 
   const long long hd  = halo_geti_or(args, "head_dim", 0);
   const long long nkv = halo_geti_or(args, "n_head_kv", 0);
   const long long bs  = halo_geti_or(args, "block_size", 0);
   if (hd <= 0 || nkv <= 0 || bs <= 0) return HALO_NO(RAD_E_SHAPE);
-  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != 2 * hd)
+  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs ||
+      kv->shape[3] != (i8 ? 2 * hd + 4 : 2 * hd))
     return HALO_NO(RAD_E_SHAPE);
   const long long M = qg ? qg->shape[0] : k->shape[0];
   long long Mv = 0;
@@ -442,6 +528,7 @@ extern "C" int halo_rad_qk_norm_rope_gate_kv_store(const RadArgs* args, RadStrea
   kvs.n_blocks   = (int)kv->shape[0];
   kvs.k_inv      = 1.0f / (float)ks;
   kvs.v_inv      = 1.0f / (float)vs;
+  if (i8) return qk_body<QK_KV_I8>(args, stream, kvs);
   return kv->dtype == RAD_BF16 ? qk_body<QK_KV_BF16>(args, stream, kvs)
                                : qk_body<QK_KV_FP8>(args, stream, kvs);
 }
@@ -463,18 +550,20 @@ extern "C" int halo_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args,
   const char* kvd = halo_gets(args, "kv_dtype");
   const uint32_t want = kvd ? rad_dtype_parse(kvd) : (uint32_t)RAD_DT_INVALID;
   if (v->dtype != RAD_BF16 || sm->dtype != RAD_I32 || kv->dtype != want ||
-      (kv->dtype != RAD_F8E4M3 && kv->dtype != RAD_BF16) || res->dtype != RAD_I32 ||
-      ho->dtype != RAD_U8)
+      (kv->dtype != RAD_F8E4M3 && kv->dtype != RAD_BF16 && kv->dtype != RAD_I8) ||
+      res->dtype != RAD_I32 || ho->dtype != RAD_U8)
     return HALO_NO(RAD_E_DTYPE);
   if (!halo_contig(sm) || !halo_contig(kv) || !halo_contig(res) || !halo_contig(ho) ||
       ho->rank != 2)
     return HALO_NO(RAD_E_STRIDE);
+  const bool i8 = kv->dtype == RAD_I8;   /* the int8 cache: a row of 2 * HD + 4 bytes */
 
   const long long hd  = halo_geti_or(args, "head_dim", 0);
   const long long nkv = halo_geti_or(args, "n_head_kv", 0);
   const long long bs  = halo_geti_or(args, "block_size", 0);
   if (hd <= 0 || nkv <= 0 || bs <= 0) return HALO_NO(RAD_E_SHAPE);
-  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != 2 * hd)
+  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs ||
+      kv->shape[3] != (i8 ? 2 * hd + 4 : 2 * hd))
     return HALO_NO(RAD_E_SHAPE);
   const long long M = qg ? qg->shape[0] : k->shape[0];
   long long Mv = 0;
@@ -484,7 +573,8 @@ extern "C" int halo_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args,
 
   /* One block of one layer: the mirror's row pitch and the ring's slot pitch are the same bytes,
    * so the store addresses both with one row arithmetic. */
-  const long long row    = nkv * bs * 2 * hd * (kv->dtype == RAD_BF16 ? 2 : 1);
+  const long long row    = i8 ? nkv * bs * (2 * hd + 4)
+                               : nkv * bs * 2 * hd * (kv->dtype == RAD_BF16 ? 2 : 1);
   const long long blocks = ho->shape[0], slots = kv->shape[0];
   if (blocks <= 0 || slots <= 0 || row <= 0) return HALO_NO(RAD_E_SHAPE);
   if (ho->shape[1] != row || ho->stride[0] != row) return HALO_NO(RAD_E_STRIDE);
@@ -506,6 +596,7 @@ extern "C" int halo_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args,
   kvs.res        = (const int32_t*)halo_p(res);
   kvs.host       = halo_wp(ho);
   kvs.blocks     = (int)blocks;
+  if (i8) return qk_body<QK_KV_STREAMED_I8>(args, stream, kvs);
   return kv->dtype == RAD_BF16 ? qk_body<QK_KV_STREAMED_BF16>(args, stream, kvs)
                                : qk_body<QK_KV_STREAMED>(args, stream, kvs);
 }
@@ -595,7 +686,12 @@ extern "C" int halo_rad_rope_table(const RadArgs* args, RadStream stream) {
   const float rscale = (float)halo_getf(args, "scale", 1.0);
   const RadYarn yarn = rad_yarn_args(args);
   if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return HALO_NO(RAD_E_INVAL);
-  return HALO_EMIT(stream, halo_qk_rope_table_kernel, dim3((int)M), dim3(64), 0,
-                  halo_p(po), halo_wp(cs), (long)(halo_numel(cs) / rot), (int)rot, (int)den, theta,
-                  rscale, cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0, yarn);
+#define HALO_RT(CH_)                                                                             \
+  HALO_EMIT(stream, halo_qk_rope_table_kernel<CH_>, dim3((int)M), dim3(64), 0,                   \
+            halo_p(po), halo_wp(cs), (long)(halo_numel(cs) / rot), (int)rot, (int)den, theta,     \
+            rscale, cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0, yarn)
+  const int rc = halo_geti_or(args, "chain", 0) != 0 && M <= 64 ? HALO_RT(r4dchain)
+                                                                : HALO_RT(HaloUnchained);
+#undef HALO_RT
+  return rc;
 }

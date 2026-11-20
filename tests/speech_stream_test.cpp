@@ -112,7 +112,7 @@ struct Stream {
     std::thread route;
     Stream() {
         f.reset(new Fixture(Fixture::Tweak{ [this](ServerOptions& o, Deps& d) {
-            d.audio = { &gen, d.tok, {} };
+            d.audio = &gen;
             o.audio_model = true;
         } }));
         const SocketHandler* h = f->srv->router().socket_for("/v1/audio/speech/stream");

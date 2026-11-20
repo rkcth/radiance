@@ -276,9 +276,9 @@ TEST(the_coupling_uniform_is_the_specified_53_bit_draw) {
  * shift every later operand of a plane the host writes and the device reads. */
 TEST(the_coupling_wire_rows_keep_their_layout) {
     CHECK_EQ(sizeof(RadMtpCoupleDraw), (size_t)32);
-    CHECK_EQ(sizeof(RadMtpCoupleState), (size_t)152);
+    CHECK_EQ(sizeof(RadMtpCoupleState), (size_t)168);
     CHECK_EQ(RAD_MTP_COUPLE_DRAW_WORDS, (size_t)8);
-    CHECK_EQ(RAD_MTP_COUPLE_STATE_WORDS, (size_t)38);
+    CHECK_EQ(RAD_MTP_COUPLE_STATE_WORDS, (size_t)42);
     CHECK_EQ(offsetof(RadMtpCoupleState, q) % 8, (size_t)0);
 }
 

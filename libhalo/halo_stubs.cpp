@@ -14,93 +14,209 @@
 extern "C" __attribute__((weak)) void halo_gemm_fp8a8_pin_nt(int) {}
 extern "C" __attribute__((weak)) void halo_mla_matrix_stats(unsigned long long*) {}
 extern "C" __attribute__((weak)) void halo_qsa_select_pin_form(int) {}
+__attribute__((weak)) int halo_rad_attn_anchor_window_h128_gqa1_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h128_gqa1_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa1_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa1_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa2_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa2_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa4_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa4_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa8_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h256_gqa8_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa1_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa1_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa2_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa2_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa4_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa4_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa8_bf16kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_anchor_window_h512_gqa8_i8kv(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_ghq_h256_gqa12_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_ghq_h256_gqa12_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_ghq_h256_gqa6_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_ghq_h256_gqa6_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_ghq_h256_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa12_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa12_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa12_fp8v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa12_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa12_k6v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa6_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa6_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa6_fp8v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa6_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa6_k6v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_gq_h256_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h128_gqa16_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h128_gqa16_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa16_i8_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa16_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_decode_h128_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h128_gqa1_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h128_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa1_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa1_scratch(const RadArgs*) { return 0; }
 __attribute__((weak)) int halo_rad_attn_decode_h128_gqa2_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h128_gqa2_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h128_gqa2_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa2_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa2_scratch(const RadArgs*) { return 0; }
+__attribute__((weak)) int halo_rad_attn_decode_h128_gqa7_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h128_gqa7_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa7_i8_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa7_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_decode_h128_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h128_gqa8_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h128_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa8_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h128_gqa8_scratch(const RadArgs*) { return 0; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa12_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa12_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa12_fp8v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa12_fp8v4_scratch(const RadArgs*) { return 0; }
+__attribute__((weak)) int halo_rad_attn_decode_h256_gqa12_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa12_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa12_k6v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa12_k6v4_scratch(const RadArgs*) { return 0; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa12_scratch(const RadArgs*) { return 0; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa4_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h256_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa4_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa4_scratch(const RadArgs*) { return 0; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa6_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa6_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa6_fp8v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa6_fp8v4_scratch(const RadArgs*) { return 0; }
+__attribute__((weak)) int halo_rad_attn_decode_h256_gqa6_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa6_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa6_k6v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa6_k6v4_scratch(const RadArgs*) { return 0; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa6_scratch(const RadArgs*) { return 0; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_decode_h256_gqa8_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_decode_h256_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa8_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_decode_h256_gqa8_scratch(const RadArgs*) { return 0; }
+__attribute__((weak)) int halo_rad_attn_prefill_h128_gqa16_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h128_gqa16_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa16_i8_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa16_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h128_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h128_gqa1_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h128_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa1_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa1_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h128_gqa2_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h128_gqa2_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h128_gqa2_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa2_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa2_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int halo_rad_attn_prefill_h128_gqa7_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h128_gqa7_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa7_i8_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa7_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h128_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h128_gqa8_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h128_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa8_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h128_gqa8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa12_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa12_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa12_fp8v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa12_fp8v4_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int halo_rad_attn_prefill_h256_gqa12_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa12_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa12_k6v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa12_k6v4_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa12_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa4_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h256_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa4_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa4_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa6_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa6_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa6_fp8v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa6_fp8v4_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int halo_rad_attn_prefill_h256_gqa6_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa6_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa6_k6v4(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa6_k6v4_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa6_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h256_gqa8_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h256_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa8_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h256_gqa8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int halo_rad_attn_prefill_h64_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_prefill_h64_gqa4_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_prefill_h64_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int64_t halo_rad_attn_prefill_h64_gqa4_i8_scratch(const RadArgs*) { return -1; }
 __attribute__((weak)) int64_t halo_rad_attn_prefill_h64_gqa4_scratch(const RadArgs*) { return -1; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa2_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa2_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_ahead_h256_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h128_gqa16_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h128_gqa16_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h128_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h128_gqa1_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h128_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h128_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h128_gqa4_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h128_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa1_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h256_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa2_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa2_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h256_gqa2_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa4_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h256_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h256_gqa8_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h256_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h512_gqa16_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h512_gqa16_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa1_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h512_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa2_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa2_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h512_gqa2_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa4_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h512_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 __attribute__((weak)) int halo_rad_attn_window_h512_gqa8_fp8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_h512_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_sink_h128_gqa16_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_sink_h128_gqa16_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_sink_h128_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_sink_h128_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa2_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa2_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h256_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa1_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa1_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa2_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa2_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa4_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa4_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa8_bf16(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+__attribute__((weak)) int halo_rad_attn_window_tree_h512_gqa8_i8(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 
 /* The hooks this file still stubs, space separated, empty when the port is complete.
  *
@@ -110,4 +226,4 @@ __attribute__((weak)) int halo_rad_attn_window_h512_gqa8_fp8(const RadArgs*, Rad
  * list is the only place that knows which hooks are still stubs, and it is generated from the same
  * scan as the bodies above, so a unit that lands a real hook drops its name here on the next run.
  * halo_selftest reads it through libhalo/halo_selftest.cpp's `hook()`. */
-extern "C" const char* halo_stub_hooks(void) { return "halo_gemm_fp8a8_pin_nt halo_mla_matrix_stats halo_qsa_select_pin_form halo_rad_attn_decode_gq_h256_gqa12_bf16 halo_rad_attn_decode_gq_h256_gqa12_fp8 halo_rad_attn_decode_gq_h256_gqa12_fp8v4 halo_rad_attn_decode_gq_h256_gqa12_k6v4 halo_rad_attn_decode_gq_h256_gqa6_bf16 halo_rad_attn_decode_gq_h256_gqa6_fp8 halo_rad_attn_decode_gq_h256_gqa6_fp8v4 halo_rad_attn_decode_gq_h256_gqa6_k6v4 halo_rad_attn_decode_h128_gqa1_bf16 halo_rad_attn_decode_h128_gqa1_fp8 halo_rad_attn_decode_h128_gqa1_scratch halo_rad_attn_decode_h128_gqa2_bf16 halo_rad_attn_decode_h128_gqa2_fp8 halo_rad_attn_decode_h128_gqa2_scratch halo_rad_attn_decode_h128_gqa8_bf16 halo_rad_attn_decode_h128_gqa8_fp8 halo_rad_attn_decode_h128_gqa8_scratch halo_rad_attn_decode_h256_gqa12_bf16 halo_rad_attn_decode_h256_gqa12_fp8 halo_rad_attn_decode_h256_gqa12_fp8v4 halo_rad_attn_decode_h256_gqa12_fp8v4_scratch halo_rad_attn_decode_h256_gqa12_k6v4 halo_rad_attn_decode_h256_gqa12_k6v4_scratch halo_rad_attn_decode_h256_gqa12_scratch halo_rad_attn_decode_h256_gqa4_bf16 halo_rad_attn_decode_h256_gqa4_fp8 halo_rad_attn_decode_h256_gqa4_scratch halo_rad_attn_decode_h256_gqa6_bf16 halo_rad_attn_decode_h256_gqa6_fp8 halo_rad_attn_decode_h256_gqa6_fp8v4 halo_rad_attn_decode_h256_gqa6_fp8v4_scratch halo_rad_attn_decode_h256_gqa6_k6v4 halo_rad_attn_decode_h256_gqa6_k6v4_scratch halo_rad_attn_decode_h256_gqa6_scratch halo_rad_attn_decode_h256_gqa8_bf16 halo_rad_attn_decode_h256_gqa8_fp8 halo_rad_attn_decode_h256_gqa8_scratch halo_rad_attn_prefill_h128_gqa1_bf16 halo_rad_attn_prefill_h128_gqa1_fp8 halo_rad_attn_prefill_h128_gqa1_scratch halo_rad_attn_prefill_h128_gqa2_bf16 halo_rad_attn_prefill_h128_gqa2_fp8 halo_rad_attn_prefill_h128_gqa2_scratch halo_rad_attn_prefill_h128_gqa8_bf16 halo_rad_attn_prefill_h128_gqa8_fp8 halo_rad_attn_prefill_h128_gqa8_scratch halo_rad_attn_prefill_h256_gqa12_bf16 halo_rad_attn_prefill_h256_gqa12_fp8 halo_rad_attn_prefill_h256_gqa12_fp8v4 halo_rad_attn_prefill_h256_gqa12_fp8v4_scratch halo_rad_attn_prefill_h256_gqa12_k6v4 halo_rad_attn_prefill_h256_gqa12_k6v4_scratch halo_rad_attn_prefill_h256_gqa12_scratch halo_rad_attn_prefill_h256_gqa4_bf16 halo_rad_attn_prefill_h256_gqa4_fp8 halo_rad_attn_prefill_h256_gqa4_scratch halo_rad_attn_prefill_h256_gqa6_bf16 halo_rad_attn_prefill_h256_gqa6_fp8 halo_rad_attn_prefill_h256_gqa6_fp8v4 halo_rad_attn_prefill_h256_gqa6_fp8v4_scratch halo_rad_attn_prefill_h256_gqa6_k6v4 halo_rad_attn_prefill_h256_gqa6_k6v4_scratch halo_rad_attn_prefill_h256_gqa6_scratch halo_rad_attn_prefill_h256_gqa8_bf16 halo_rad_attn_prefill_h256_gqa8_fp8 halo_rad_attn_prefill_h256_gqa8_scratch halo_rad_attn_prefill_h64_gqa4_bf16 halo_rad_attn_prefill_h64_gqa4_fp8 halo_rad_attn_prefill_h64_gqa4_scratch halo_rad_attn_window_h128_gqa1_bf16 halo_rad_attn_window_h128_gqa1_fp8 halo_rad_attn_window_h256_gqa1_bf16 halo_rad_attn_window_h256_gqa1_fp8 halo_rad_attn_window_h256_gqa2_bf16 halo_rad_attn_window_h256_gqa2_fp8 halo_rad_attn_window_h256_gqa4_bf16 halo_rad_attn_window_h256_gqa4_fp8 halo_rad_attn_window_h256_gqa8_bf16 halo_rad_attn_window_h256_gqa8_fp8 halo_rad_attn_window_h512_gqa1_bf16 halo_rad_attn_window_h512_gqa1_fp8 halo_rad_attn_window_h512_gqa2_bf16 halo_rad_attn_window_h512_gqa2_fp8 halo_rad_attn_window_h512_gqa4_bf16 halo_rad_attn_window_h512_gqa4_fp8 halo_rad_attn_window_h512_gqa8_bf16 halo_rad_attn_window_h512_gqa8_fp8"; }
+extern "C" const char* halo_stub_hooks(void) { return "halo_gemm_fp8a8_pin_nt halo_mla_matrix_stats halo_qsa_select_pin_form halo_rad_attn_anchor_window_h128_gqa1_bf16kv halo_rad_attn_anchor_window_h128_gqa1_i8kv halo_rad_attn_anchor_window_h256_gqa1_bf16kv halo_rad_attn_anchor_window_h256_gqa1_i8kv halo_rad_attn_anchor_window_h256_gqa2_bf16kv halo_rad_attn_anchor_window_h256_gqa2_i8kv halo_rad_attn_anchor_window_h256_gqa4_bf16kv halo_rad_attn_anchor_window_h256_gqa4_i8kv halo_rad_attn_anchor_window_h256_gqa8_bf16kv halo_rad_attn_anchor_window_h256_gqa8_i8kv halo_rad_attn_anchor_window_h512_gqa1_bf16kv halo_rad_attn_anchor_window_h512_gqa1_i8kv halo_rad_attn_anchor_window_h512_gqa2_bf16kv halo_rad_attn_anchor_window_h512_gqa2_i8kv halo_rad_attn_anchor_window_h512_gqa4_bf16kv halo_rad_attn_anchor_window_h512_gqa4_i8kv halo_rad_attn_anchor_window_h512_gqa8_bf16kv halo_rad_attn_anchor_window_h512_gqa8_i8kv halo_rad_attn_decode_ghq_h256_gqa12_bf16 halo_rad_attn_decode_ghq_h256_gqa12_i8 halo_rad_attn_decode_ghq_h256_gqa6_bf16 halo_rad_attn_decode_ghq_h256_gqa6_i8 halo_rad_attn_decode_ghq_h256_gqa8_i8 halo_rad_attn_decode_gq_h256_gqa12_bf16 halo_rad_attn_decode_gq_h256_gqa12_fp8 halo_rad_attn_decode_gq_h256_gqa12_fp8v4 halo_rad_attn_decode_gq_h256_gqa12_i8 halo_rad_attn_decode_gq_h256_gqa12_k6v4 halo_rad_attn_decode_gq_h256_gqa6_bf16 halo_rad_attn_decode_gq_h256_gqa6_fp8 halo_rad_attn_decode_gq_h256_gqa6_fp8v4 halo_rad_attn_decode_gq_h256_gqa6_i8 halo_rad_attn_decode_gq_h256_gqa6_k6v4 halo_rad_attn_decode_gq_h256_gqa8_i8 halo_rad_attn_decode_h128_gqa16_bf16 halo_rad_attn_decode_h128_gqa16_i8 halo_rad_attn_decode_h128_gqa16_i8_scratch halo_rad_attn_decode_h128_gqa16_scratch halo_rad_attn_decode_h128_gqa1_bf16 halo_rad_attn_decode_h128_gqa1_fp8 halo_rad_attn_decode_h128_gqa1_i8 halo_rad_attn_decode_h128_gqa1_i8_scratch halo_rad_attn_decode_h128_gqa1_scratch halo_rad_attn_decode_h128_gqa2_bf16 halo_rad_attn_decode_h128_gqa2_fp8 halo_rad_attn_decode_h128_gqa2_i8 halo_rad_attn_decode_h128_gqa2_i8_scratch halo_rad_attn_decode_h128_gqa2_scratch halo_rad_attn_decode_h128_gqa7_bf16 halo_rad_attn_decode_h128_gqa7_i8 halo_rad_attn_decode_h128_gqa7_i8_scratch halo_rad_attn_decode_h128_gqa7_scratch halo_rad_attn_decode_h128_gqa8_bf16 halo_rad_attn_decode_h128_gqa8_fp8 halo_rad_attn_decode_h128_gqa8_i8 halo_rad_attn_decode_h128_gqa8_i8_scratch halo_rad_attn_decode_h128_gqa8_scratch halo_rad_attn_decode_h256_gqa12_bf16 halo_rad_attn_decode_h256_gqa12_fp8 halo_rad_attn_decode_h256_gqa12_fp8v4 halo_rad_attn_decode_h256_gqa12_fp8v4_scratch halo_rad_attn_decode_h256_gqa12_i8 halo_rad_attn_decode_h256_gqa12_i8_scratch halo_rad_attn_decode_h256_gqa12_k6v4 halo_rad_attn_decode_h256_gqa12_k6v4_scratch halo_rad_attn_decode_h256_gqa12_scratch halo_rad_attn_decode_h256_gqa4_bf16 halo_rad_attn_decode_h256_gqa4_fp8 halo_rad_attn_decode_h256_gqa4_i8 halo_rad_attn_decode_h256_gqa4_i8_scratch halo_rad_attn_decode_h256_gqa4_scratch halo_rad_attn_decode_h256_gqa6_bf16 halo_rad_attn_decode_h256_gqa6_fp8 halo_rad_attn_decode_h256_gqa6_fp8v4 halo_rad_attn_decode_h256_gqa6_fp8v4_scratch halo_rad_attn_decode_h256_gqa6_i8 halo_rad_attn_decode_h256_gqa6_i8_scratch halo_rad_attn_decode_h256_gqa6_k6v4 halo_rad_attn_decode_h256_gqa6_k6v4_scratch halo_rad_attn_decode_h256_gqa6_scratch halo_rad_attn_decode_h256_gqa8_bf16 halo_rad_attn_decode_h256_gqa8_fp8 halo_rad_attn_decode_h256_gqa8_i8 halo_rad_attn_decode_h256_gqa8_i8_scratch halo_rad_attn_decode_h256_gqa8_scratch halo_rad_attn_prefill_h128_gqa16_bf16 halo_rad_attn_prefill_h128_gqa16_i8 halo_rad_attn_prefill_h128_gqa16_i8_scratch halo_rad_attn_prefill_h128_gqa16_scratch halo_rad_attn_prefill_h128_gqa1_bf16 halo_rad_attn_prefill_h128_gqa1_fp8 halo_rad_attn_prefill_h128_gqa1_i8 halo_rad_attn_prefill_h128_gqa1_i8_scratch halo_rad_attn_prefill_h128_gqa1_scratch halo_rad_attn_prefill_h128_gqa2_bf16 halo_rad_attn_prefill_h128_gqa2_fp8 halo_rad_attn_prefill_h128_gqa2_i8 halo_rad_attn_prefill_h128_gqa2_i8_scratch halo_rad_attn_prefill_h128_gqa2_scratch halo_rad_attn_prefill_h128_gqa7_bf16 halo_rad_attn_prefill_h128_gqa7_i8 halo_rad_attn_prefill_h128_gqa7_i8_scratch halo_rad_attn_prefill_h128_gqa7_scratch halo_rad_attn_prefill_h128_gqa8_bf16 halo_rad_attn_prefill_h128_gqa8_fp8 halo_rad_attn_prefill_h128_gqa8_i8 halo_rad_attn_prefill_h128_gqa8_i8_scratch halo_rad_attn_prefill_h128_gqa8_scratch halo_rad_attn_prefill_h256_gqa12_bf16 halo_rad_attn_prefill_h256_gqa12_fp8 halo_rad_attn_prefill_h256_gqa12_fp8v4 halo_rad_attn_prefill_h256_gqa12_fp8v4_scratch halo_rad_attn_prefill_h256_gqa12_i8 halo_rad_attn_prefill_h256_gqa12_i8_scratch halo_rad_attn_prefill_h256_gqa12_k6v4 halo_rad_attn_prefill_h256_gqa12_k6v4_scratch halo_rad_attn_prefill_h256_gqa12_scratch halo_rad_attn_prefill_h256_gqa4_bf16 halo_rad_attn_prefill_h256_gqa4_fp8 halo_rad_attn_prefill_h256_gqa4_i8 halo_rad_attn_prefill_h256_gqa4_i8_scratch halo_rad_attn_prefill_h256_gqa4_scratch halo_rad_attn_prefill_h256_gqa6_bf16 halo_rad_attn_prefill_h256_gqa6_fp8 halo_rad_attn_prefill_h256_gqa6_fp8v4 halo_rad_attn_prefill_h256_gqa6_fp8v4_scratch halo_rad_attn_prefill_h256_gqa6_i8 halo_rad_attn_prefill_h256_gqa6_i8_scratch halo_rad_attn_prefill_h256_gqa6_k6v4 halo_rad_attn_prefill_h256_gqa6_k6v4_scratch halo_rad_attn_prefill_h256_gqa6_scratch halo_rad_attn_prefill_h256_gqa8_bf16 halo_rad_attn_prefill_h256_gqa8_fp8 halo_rad_attn_prefill_h256_gqa8_i8 halo_rad_attn_prefill_h256_gqa8_i8_scratch halo_rad_attn_prefill_h256_gqa8_scratch halo_rad_attn_prefill_h64_gqa4_bf16 halo_rad_attn_prefill_h64_gqa4_fp8 halo_rad_attn_prefill_h64_gqa4_i8 halo_rad_attn_prefill_h64_gqa4_i8_scratch halo_rad_attn_prefill_h64_gqa4_scratch halo_rad_attn_window_ahead_h256_gqa1_bf16 halo_rad_attn_window_ahead_h256_gqa1_i8 halo_rad_attn_window_ahead_h256_gqa2_bf16 halo_rad_attn_window_ahead_h256_gqa2_i8 halo_rad_attn_window_ahead_h256_gqa4_bf16 halo_rad_attn_window_ahead_h256_gqa4_i8 halo_rad_attn_window_ahead_h256_gqa8_bf16 halo_rad_attn_window_ahead_h256_gqa8_i8 halo_rad_attn_window_h128_gqa16_bf16 halo_rad_attn_window_h128_gqa16_i8 halo_rad_attn_window_h128_gqa1_bf16 halo_rad_attn_window_h128_gqa1_fp8 halo_rad_attn_window_h128_gqa1_i8 halo_rad_attn_window_h128_gqa4_bf16 halo_rad_attn_window_h128_gqa4_fp8 halo_rad_attn_window_h128_gqa4_i8 halo_rad_attn_window_h256_gqa1_bf16 halo_rad_attn_window_h256_gqa1_fp8 halo_rad_attn_window_h256_gqa1_i8 halo_rad_attn_window_h256_gqa2_bf16 halo_rad_attn_window_h256_gqa2_fp8 halo_rad_attn_window_h256_gqa2_i8 halo_rad_attn_window_h256_gqa4_bf16 halo_rad_attn_window_h256_gqa4_fp8 halo_rad_attn_window_h256_gqa4_i8 halo_rad_attn_window_h256_gqa8_bf16 halo_rad_attn_window_h256_gqa8_fp8 halo_rad_attn_window_h256_gqa8_i8 halo_rad_attn_window_h512_gqa16_bf16 halo_rad_attn_window_h512_gqa16_i8 halo_rad_attn_window_h512_gqa1_bf16 halo_rad_attn_window_h512_gqa1_fp8 halo_rad_attn_window_h512_gqa1_i8 halo_rad_attn_window_h512_gqa2_bf16 halo_rad_attn_window_h512_gqa2_fp8 halo_rad_attn_window_h512_gqa2_i8 halo_rad_attn_window_h512_gqa4_bf16 halo_rad_attn_window_h512_gqa4_fp8 halo_rad_attn_window_h512_gqa4_i8 halo_rad_attn_window_h512_gqa8_bf16 halo_rad_attn_window_h512_gqa8_fp8 halo_rad_attn_window_h512_gqa8_i8 halo_rad_attn_window_sink_h128_gqa16_bf16 halo_rad_attn_window_sink_h128_gqa16_i8 halo_rad_attn_window_sink_h128_gqa8_bf16 halo_rad_attn_window_sink_h128_gqa8_i8 halo_rad_attn_window_tree_h256_gqa1_bf16 halo_rad_attn_window_tree_h256_gqa1_i8 halo_rad_attn_window_tree_h256_gqa2_bf16 halo_rad_attn_window_tree_h256_gqa2_i8 halo_rad_attn_window_tree_h256_gqa4_bf16 halo_rad_attn_window_tree_h256_gqa4_i8 halo_rad_attn_window_tree_h256_gqa8_bf16 halo_rad_attn_window_tree_h256_gqa8_i8 halo_rad_attn_window_tree_h512_gqa1_bf16 halo_rad_attn_window_tree_h512_gqa1_i8 halo_rad_attn_window_tree_h512_gqa2_bf16 halo_rad_attn_window_tree_h512_gqa2_i8 halo_rad_attn_window_tree_h512_gqa4_bf16 halo_rad_attn_window_tree_h512_gqa4_i8 halo_rad_attn_window_tree_h512_gqa8_bf16 halo_rad_attn_window_tree_h512_gqa8_i8"; }

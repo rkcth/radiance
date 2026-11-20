@@ -1,0 +1,25 @@
+# lfm3-1.7b-iq8r.recipe -- LiquidAI LFM3-1.7B with a rotated int8 trunk, served by lfm3_bf16.
+#
+#   rad-convert <LiquidAI/LFM3-1.7B> -o lfm3-1.7b-iq8r.rad --recipe data/recipes/lfm3-1.7b-iq8r.recipe
+#
+# Every linear of the 24 layers but the attention gate (attention q, k, v and output; the
+# convolutions' in and out projections; gate|up and down) becomes int8 codes in -127..127 in the
+# 128-wide Hadamard domain, with a bf16 scale per [1 x 128] of K, read against int8 activations
+# rotated the same way. Round to nearest with a scale search; no calibration data is read.
+#
+# The group is 128, not IQ8R's 256 (a u8 scale per [1 x 256] under a bf16 scale per row, as
+# d1-3b-iq8r.recipe), because libhalo serves the rotated quantiser and its GEMMs at 128 only:
+# this container runs on libr4d, libhalo and the host libraries. lfm3_bf16 serves the 256 form
+# too, where the kernels do (libr4d, libavx, libref).
+#
+# Kept bf16: the attention gate (gate_proj: one row a query head, a multiplier on that whole
+# head; lfm3_bf16 refuses a quantised one), the short convolution, the norms, the embedding and
+# the lm_head tied to it.
+blk.*.attn_q.weight          rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_k.weight          rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_v.weight          rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.conv_in.weight         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.conv_out.weight        rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight        rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search

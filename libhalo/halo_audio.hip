@@ -28,7 +28,138 @@ namespace {
 __device__ __forceinline__ float bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 
 
+__global__ void elu_f32_kernel(const float* x, float* y, int rows, int n, int xp, int yp) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n) return;
+    const float v = x[(size_t)(i / n) * xp + i % n];
+    y[(size_t)(i / n) * yp + i % n] = v >= 0 ? v : expm1f(v);
+}
+
+/* One workgroup a frame, one thread a candidate at a time. Candidate ties reduce to the
+ * lower index. The projected residual is only updated after every candidate has read it. */
+__global__ void vq_euclidean_kernel(float* x, const float* cb, int* codes, int n, int bins,
+                                   int xp, int cp, int cs) {
+    const int r = blockIdx.x, t = threadIdx.x;
+    __shared__ float dist[256];
+    __shared__ int pick[256];
+    float best = INFINITY;
+    int id = 0;
+    for (int k = t; k < bins; k += 256) {
+        float d = 0;
+        for (int j = 0; j < n; ++j) {
+            const float delta = x[(size_t)r * xp + j] - cb[(size_t)k * cp + j];
+            d += delta * delta;
+        }
+        if (d < best) { best = d; id = k; }
+    }
+    dist[t] = best; pick[t] = id;
+    __syncthreads();
+    for (int s = 128; s; s /= 2) {
+        if (t < s && (dist[t + s] < dist[t] ||
+                      (dist[t + s] == dist[t] && pick[t + s] < pick[t]))) {
+            dist[t] = dist[t + s]; pick[t] = pick[t + s];
+        }
+        __syncthreads();
+    }
+    if (!t) codes[(size_t)r * cs] = pick[0];
+    for (int j = t; j < n; j += 256)
+        x[(size_t)r * xp + j] -= cb[(size_t)pick[0] * cp + j];
+}
+
 constexpr int kT = 256;
+
+/* Small f32 encoder primitives. The generator remains bf16; these keep the released
+ * reference tokenizer in f32 instead of routing its transformer through a host fallback. */
+__device__ float encoder_sum(float v, float* buf) {
+    const int t = threadIdx.x;
+    buf[t] = v;
+    __syncthreads();
+    for (int s = 128; s; s /= 2) {
+        if (t < s) buf[t] += buf[t + s];
+        __syncthreads();
+    }
+    return buf[0];
+}
+
+__global__ void encoder_layernorm(const float* x, const float* w, const float* bias,
+                                 float* y, int n, int xp, int yp, float eps) {
+    __shared__ float buf[256];
+    const int r = blockIdx.x, t = threadIdx.x;
+    float v = 0;
+    for (int j = t; j < n; j += 256) v += x[(size_t)r * xp + j];
+    const float mean = encoder_sum(v, buf) / n;
+    __syncthreads();
+    v = 0;
+    for (int j = t; j < n; j += 256) {
+        const float d = x[(size_t)r * xp + j] - mean;
+        v += d * d;
+    }
+    const float inv = rsqrtf(encoder_sum(v, buf) / n + eps);
+    __syncthreads();
+    for (int j = t; j < n; j += 256)
+        y[(size_t)r * yp + j] = (x[(size_t)r * xp + j] - mean) * inv * w[j] + (bias ? bias[j] : 0);
+}
+
+__global__ void encoder_gelu(const float* x, float* y, int rows, int n, int xp, int yp) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n) return;
+    const float v = x[(size_t)(i / n) * xp + i % n];
+    y[(size_t)(i / n) * yp + i % n] = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
+}
+
+__global__ void encoder_rope(float* x, const int* positions, int heads, int pitch,
+                            float theta, float scale) {
+    const int r = blockIdx.x;
+    for (int k = threadIdx.x; k < heads * 32; k += 256) {
+        const int h = k / 32, j = k % 32;
+        float* row = x + (size_t)r * pitch + h * 64;
+        const float angle = positions[r] / scale / powf(theta, (2.0f * j) / 64.0f);
+        float sn, cs;
+        sincosf(angle, &sn, &cs);
+        const float a = row[j], b = row[j + 32];
+        row[j] = a * cs - b * sn; row[j + 32] = a * sn + b * cs;
+    }
+}
+
+/* One workgroup a (query, head), <=512 keys. Only the reference encoder uses this f32
+ * attention path; its sequence is at most 250 rows, so no quadratic global score plane. */
+__global__ void encoder_attn(const float* q, const float* k, const float* v, const int* cu,
+                            float* out, int heads, int qp, int kp, int vp, int op,
+                            int nseq, int div, int window, float scale) {
+    __shared__ float score[512], reduce[256];
+    const int r = blockIdx.x, h = blockIdx.y, t = threadIdx.x;
+    int seq = 0;
+    while (seq + 1 < nseq && cu[seq + 1] <= r * div) ++seq;
+    const int first = max(cu[seq] / div, window > 0 ? r - window + 1 : 0);
+    const int last = min(cu[seq + 1] / div, r + 1), count = last - first;
+    if (count <= 0 || count > 512) return;
+    float best = -INFINITY;
+    for (int j = t; j < count; j += 256) {
+        float dot = 0;
+        for (int d = 0; d < 64; ++d)
+            dot += q[(size_t)r * qp + h * 64 + d] * k[(size_t)(first + j) * kp + h * 64 + d];
+        score[j] = dot * scale;
+        best = fmaxf(best, score[j]);
+    }
+    reduce[t] = best;
+    __syncthreads();
+    for (int s = 128; s; s /= 2) {
+        if (t < s) reduce[t] = fmaxf(reduce[t], reduce[t + s]);
+        __syncthreads();
+    }
+    best = reduce[0];
+    __syncthreads();
+    float sum = 0;
+    for (int j = t; j < count; j += 256) { score[j] = expf(score[j] - best); sum += score[j]; }
+    const float denom = encoder_sum(sum, reduce);
+    __syncthreads();
+    if (t < 64) {
+        float result = 0;
+        for (int j = 0; j < count; ++j)
+            result += score[j] / denom * v[(size_t)(first + j) * vp + h * 64 + t];
+        out[(size_t)r * op + h * 64 + t] = result;
+    }
+}
 
 // A window entry's flags (RadAudioGenBatch, RAD_AGEN_F_*), as libref restates them.
 enum { kFirst = 1, kLast = 8, kJoin = 16 };
@@ -1014,6 +1145,119 @@ extern "C" int halo_rad_conv1d(const RadArgs* a, RadStream s) {
 /* The f32 rows. The weight is the _f32 layout hooks' (tap-major for conv1d, phase-major with
  * ceil(k / stride) taps for conv_t1d). The column tile is the narrowest of 128, 64 and 32 that
  * covers cout in as few workgroups; fewer than 16 channels take the direct conv1d kernel. */
+extern "C" int halo_rad_encoder_layernorm(const RadArgs* a, RadStream s) {
+    const auto *x = halo_opt(a, 0), *w = halo_opt(a, 1), *b = halo_opt(a, 2), *y = halo_opt(a, 3);
+    if (!x || !w || !y || !is_f32(x) || !is_f32(w) || !is_f32(y) || (b && !is_f32(b)))
+        return HALO_NO(RAD_E_DTYPE);
+    const long long n = halo_geti_or(a, "n", 0);
+    if (n < 1 || n > 4096 || halo_numel(w) != n || (b && halo_numel(b) != n)) return HALO_NO(RAD_E_SHAPE);
+    long long rx = 0, ry = 0;
+    const auto xp = halo_rows_pitch(x, n, &rx), yp = halo_rows_pitch(y, n, &ry);
+    if (xp < 0 || yp < 0 || !halo_contig(w) || (b && !halo_contig(b))) return HALO_NO(RAD_E_STRIDE);
+    const float eps = halo_getf(a, "eps", 1e-5);
+    if (ry < 1 || ry > 65535 || rx < ry || xp > 0x7fffffffll || yp > 0x7fffffffll || !(eps > 0))
+        return HALO_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(encoder_layernorm, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
+        (const float*)x->data, (const float*)w->data, b ? (const float*)b->data : nullptr,
+        (float*)y->data, (int)n, (int)xp, (int)yp, eps);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int halo_rad_encoder_gelu(const RadArgs* a, RadStream s) {
+    const auto *x = halo_opt(a, 0), *y = halo_opt(a, 1);
+    if (!x || !y || !is_f32(x) || !is_f32(y)) return HALO_NO(RAD_E_DTYPE);
+    const long long n = halo_geti_or(a, "n", 0);
+    if (n < 1 || n > 0x7fffffffll) return HALO_NO(RAD_E_SHAPE);
+    long long rx = 0, ry = 0;
+    const auto xp = halo_rows_pitch(x, n, &rx), yp = halo_rows_pitch(y, n, &ry);
+    if (xp < 0 || yp < 0) return HALO_NO(RAD_E_STRIDE);
+    if (ry < 1 || rx < ry || ry > 0x7fffffffll / n || xp > 0x7fffffffll || yp > 0x7fffffffll)
+        return HALO_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(encoder_gelu, dim3(blocks_for(ry * n)), dim3(kT), 0, (hipStream_t)s,
+        (const float*)x->data, (float*)y->data, (int)ry, (int)n, (int)xp, (int)yp);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int halo_rad_encoder_rope(const RadArgs* a, RadStream s) {
+    const auto *x = halo_opt(a, 0), *p = halo_opt(a, 1);
+    if (!x || !p || !is_f32(x) || !is_i32(p)) return HALO_NO(RAD_E_DTYPE);
+    const long long nh = halo_geti_or(a, "n_head", 0), nk = halo_geti_or(a, "n_head_kv", 0);
+    const char* mode = halo_gets(a, "mode");
+    if (halo_geti_or(a, "head_dim", 0) != 64 || halo_geti_or(a, "rotary_dim", 64) != 64 ||
+        nh < 1 || nh > 64 || nk != nh || !mode || std::strcmp(mode, "neox") || p->rank != 1 ||
+        halo_gets(a, "sections") || halo_getf(a, "yarn_factor", 0) != 0 ||
+        halo_getf(a, "llama3_factor", 0) != 0) return HALO_NO(RAD_E_UNSUPPORTED);
+    long long rx = 0;
+    const auto xp = halo_rows_pitch(x, 3 * nh * 64, &rx), rows = halo_numel(p);
+    if (xp < 0 || !halo_contig(p)) return HALO_NO(RAD_E_STRIDE);
+    const float theta = halo_getf(a, "theta", 10000), scale = halo_getf(a, "scale", 1);
+    if (rows < 1 || rows > 65535 || rx < rows || xp > 0x7fffffffll || !(theta > 0) || !(scale > 0))
+        return HALO_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(encoder_rope, dim3((unsigned)rows), dim3(kT), 0, (hipStream_t)s,
+        (float*)x->data, (const int*)p->data, (int)(nh + nk), (int)xp, theta, scale);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int halo_rad_encoder_attn(const RadArgs* a, RadStream s) {
+    const auto *q = halo_opt(a, 0), *k = halo_opt(a, 1), *v = halo_opt(a, 2),
+               *cu = halo_opt(a, 3), *y = halo_opt(a, 4);
+    if (!q || !k || !v || !cu || !y || !is_f32(q) || !is_f32(k) || !is_f32(v) ||
+        !is_f32(y) || !is_i32(cu)) return HALO_NO(RAD_E_DTYPE);
+    if (halo_geti_or(a, "head_dim", 0) != 64 || halo_geti_or(a, "gqa", 1) != 1 ||
+        halo_geti_or(a, "causal", 0) != 1) return HALO_NO(RAD_E_UNSUPPORTED);
+    const long long n = halo_dim(q, (int)q->rank - 1), div = halo_geti_or(a, "cu_div", 1);
+    if (n < 64 || n % 64 || n > 4096 || div < 1 || div > 0x7fffffffll) return HALO_NO(RAD_E_SHAPE);
+    long long rq = 0, rk = 0, rv = 0, ry = 0;
+    const auto qp = halo_rows_pitch(q, n, &rq), kp = halo_rows_pitch(k, n, &rk),
+               vp = halo_rows_pitch(v, n, &rv), yp = halo_rows_pitch(y, n, &ry);
+    if (qp < 0 || kp < 0 || vp < 0 || yp < 0 || !halo_contig(cu)) return HALO_NO(RAD_E_STRIDE);
+    const auto ns = halo_numel(cu) - 1, window = halo_geti_or(a, "window", 0);
+    if (ry < 1 || ry > 512 || rq < ry || rk < ry || rv < ry || ns < 1 || ns > 512 ||
+        qp > 0x7fffffffll || kp > 0x7fffffffll || vp > 0x7fffffffll || yp > 0x7fffffffll ||
+        window < 0 || window > 0x7fffffffll) return HALO_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(encoder_attn, dim3((unsigned)ry, (unsigned)(n / 64)), dim3(kT), 0,
+        (hipStream_t)s, (const float*)q->data, (const float*)k->data, (const float*)v->data,
+        (const int*)cu->data, (float*)y->data, (int)(n / 64), (int)qp, (int)kp, (int)vp, (int)yp,
+        (int)ns, (int)div, (int)window, (float)halo_getf(a, "scale", 0.125));
+    return st_of(hipGetLastError());
+}
+
+extern "C" int halo_rad_elu(const RadArgs* a, RadStream s) {
+    const RadTensor *x = halo_opt(a, 0), *y = halo_opt(a, 1);
+    if (!x || !y || !is_f32(x) || !is_f32(y)) return HALO_NO(RAD_E_DTYPE);
+    const long long n = halo_geti_or(a, "n", 0);
+    long long rx = 0, ry = 0;
+    if (n <= 0) return HALO_NO(RAD_E_SHAPE);
+    const long long xp = halo_rows_pitch(x, n, &rx), yp = halo_rows_pitch(y, n, &ry);
+    if (xp < 0 || yp < 0) return HALO_NO(RAD_E_STRIDE);
+    if (ry <= 0 || rx < ry || n > 0x7fffffffll || ry > 0x7fffffffll / n ||
+        xp > 0x7fffffffll || yp > 0x7fffffffll) return HALO_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(elu_f32_kernel, dim3(blocks_for(ry * n)), dim3(kT), 0,
+                       (hipStream_t)s, (const float*)x->data, (float*)y->data,
+                       (int)ry, (int)n, (int)xp, (int)yp);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int halo_rad_vq_euclidean(const RadArgs* a, RadStream s) {
+    const RadTensor *x = halo_opt(a, 0), *cb = halo_opt(a, 1), *c = halo_opt(a, 2);
+    if (!x || !cb || !c || !is_f32(x) || !is_f32(cb) || !is_i32(c))
+        return HALO_NO(RAD_E_DTYPE);
+    const long long n = halo_geti_or(a, "n", 0), bins = halo_geti_or(a, "bins", 0);
+    if (n <= 0 || bins <= 0) return HALO_NO(RAD_E_SHAPE);
+    long long rx = 0, rc = 0;
+    const long long xp = halo_rows_pitch(x, n, &rx), cp = halo_rows_pitch(cb, n, &rc);
+    if (xp < 0 || cp < 0) return HALO_NO(RAD_E_STRIDE);
+    if (rx < 1 || rc != bins || halo_numel(c) < rx || rx > 65535 || n > 4096 ||
+        bins > 65536 || xp > 0x7fffffffll || cp > 0x7fffffffll)
+        return HALO_NO(RAD_E_SHAPE);
+    const long long cs = c->rank ? c->stride[c->rank - 1] : 1;
+    if (cs < 1 || cs > 0x7fffffffll) return HALO_NO(RAD_E_STRIDE);
+    hipLaunchKernelGGL(vq_euclidean_kernel, dim3((unsigned)rx), dim3(kT), 0,
+                       (hipStream_t)s, (float*)x->data, (const float*)cb->data,
+                       (int*)c->data, (int)n, (int)bins, (int)xp, (int)cp, (int)cs);
+    return st_of(hipGetLastError());
+}
+
 extern "C" int halo_rad_conv1d_f32(const RadArgs* a, RadStream s) {
     const RadTensor *x = halo_opt(a, 0), *w = halo_opt(a, 1), *cu = halo_opt(a, 2);
     const RadTensor *res = halo_opt(a, 3), *y = halo_opt(a, 4), *b = halo_opt(a, 5);

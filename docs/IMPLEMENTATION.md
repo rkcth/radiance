@@ -43,7 +43,7 @@ libavx/           the same vocabulary in x86 SIMD, host domain: the production h
                   built on every x86-64 build because the engine refuses to serve an op that
                   resolves only to libref (without debug-accept-reference-kernels)
 libquant/         the built-in quantisers rad-convert's recipes name: grids, transforms, rtn, gptq
-plugin/spechub/   the draft-coupling ops (`mtp_couple_propose`, `mtp_couple_verify`,
+plugin/spechub/   the draft-coupling ops (`mtp_couple_propose`, `mtp_couple_verify`, `mtp_trav_verify`,
                   `dflash_couple_propose`, `draft-coupling: on`): schemas and shapes on the host,
                   launches on the card and in a host reference
 arch/<id>/        one architecture plugin per directory

@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 40 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 44 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -23,6 +23,7 @@
 { "RadArchProbe", "gen_max_pixels", 104, 8 },
 { "RadArchProbe", "gen_max_refs", 112, 8 },
 { "RadArchProbe", "gen_shape", 120, 4 },
+{ "RadArchProbe", "ckpt_snap_ok", 124, 4 },
 { "RadArgs", "", 0, 72 },
 { "RadArgs", "t", 0, 8 },
 { "RadArgs", "n_t", 8, 4 },
@@ -35,7 +36,7 @@
 { "RadArgs", "world_size", 60, 4 },
 { "RadArgs", "kv_used_max_h", 64, 4 },
 { "RadArgs", "wgp_count", 68, 4 },
-{ "RadBatch", "", 0, 480 },
+{ "RadBatch", "", 0, 496 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -101,6 +102,8 @@
 { "RadBatch", "bidi_seq", 456, 8 },
 { "RadBatch", "bidi_used", 464, 8 },
 { "RadBatch", "anchor_rows", 472, 8 },
+{ "RadBatch", "ckpt_cut", 480, 4 },
+{ "RadBatch", "ckpt_cu", 488, 8 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },
@@ -109,7 +112,7 @@
 { "RadBufDecl", "domain", 60, 4 },
 { "RadBufDecl", "derive", 64, 8 },
 { "RadBufDecl", "kv", 72, 4 },
-{ "RadBuildCtx", "", 0, 200 },
+{ "RadBuildCtx", "", 0, 208 },
 { "RadBuildCtx", "rank", 0, 4 },
 { "RadBuildCtx", "world_size", 4, 4 },
 { "RadBuildCtx", "max_tok", 8, 8 },
@@ -142,6 +145,7 @@
 { "RadBuildCtx", "gen_max_refs", 184, 8 },
 { "RadBuildCtx", "expert_file_tier", 192, 4 },
 { "RadBuildCtx", "slot_base", 196, 4 },
+{ "RadBuildCtx", "span_pass_step", 200, 4 },
 { "RadAudioGenBatch", "", 0, 352 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },
@@ -938,7 +942,7 @@
 { "RadMtpCoupleDraw", "seq", 16, 8 },
 { "RadMtpCoupleDraw", "card", 24, 4 },
 { "RadMtpCoupleDraw", "mode", 28, 4 },
-{ "RadMtpCoupleState", "", 0, 152 },
+{ "RadMtpCoupleState", "", 0, 168 },
 { "RadMtpCoupleState", "draw", 0, 32 },
 { "RadMtpCoupleState", "pos", 32, 8 },
 { "RadMtpCoupleState", "status", 40, 4 },
@@ -947,3 +951,7 @@
 { "RadMtpCoupleState", "count", 52, 4 },
 { "RadMtpCoupleState", "ids", 56, 32 },
 { "RadMtpCoupleState", "q", 88, 64 },
+{ "RadMtpCoupleState", "nkids", 152, 4 },
+{ "RadMtpCoupleState", "scheme", 156, 4 },
+{ "RadMtpCoupleState", "blk", 160, 4 },
+{ "RadMtpCoupleState", "pad_", 164, 4 },

@@ -1628,6 +1628,7 @@ static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
         opd(C, ne1, N1, K1),           /* w_odd -- the odd experts */
         opd((uint32_t)RAD_BF16, ne1, srows(N1), (K1 + g - 1) / g),   /* w_odd_scale */
         opd(D, M * k, N),                                 /* y, in sorted order */
+        opd_none(),                                       /* split -- optional */
     };
     R4D_PICK(l);
 }
@@ -1678,6 +1679,7 @@ static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpd
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
         wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
         opd(D, M * k, N),                                 /* y -- in SORTED order */
+        opd_none(),                                       /* split -- optional */
     };
     R4D_PICK(l);
 }

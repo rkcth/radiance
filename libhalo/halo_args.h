@@ -239,6 +239,10 @@ enum {
      * cannot be static_asserted against `halo_gemm_fp8a8_block()` (a function, not a macro), so
      * halo_gemm_fp8a8.hip checks it at launch. */
     HALO_FP8_BLOCK = 128,
+    /* IQR's 8-bit format (IQ8R): int8 codes rotated 128 wide, one bf16 scale per row per 256 of K
+     * against an int8 activation with one f32 scale per (token, 256). Twice the int8 block, so a
+     * fold covers two 128-wide rotation blocks. */
+    HALO_I8_GROUP_WIDE = 256,
     HALO_WAVE     = 32,
     HALO_NTILE    = 16     /* output rows per WMMA n-tile                          */
 };

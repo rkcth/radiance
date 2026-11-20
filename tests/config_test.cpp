@@ -69,131 +69,6 @@ TEST(help_is_reported_separately_from_an_error) {
 
 /* An unknown flag is an error naming it, not a warning: a typo in a budget flag would otherwise
  * yield a plan the operator did not ask for. */
-TEST(device_ordinals_are_an_ordered_rank_binding) {
-    Config c;
-    CHECK_EQ(parse({"--device-ordinal", "1", "--device-ordinal", "0", "--tp", "2"}, &c), RAD_OK);
-    CHECK_EQ(c.device_ordinals.size(), 2u);
-    if (c.device_ordinals.size() == 2) {
-        CHECK_EQ(c.device_ordinals[0], 1);
-        CHECK_EQ(c.device_ordinals[1], 0);
-    }
-    CHECK_EQ(parse_fresh({"--device-ordinal", "-1"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--device-ordinal", "0", "--device-ordinal", "0", "--tp", "2"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--device-ordinal", "0", "--tp", "2"}), RAD_E_INVAL);
-}
-
-TEST(supplemental_text_requires_a_model_device_pair_and_http_serving) {
-    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--supplemental-text-device", "1"}), RAD_E_INVAL);
-    Config cfg;
-    REQUIRE_EQ(parse({"--supplemental-text-model", "/m/secondary.rad",
-                      "--supplemental-text-device", "1"}, &cfg), RAD_OK);
-    CHECK_EQ(cfg.supplemental_text_model, "/m/secondary.rad");
-    CHECK_EQ(cfg.supplemental_text_device, 1);
-    CHECK_EQ(cfg.supplemental_text_host_pool_mib, 0);
-    CHECK(cfg.image_model.empty());
-    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
-                          "--supplemental-text-device", "1", "--debug-graph"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
-                          "--supplemental-text-device", "1", "--calib-corpus", "/c.jsonl",
-                          "--calib-dir", "/d"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
-                          "--supplemental-text-device", "1", "--kld-record", "/r",
-                          "--kld-corpus", "/c.jsonl"}), RAD_E_INVAL);
-}
-
-TEST(supplemental_text_host_pool_requires_a_supplemental_model) {
-    Config cfg;
-    REQUIRE_EQ(parse({"--supplemental-text-model", "/m/secondary.rad",
-                      "--supplemental-text-device", "1",
-                      "--supplemental-text-host-pool-mib", "4096"}, &cfg), RAD_OK);
-    CHECK_EQ(cfg.supplemental_text_host_pool_mib, 4096);
-    CHECK_EQ(cfg.host_pool_mib, 0);
-    CHECK_EQ(parse_fresh({"--supplemental-text-host-pool-mib", "0"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
-                          "--supplemental-text-device", "1",
-                          "--supplemental-text-host-pool-mib", "-1"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--supplemental-text-model", "/m/secondary.rad",
-                          "--supplemental-text-device", "1",
-                          "--supplemental-text-host-pool-mib", "1099511627776"}), RAD_E_INVAL);
-}
-
-TEST(shared_image_weight_loans_are_opt_out) {
-    Config cfg;
-    CHECK(cfg.image_weight_loan);
-    CHECK_EQ(parse_fresh({"--no-image-weight-loan"}), RAD_E_INVAL);
-    REQUIRE_EQ(parse({"--image-model", "/m/image.rad", "--no-image-weight-loan"}, &cfg), RAD_OK);
-    CHECK(!cfg.image_weight_loan);
-}
-
-TEST(shared_image_can_select_a_text_rank) {
-    Config c;
-    CHECK_EQ(parse({"--image-text-rank", "1", "--image-model", "/m/image.rad", "--tp", "2"}, &c), RAD_OK);
-    CHECK_EQ(c.image_text_rank, 1);
-    CHECK_EQ(parse_fresh({"--image-text-rank", "0"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-text-rank", "1", "--image-model", "/m/image.rad"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-text-rank", "-1", "--image-model", "/m/image.rad"}), RAD_E_INVAL);
-}
-
-TEST(shared_image_reload_headroom_is_opt_in) {
-    Config c;
-    CHECK_EQ(c.image_reload_headroom_mib, 0);
-    REQUIRE_EQ(parse({"--image-model", "/m/image.rad", "--image-reload-headroom-mib", "64"}, &c), RAD_OK);
-    CHECK_EQ(c.image_reload_headroom_mib, 64);
-    CHECK_EQ(parse_fresh({"--image-reload-headroom-mib", "64"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--image-reload-headroom-mib", "-1"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--image-reload-headroom-mib",
-                          "8796093022208"}), RAD_E_INVAL);
-}
-
-TEST(unloaded_image_expert_pool_is_opt_in) {
-    Config c;
-    CHECK_EQ(c.unloaded_image_expert_pool_mib, 0);
-    REQUIRE_EQ(parse({"--image-model", "/m/image.rad", "--unloaded-image-expert-pool-mib", "64"}, &c), RAD_OK);
-    CHECK_EQ(c.unloaded_image_expert_pool_mib, 64);
-    CHECK_EQ(parse_fresh({"--unloaded-image-expert-pool-mib", "64"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--unloaded-image-expert-pool-mib", "-1"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--unloaded-image-expert-pool-mib",
-                          "8796093022208"}), RAD_E_INVAL);
-}
-
-TEST(shared_video_tower_placement_is_independent_of_text) {
-    Config c;
-    CHECK_EQ(parse({"--image-model", "/m/image.rad", "--video-tower-placement", "ram",
-                    "--vision-tower-placement", "vram"}, &c), RAD_OK);
-    CHECK(c.video_tower_placement == TablePlacement::Ram);
-    CHECK(c.tower_placement == TablePlacement::Vram);
-    CHECK_EQ(parse_fresh({"--video-tower-placement", "ram"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--video-tower-placement", "auto"}),
-             RAD_E_INVAL);
-}
-
-TEST(shared_image_embedding_placement_is_independent_of_text) {
-    Config c;
-    CHECK_EQ(parse({"--image-model", "/m/image.rad", "--image-embedding-placement", "vram",
-                    "--embedding-placement", "ram"}, &c), RAD_OK);
-    CHECK(c.image_embedding_placement == TablePlacement::Vram);
-    CHECK(c.embedding_placement == TablePlacement::Ram);
-    CHECK_EQ(parse_fresh({"--image-embedding-placement", "vram"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad", "--image-embedding-placement", "disk"}),
-             RAD_E_INVAL);
-}
-
-TEST(shared_image_snapshot_memory_defaults_to_pageable) {
-    Config defaults, pageable, pinned;
-    REQUIRE_EQ(parse({"--image-model", "/m/image.rad"}, &defaults), RAD_OK);
-    CHECK(defaults.image_snapshot_pageable);
-    REQUIRE_EQ(parse({"--image-model", "/m/image.rad",
-                      "--image-snapshot-memory", "pageable"}, &pageable), RAD_OK);
-    CHECK(pageable.image_snapshot_pageable);
-    REQUIRE_EQ(parse({"--image-model", "/m/image.rad",
-                      "--image-snapshot-memory", "pinned"}, &pinned), RAD_OK);
-    CHECK(!pinned.image_snapshot_pageable);
-    CHECK_EQ(parse_fresh({"--image-snapshot-memory", "pageable"}), RAD_E_INVAL);
-    CHECK_EQ(parse_fresh({"--image-model", "/m/image.rad",
-                          "--image-snapshot-memory", "auto"}), RAD_E_INVAL);
-}
-
 TEST(an_unknown_option_is_refused) {
     Config c;
     CHECK_EQ(parse({ "--not-a-flag" }, &c), RAD_E_INVAL);
@@ -595,6 +470,50 @@ TEST(a_prefill_span_below_one_interval_is_refused) {
     CHECK_EQ(c.prefill_span, 4);
 }
 
+/* --prefill-span-pass piece|step and --prefill-span-min auto|N shape a span: piece and auto are
+ * the defaults (a pass a piece, the automatic minimum), and either is refused without a span to shape. */
+TEST(the_span_pass_and_the_span_minimum_need_a_span) {
+    LogGuard lg;
+    Config d;
+    CHECK(!d.prefill_span_step);
+    CHECK_EQ(d.prefill_span_min, -1);
+    CHECK_EQ(parse({ "--prefill-span", "2" }, &d), RAD_OK);
+    CHECK(!d.prefill_span_step);
+    CHECK_EQ(d.prefill_span_min, -1);
+
+    Config c;
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "step" }, &c), RAD_OK);
+    CHECK(c.prefill_span_step);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "piece" }, &c), RAD_OK);
+    CHECK(!c.prefill_span_step);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "whole" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-pass", "step" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span", "1", "--prefill-span-pass", "step" }), RAD_E_INVAL);
+    /* piece without a span is the default said aloud. */
+    CHECK_EQ(parse_fresh({ "--prefill-span-pass", "piece" }), RAD_OK);
+
+    /* --prefill-tail-snapshot: on by default, off and on parse, nothing else does. */
+    CHECK(d.prefill_tail_snapshot);
+    Config t;
+    CHECK_EQ(parse({ "--prefill-tail-snapshot", "off" }, &t), RAD_OK);
+    CHECK(!t.prefill_tail_snapshot);
+    CHECK_EQ(parse({ "--prefill-tail-snapshot", "on" }, &t), RAD_OK);
+    CHECK(t.prefill_tail_snapshot);
+    CHECK_EQ(parse_fresh({ "--prefill-tail-snapshot", "maybe" }), RAD_E_INVAL);
+
+    Config m;
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "0" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, 0);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "16384" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, 16384);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "auto" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, -1);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "-1" }, &m), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "2k" }, &m), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-min", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-min", "auto" }), RAD_OK);
+}
+
 /* A budget flag takes a whole number; a typo is refused rather than read as 0 or its prefix. */
 TEST(a_numeric_flag_refuses_what_is_not_a_number) {
     Config c;
@@ -685,23 +604,6 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
 /* A legal value for every option that takes one, with any option it cannot be given without. */
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
-        { "--device-ordinal", { "0" } },
-        { "--image-model", { "/m/image.rad" } },
-        { "--supplemental-text-model", { "/m/secondary.rad", "--supplemental-text-device", "1" } },
-        { "--supplemental-text-device", { "1", "--supplemental-text-model", "/m/secondary.rad" } },
-        { "--supplemental-text-host-pool-mib", { "4096", "--supplemental-text-model",
-                                              "/m/secondary.rad", "--supplemental-text-device", "1" } },
-        { "--image-text-rank", { "0", "--image-model", "/m/image.rad" } },
-        { "--image-model-reserve", { "/m/other.rad", "--image-model", "/m/image.rad" } },
-        { "--image-reload-headroom-mib", { "64", "--image-model", "/m/image.rad" } },
-        { "--unloaded-image-expert-pool-mib", { "64", "--image-model", "/m/image.rad" } },
-        { "--image-model-fifo", { "--image-model", "/m/image.rad" } },
-        { "--no-image-weight-loan", { "--image-model", "/m/image.rad" } },
-        { "--video-tower-placement", { "ram", "--image-model", "/m/image.rad" } },
-        { "--image-embedding-placement", { "vram", "--image-model", "/m/image.rad" } },
-        { "--image-lora-snapshot-mib", { "64", "--image-model", "/m/image.rad", "--max-loras", "1" } },
-        { "--image-snapshot-memory", { "pageable", "--image-model", "/m/image.rad" } },
-        { "--image-model-cache-mib", { "128", "--image-model", "/m/image.rad" } },
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
         { "--model-revision", { "v1.2" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
@@ -710,6 +612,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--mixed-step-target-ms", { "150" } },
+        { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
@@ -724,12 +627,27 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
+        { "--prefill-span-pass", { "step", "--prefill-span", "2" } },
+        { "--prefill-tail-snapshot", { "off" } },
+        { "--prefill-span-first", { "on" } },
+        { "--prefill-span-min", { "4096", "--prefill-span", "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--prefix-resume", { "nearest" } },
         { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
-        { "--draft-coupling", { "on" } },
+        { "--draft-coupling", { "on" } }, { "--draft-verify", { "block" } },
+        { "--draft-suffix", { "on" } }, { "--draft-suffix-min-match", { "5" } },
+        { "--draft-suffix-max", { "6" } }, { "--draft-suffix-min-score", { "0.4" } },
+        { "--draft-depth", { "adaptive" } }, { "--draft-depth-max", { "5" } },
+        { "--draft-depth-min", { "2" } }, { "--draft-depth-stop", { "0.7" } },
+        { "--draft-depth-lag", { "0" } }, { "--draft-depth-stat", { "path" } },
+        { "--draft-depth-load", { "on", "--draft-depth", "adaptive" } },
+        { "--draft-depth-load-from", { "4" } }, { "--draft-depth-load-min", { "1" } },
+        { "--draft-depth-load-late", { "off" } }, { "--draft-depth-load-calib", { "static" } },
+        { "--draft-depth-load-tok-ms", { "0.23,0.36,0.43,0.51" } },
+        { "--draft-depth-load-row-ms", { "1.2,0.8" } }, { "--draft-depth-load-round-ms", { "0.5" } },
+        { "--draft-depth-load-jump-ms", { "1.3,1.4,2.3,0" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -809,13 +727,14 @@ TEST(every_listed_option_parses_and_is_reported_as_given) {
         if (name == "--help" || name == "--draft-model") continue;
         CHECK(std::find(names.begin(), names.end(), name) != names.end());
         std::vector<std::string> args{ "--model", "/m/x.rad", name };
-        const auto it = legal_values().find(name);
-        if (it != legal_values().end()) {
+        if (!arg.empty()) {
+            auto it = legal_values().find(name);
+            if (it == legal_values().end()) {
+                std::fprintf(stderr, "    no legal value listed for %s %s\n", name.c_str(), arg.c_str());
+                CHECK(false);
+                continue;
+            }
             args.insert(args.end(), it->second.begin(), it->second.end());
-        } else if (!arg.empty()) {
-            std::fprintf(stderr, "    no legal value listed for %s %s\n", name.c_str(), arg.c_str());
-            CHECK(false);
-            continue;
         }
         Config c;
         Argv a(args);
@@ -1176,6 +1095,145 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+}
+
+/* --draft-depth is fixed unless asked for. adaptive switches the coupled drafting on (its rule reads
+ * the draft's laws), excludes the fixed block verify and --draft-window adaptive, and takes its knobs
+ * in range. */
+TEST(draft_depth_adaptive_parses_and_needs_a_coupled_chain) {
+    Config c;
+    CHECK_EQ(parse({}, &c), RAD_OK);
+    CHECK(!c.draft_depth_adaptive);
+    CHECK_EQ(c.draft_depth_max, 0);
+    CHECK_EQ(c.draft_depth_min, 1);
+    CHECK_EQ(c.draft_depth_lag, 1);
+    CHECK_EQ(c.draft_depth_stat, 0);
+    CHECK(c.draft_depth_stop == 0.85);
+    CHECK(!c.draft_coupling);
+    Config a;
+    CHECK_EQ(parse({ "--draft-depth", "adaptive", "--draft-depth-max", "6", "--draft-depth-stop", "0.6",
+                     "--draft-depth-lag", "0", "--draft-depth-stat", "path", "--draft-depth-min", "2" }, &a),
+             RAD_OK);
+    CHECK(a.draft_depth_adaptive);
+    CHECK(a.draft_coupling);
+    CHECK_EQ(a.draft_depth_max, 6);
+    CHECK_EQ(a.draft_depth_min, 2);
+    CHECK_EQ(a.draft_depth_lag, 0);
+    CHECK_EQ(a.draft_depth_stat, 1);
+    CHECK(a.draft_depth_stop == 0.6);
+    CHECK_EQ(parse({ "--draft-depth", "fixed" }, &a), RAD_OK);
+    CHECK(!a.draft_depth_adaptive);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "traversal" }), RAD_OK);
+    for (const char* bad : { "on", "auto", "" }) CHECK_EQ(parse_fresh({ "--draft-depth", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth" }), RAD_E_INVAL);
+    for (const char* bad : { "-0.1", "1.5", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-stop", bad }), RAD_E_INVAL);
+    for (const char* bad : { "2", "-1" }) CHECK_EQ(parse_fresh({ "--draft-depth-lag", bad }), RAD_E_INVAL);
+    for (const char* bad : { "17", "-1" }) CHECK_EQ(parse_fresh({ "--draft-depth-max", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-min", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-stat", "mean" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-coupling", "off" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-window", "adaptive" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-window", "fixed" }), RAD_OK);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "block" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-min", "4", "--draft-depth-max", "3" }),
+             RAD_E_INVAL);
+}
+
+/* --draft-depth-load is off unless asked for: the load-aware rule of the adaptive chain. It needs
+ * that chain and its `top` statistic, and takes its tables as comma lists. */
+TEST(draft_depth_load_parses_and_needs_the_adaptive_chain) {
+    Config c;
+    CHECK_EQ(parse({}, &c), RAD_OK);
+    CHECK(!c.draft_depth_load);
+    CHECK_EQ(c.draft_depth_load_from, 5);
+    CHECK_EQ(c.draft_depth_load_min, 2);
+    CHECK(c.draft_depth_load_late);
+    CHECK(c.draft_depth_load_online);
+    CHECK(c.draft_depth_load_tok_ms.empty() && c.draft_depth_load_jump_ms.empty());
+    Config a;
+    CHECK_EQ(parse({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-depth-load-from", "3",
+                     "--draft-depth-load-min", "1", "--draft-depth-load-late", "off",
+                     "--draft-depth-load-calib", "static", "--draft-depth-load-row-ms", "1.1,0.8,0.7",
+                     "--draft-depth-load-jump-ms", "1.3,0,2" }, &a), RAD_OK);
+    CHECK(a.draft_depth_load && a.draft_depth_adaptive && a.draft_coupling);
+    CHECK_EQ(a.draft_depth_load_from, 3);
+    CHECK_EQ(a.draft_depth_load_min, 1);
+    CHECK(!a.draft_depth_load_late);
+    CHECK(!a.draft_depth_load_online);
+    CHECK_EQ(a.draft_depth_load_row_ms, std::string("1.1,0.8,0.7"));
+    CHECK_EQ(a.draft_depth_load_jump_ms, std::string("1.3,0,2"));
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-verify", "traversal" }), RAD_OK);
+    /* not without the adaptive chain, and not with the drawn token's own mass as the statistic */
+    CHECK_EQ(parse_fresh({ "--draft-depth-load", "on" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "fixed", "--draft-depth-load", "on" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-depth-stat", "path" }),
+             RAD_E_INVAL);
+    /* the knobs alone change nothing and are taken */
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-from", "8" }), RAD_OK);
+    for (const char* bad : { "auto", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-depth-load", bad }), RAD_E_INVAL);
+    for (const char* bad : { "1", "65", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-from", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "17" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-min", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-calib", "auto" }), RAD_E_INVAL);
+    for (const char* bad : { "a", "1,", "1;2", "-1", "0", "1,2,3,4,5,6,7,8,9" })
+        CHECK_EQ(parse_fresh({ "--draft-depth-load-row-ms", bad }), RAD_E_INVAL);
+    for (const char* bad : { "1,2,3,4,5", "-0.5", "x" })
+        CHECK_EQ(parse_fresh({ "--draft-depth-load-jump-ms", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-jump-ms", "0,0,0,0" }), RAD_OK);
+}
+
+
+/* The SuffixDecoding selector: off by default (bit-identical engine), min match 1..12, rows 1..32,
+ * a score in [0, 1]. */
+TEST(the_draft_suffix_flags_default_off_and_parse) {
+    Config c;
+    CHECK(!c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 6);
+    CHECK_EQ(c.draft_suffix_max, 7);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.3, 1e-6);
+    CHECK_EQ(c.n_spec_head, 0);
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-suffix-min-match", "5", "--draft-suffix-max", "6",
+                     "--draft-suffix-min-score", "0.45" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 5);
+    CHECK_EQ(c.draft_suffix_max, 6);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.45, 1e-6);
+    CHECK_EQ(parse({ "--draft-suffix", "off" }, &c), RAD_OK);
+    CHECK(!c.draft_suffix);
+    for (const char* bad : { "yes", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "13", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-match", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "33", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-max", bad }), RAD_E_INVAL);
+    for (const char* bad : { "-0.1", "1.5", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-score", bad }), RAD_E_INVAL);
+}
+
+
+/* --draft-verify is token (alias rowwise) unless asked for; block and traversal parse. block
+ * implies the coupled drafting and refuses coupling off; traversal needs the coupling and says so. */
+TEST(the_draft_verify_is_token_block_or_traversal) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_verify_block);
+    CHECK(!d.draft_verify_traversal);
+    Config c;
+    CHECK_EQ(parse({ "--draft-verify", "block" }, &c), RAD_OK);
+    CHECK(c.draft_verify_block);
+    CHECK(!c.draft_verify_traversal);
+    CHECK(c.draft_coupling);
+    Config t;
+    CHECK_EQ(parse({ "--draft-coupling", "on", "--draft-verify", "traversal" }, &t), RAD_OK);
+    CHECK(t.draft_verify_traversal);
+    CHECK(!t.draft_verify_block);
+    CHECK_EQ(parse({ "--draft-verify", "rowwise" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_traversal);
+    CHECK_EQ(parse({ "--draft-verify", "token" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_block);
+    Config b;
+    for (const char* bad : { "Block", "Traversal", "on", "" })
+        CHECK_EQ(parse({ "--draft-verify", bad }, &b), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-verify" }, &b), RAD_E_INVAL);
+    Config off;
+    CHECK_EQ(parse({ "--draft-verify", "block", "--draft-coupling", "off" }, &off), RAD_E_INVAL);
+    Config nocouple;
+    CHECK_EQ(parse({ "--draft-verify", "traversal" }, &nocouple), RAD_E_INVAL);
 }
 
 /* --draft-coupling is off unless asked for, and only off and on parse: a misspelt value must not
@@ -1626,16 +1684,6 @@ TEST(spec_ngram_sets_the_window_and_refuses_another) {
     CHECK_EQ(g.n_spec, -1);              /* the range alone changes no window */
 }
 
-TEST(host_headroom_mib_must_fit_in_a_signed_byte_count) {
-    Config c;
-    const int64_t max_mib = INT64_MAX >> 20;
-    const auto largest = std::to_string(max_mib);
-    const auto oversized = std::to_string(max_mib + 1);
-    CHECK_EQ(parse({"--host-headroom-mib", largest.c_str()}, &c), RAD_OK);
-    CHECK_EQ(c.host_headroom_mib, max_mib);
-    CHECK_EQ(parse_fresh({"--host-headroom-mib", oversized.c_str()}), RAD_E_INVAL);
-}
-
 /* --gpu-headroom is an alias for --gpu-headroom-mib; both set the same field. */
 TEST(gpu_headroom_parses_under_both_spellings) {
     Config a, b, d;
@@ -1785,7 +1833,7 @@ TEST(usage_names_every_flag_it_documents) {
      * for, so a flag added without a help line is caught. */
     const std::string text = stderr_of([] { config_usage("radiance"); });
     for (const char* f : { "--model", "--host-pool-mib", "--kv-cache-dtype",
-                           "--num-speculative-tokens", "--draft-window", "--draft-coupling",
+                           "--num-speculative-tokens", "--draft-window", "--draft-coupling", "--draft-verify",
                            "--checkpoint-policy",
                            "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
                            "--embedding-placement", "--ngram-placement",
@@ -1819,6 +1867,21 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.rope_scaling.empty());
+}
+
+/* The suffix selector and the adaptive chain depth are served together, with traversal verification
+ * (bring-up refuses what the model cannot do; the parse and the shown rows say what was asked). */
+TEST(the_suffix_selector_parses_beside_adaptive_depth_and_traversal) {
+    Config c;
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-depth", "adaptive", "--draft-coupling", "on",
+                     "--draft-verify", "traversal", "--num-speculative-tokens", "5" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK(c.draft_depth_adaptive);
+    CHECK(c.draft_coupling);
+    CHECK(c.draft_verify_traversal);
+    CHECK(!c.draft_verify_block);
+    CHECK_EQ(c.n_spec, 5);
+    CHECK_EQ(c.draft_suffix_max, 7);
 }
 
 RAD_TEST_MAIN()

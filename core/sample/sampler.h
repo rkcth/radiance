@@ -127,6 +127,12 @@ struct SamplerConfig {
     /* --draft-coupling: declare the coupled verify (`mtp_couple_verify`) behind the pick and the
      * per-row state plane it reads. */
     bool    draft_coupling = false;
+    /* --draft-verify block: the chain rows of a coupled request are verified as one block
+     * (abi/rad_mtp_block.h) instead of one at a time. Needs draft_coupling. */
+    bool    draft_verify_block = false;
+    /* --draft-verify traversal: `mtp_trav_verify` replaces the row-wise verify behind the pick
+     * (needs draft_coupling) and a per-row topology plane rides with the state plane. */
+    bool    draft_verify_traversal = false;
 };
 
 /* ================================================================== the driver */
@@ -234,7 +240,7 @@ public:
      * verify op at all. Cleared by build_greedy: a gate for run(), not for evidence. */
     bool staged_any_couple() const { return any_couple_; }
     /* The verify op the last build resolved, for naming its kernel in a log line. */
-    rad_op staged_couple_op() const { return op_couple_; }
+    rad_op staged_couple_op() const { return trav_ ? op_trav_ : op_couple_; }
 
     /* What build_step staged for the coupled verify. build_greedy, which runs between that build
      * and the step's wait, clears any_couple_ but leaves this snapshot. */
@@ -303,6 +309,10 @@ private:
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
     rad_op op_couple_    = RAD_NULL_HANDLE;   /* --draft-coupling only */
+    rad_op op_trav_      = RAD_NULL_HANDLE;   /* --draft-verify traversal: replaces op_couple_ */
+    rad_buf buf_trav_    = RAD_NULL_HANDLE;   /* [rows, 2] i32: parent row (-1 root), draft token */
+    int32_t* trav_stage_ = nullptr;           /* pinned, 2 words a sampled row */
+    bool    trav_        = false;
     rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* summary of the raw distribution */
     rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
 

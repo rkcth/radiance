@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "halo_common.h"
+#include "halo_chain.h"
 
 // Internal linkage, as the unit's own definition had.
 namespace halo_moegather {
@@ -36,7 +37,7 @@ __device__ float gather_weight(const void* ew, size_t i) {
     else return bf16_to_f32(((const uint16_t*)ew)[i]);
 }
 template <uint32_t NTHR, bool F32 = false>
-__global__ __launch_bounds__(NTHR) void gather_kernel(
+__device__ __forceinline__ void gather_kernel_body(
     const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
@@ -90,6 +91,21 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
         const uint16_t p = f32_to_bf16(bf16_to_f32(sh[(size_t)t * sh_ld + c]) * gate);
         y[(size_t)t * y_ld + c] = f32_to_bf16(bf16_to_f32(p) + bf16_to_f32(g));
     }
+}
+
+/* gather_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <uint32_t NTHR, bool F32 = false, class CH = HaloUnchained>
+__global__ __launch_bounds__(NTHR)
+void gather_kernel(
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
+    const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
+    uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
+    const int32_t* __restrict__ sorted, uint32_t T,
+    const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
+    uint32_t sh_ld, uint32_t sg_ld, int sig) {
+    if (CH::on) halo_chain_wait();
+    gather_kernel_body<NTHR, F32>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sorted, T, sh, sg, sh_ld, sg_ld, sig);
+    if (CH::on) halo_chain_done();
 }
 
 }  // namespace

@@ -180,7 +180,7 @@ static int moe_w4_nl(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     return d && (std::strcmp(d, "w4nla8h") == 0 || std::strcmp(d, "w4nl64a8h") == 0 ||
                  std::strcmp(d, "w4nl32a8h") == 0 || std::strcmp(d, "w5nl64a8h") == 0 ||
-                 std::strcmp(d, "w4nl64a8i8h") == 0 || std::strcmp(d, "w4nl32a8i8h") == 0);
+                 std::strcmp(d, "w6nl64a8h") == 0 || std::strcmp(d, "w4nl64a8i8h") == 0 || std::strcmp(d, "w4nl32a8i8h") == 0);
 }
 /* The `a8i8` names are the same stored planes met by an int8 activation (moe_gemm_w4a8i8):
  * `w4a8i8` and `w4a8i8h` are w4a8's and w4a8h's, `w4nl64a8i8h` and `w4nl32a8i8h` the subgroup-scaled
@@ -194,6 +194,10 @@ static bool moe_w5(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     return d && std::strcmp(d, "w5nl64a8h") == 0;
 }
+static bool moe_w6(const RadParam* p, int n_p) {
+    const char* d = r4d_pgets(p, n_p, "dtype");
+    return d && std::strcmp(d, "w6nl64a8h") == 0;
+}
 /* `w4nl64a8h` is the codebook form with one E4M3 scale per (row, 64 of K) under a fixed f32
  * second level, kW4G64Scale, stored once per weight (`u4*fp8_e4m3[1x64]*f32[*x*]/fwht128` with the
  * table). Codes are stored as w4nla8h's. The scale view selects the E4M3 plane and the second
@@ -205,7 +209,7 @@ static int moe_w4_g64(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     if (!d) return 0;
     return (std::strcmp(d, "w4nl64a8h") == 0 || std::strcmp(d, "w5nl64a8h") == 0 ||
-            std::strcmp(d, "w4nl64a8i8h") == 0) ? 2
+            std::strcmp(d, "w6nl64a8h") == 0 || std::strcmp(d, "w4nl64a8i8h") == 0) ? 2
            : (std::strcmp(d, "w4nl32a8h") == 0 || std::strcmp(d, "w4nl32a8i8h") == 0) ? 4 : 0;
 }
 static int moe_w4_rot(const RadParam* p, int n_p) {
@@ -933,11 +937,12 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
     char fw[RAD_ENC_STR] = "";
     if (moe_w4_rot(p, n_p)) std::snprintf(fw, sizeof fw, "fwht%lld", g.group);
     const bool nl = moe_w4_nl(p, n_p);
-    const bool w5 = moe_w5(p, n_p);
+    const bool w5 = moe_w5(p, n_p), w6 = moe_w6(p, n_p);
     const int  g64 = moe_w4_g64(p, n_p);             /* scale groups a 128 of K, or 0 */
-    if (w5 && g.K % 32) return RAD_E_SHAPE;           /* a sign word is 32 elements */
-    if (g64 ? !r4d_enc::affine_table2(enc, w5 ? RAD_U5 : RAD_U4, RAD_F8E4M3, 1, g.group / g64,
-                                      RAD_F32, RAD_F32, w5 ? 32 : 16, fw)
+    if ((w5 || w6) && g.K % 32) return RAD_E_SHAPE;  /* a bit-plane word is 32 elements */
+    if (g64 ? !r4d_enc::affine_table2(enc, w6 ? RAD_U6 : w5 ? RAD_U5 : RAD_U4,
+                                      RAD_F8E4M3, 1, g.group / g64,
+                                      RAD_F32, RAD_F32, w6 ? 64 : w5 ? 32 : 16, fw)
        : nl ? !r4d_enc::affine_table(enc, RAD_U4, RAD_BF16, 1, g.group, RAD_F32, 16, fw)
             : !r4d_enc::affine(enc, RAD_I4, RAD_BF16, 1, g.group, RAD_DT_INVALID, fw))
         return RAD_E_DTYPE;
@@ -955,11 +960,15 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
         return RAD_E_UNSUPPORTED;                    /* bf16 a row a group, as it is */
     }
     if (operand != Q_B) return RAD_E_UNSUPPORTED;
-    if (nl ? !selects(enc, sel, n, "codes", "table") || !dims(pl[1], 1, w5 ? 32 : 16)
+    if (nl ? !selects(enc, sel, n, "codes", "table") || !dims(pl[1], 1, w6 ? 64 : w5 ? 32 : 16)
            : !selects(enc, sel, n, "codes"))
         return RAD_E_SHAPE;
     if (!dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
     if (!g64 && (g.N % 16 || g.K % 64)) return RAD_E_SHAPE;
+    if (w6) {
+        fill(out, "r4d.moew6nh64.w", R4D_DT_MOEW6, g.N, g.K, g.N * (g.K / 4) * 3);
+        return RAD_OK;
+    }
     if (w5) {
         fill(out, "r4d.moew5nh64.w", R4D_DT_MOEW5, g.N, g.K, g.N * (g.K / 8) * 5);
         return RAD_OK;
@@ -984,6 +993,12 @@ bool moew5_table_is_kernels(const RadTensor& t) {
     const float* v = (const float*)t.data;
     for (int i = 0; i < 32; ++i)
         if (v[i] != kW5nlTable[i]) return false;
+    return true;
+}
+bool moew6_table_is_kernels(const RadTensor& t) {
+    const float* v = (const float*)t.data;
+    for (int i = 0; i < 64; ++i)
+        if (v[i] != kW6nlTable[i]) return false;
     return true;
 }
 
@@ -1095,6 +1110,54 @@ void moew5_row(const uint8_t* s, uint8_t* d, int64_t K, uint8_t* nib, bool forwa
         }
     }
 }
+/* Six-bit rows: canonical 8 codes in 6 bytes; served as W5's permuted low nibbles and
+ * two transposed bit planes (magnitude bit 4, sign bit 5). All layouts are K*6/8 bytes. */
+void moew6_row(const uint8_t* s, uint8_t* d, int64_t K, uint8_t* nib, bool forward) {
+    if (forward) {
+        uint8_t* hi = d + K / 2;
+        uint8_t* sg = hi + K / 8;
+        for (int64_t c0 = 0; c0 < K; c0 += 32) {
+            uint32_t h = 0, sign = 0;
+            for (int64_t k = c0; k < c0 + 32; k += 8) {
+                uint64_t x = 0;
+                std::memcpy(&x, s + k / 8 * 6, 6);
+                uint32_t lo = 0;
+                for (int i = 0; i < 8; ++i) {
+                    const uint32_t c = (uint32_t)(x >> (6 * i)) & 63u;
+                    lo |= (c & 15u) << (4 * i);
+                    const uint32_t pos = moew5_sign_bit(k - c0 + i);
+                    h |= ((c >> 4) & 1u) << pos;
+                    sign |= (c >> 5) << pos;
+                }
+                std::memcpy(nib + k / 2, &lo, 4);
+            }
+            std::memcpy(hi + c0 / 8, &h, 4);
+            std::memcpy(sg + c0 / 8, &sign, 4);
+        }
+        moew4_permute(nib, d, K / 2, true);
+        return;
+    }
+    moew4_permute(s, nib, K / 2, false);
+    const uint8_t* hi = s + K / 2;
+    const uint8_t* sg = hi + K / 8;
+    for (int64_t c0 = 0; c0 < K; c0 += 32) {
+        uint32_t h = 0, sign = 0;
+        std::memcpy(&h, hi + c0 / 8, 4);
+        std::memcpy(&sign, sg + c0 / 8, 4);
+        for (int64_t k = c0; k < c0 + 32; k += 8) {
+            uint32_t lo = 0;
+            std::memcpy(&lo, nib + k / 2, 4);
+            uint64_t x = 0;
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t pos = moew5_sign_bit(k - c0 + i);
+                const uint64_t c = ((lo >> (4 * i)) & 15u) |
+                                   (((h >> pos) & 1u) << 4) | (((sign >> pos) & 1u) << 5);
+                x |= c << (6 * i);
+            }
+            std::memcpy(d + k / 8 * 6, &x, 6);
+        }
+    }
+}
 }  /* namespace */
 
 namespace {
@@ -1125,6 +1188,14 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
         std::memcpy(dst, pdata(pl[0]), (size_t)L.bytes);
         return RAD_OK;
     }
+    if (moe_w6(v.p, v.n)) {
+        if (!moew6_table_is_kernels(pl[1])) return RAD_E_DTYPE;
+        const int64_t rb = g.K / 4 * 3;
+        std::vector<uint8_t> nib((size_t)(g.K / 2));
+        for (long long nn = 0; nn < g.N; ++nn)
+            moew6_row(pdata(pl[0]) + nn * rb, (uint8_t*)dst + nn * rb, g.K, nib.data(), true);
+        return RAD_OK;
+    }
     if (moe_w5(v.p, v.n)) {
         if (!moew5_table_is_kernels(pl[1])) return RAD_E_DTYPE;
         const int64_t rb = g.K / 8 * 5;
@@ -1152,6 +1223,15 @@ int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
     if (v.operand == Q_BSCALE) {
         std::memcpy(pl[0].data, src, (size_t)L.bytes);
         std::memcpy(pl[1].data, &kW4G64Scale, sizeof kW4G64Scale);
+        return RAD_OK;
+    }
+    if (moe_w6(v.p, v.n)) {
+        const int64_t rb = g.K / 4 * 3;
+        std::vector<uint8_t> nib((size_t)(g.K / 2));
+        for (long long nn = 0; nn < g.N; ++nn)
+            moew6_row((const uint8_t*)src + nn * rb, (uint8_t*)pl[0].data + nn * rb, g.K,
+                      nib.data(), false);
+        std::memcpy(pl[1].data, kW6nlTable, sizeof kW6nlTable);
         return RAD_OK;
     }
     if (moe_w5(v.p, v.n)) {

@@ -104,7 +104,7 @@ __device__ __forceinline__ void r4d_gemm_w4a8_nt_m64_body(
     const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
     const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C,
     int M, int K, int N, int WV, int SK) {
-  if (CHAIN) r4d_chain_wait();
+  if (CHAIN) r4d_chain_wait_vec();
   extern __shared__ float red[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;

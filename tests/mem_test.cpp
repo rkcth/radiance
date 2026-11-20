@@ -208,19 +208,6 @@ TEST(pools_refuse_a_split_the_resolver_never_made) {
     CHECK(!p.configured());
 }
 
-TEST(pools_allow_no_kv_for_a_program_without_cache_groups) {
-    Config c;
-    c.vram_weights_mib = 1;
-    c.vram_kv_mib = 0;
-    Pools p;
-    auto* alloc = &rad_malloc_allocator();
-    CHECK_OK(p.configure(c, 0, alloc, alloc, /*needs_kv=*/false));
-    CHECK_EQ(p.kv().bytes(), (int64_t)0);
-    KVManager kv;
-    CHECK_OK(kv.configure(std::vector<KVGroupInfo>(1), c, p.kv()));
-    CHECK_EQ(p.kv().used(), (int64_t)0);
-}
-
 TEST(pool_oversubscription_is_refused_by_name) {
     Config c;
     c.vram_weights_mib  = 24 * 1024;
@@ -665,6 +652,40 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
                             - c2.vram_weights_mib * MiB - c2.vram_kv_mib * MiB;
     CHECK(unclaimed >= 112 * MiB);
     CHECK(unclaimed < 114 * MiB);
+}
+
+/* The runtime keeps queue scratch resident once a kernel with a private segment has run
+ * (rad_dev_resident_scratch_bytes); it is part of the hardware queues' term, the largest rank's. */
+TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    f.n_queues = 2; f.queue_bytes = 33LL << 20;
+    VramBudget b0, b1;
+    Config c0 = c, c1 = c;
+    CHECK_OK(vram_budget_resolve(c0, { f }, &b0));
+    f.queue_scratch = 160LL << 20;
+    CHECK_OK(vram_budget_resolve(c1, { f }, &b1));
+    CHECK_EQ(b0.queues, 66LL << 20);
+    CHECK_EQ(b1.queues, (66LL << 20) + (160LL << 20));
+    CHECK_EQ(b1.claimable, b0.claimable - (160LL << 20));
+    /* The minimum the fleet asks of the card moves by the same bytes. */
+    int64_t need0 = 0, want0 = 0, need1 = 0, want1 = 0;
+    f.queue_scratch = 0;
+    vram_budget_need({ f }, &need0, &want0);
+    f.queue_scratch = 160LL << 20;
+    vram_budget_need({ f }, &need1, &want1);
+    CHECK_EQ(need1 - need0, 160LL << 20);
+    CHECK_EQ(want1 - want0, 160LL << 20);
 }
 
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
@@ -3801,6 +3822,39 @@ TEST(the_lowest_free_block_is_the_one_handed_out) {
  * loan only on a timer would refuse it, and the scheduler waiting or preempting would never create
  * the demand that triggers the reclaim. So admission is decided against the whole carve, and the
  * recall happens on the path that needs it, through the slab owner. */
+TEST(admission_reports_only_recoverable_external_capacity_as_a_fleet_wait) {
+    Lender e;
+    REQUIRE_EQ(e.build(), RAD_OK);
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+    const int64_t idle = e.kv.live_blocks(G_FULL);
+    const int64_t tokens = (idle + all) / 2 * e.bs();
+    /* The test pool is already backed; enable just the flex quota and callback protocol. */
+    e.kv.set_flex(1);
+    e.kv.set_flex_room(0);
+    CHECK_OK(e.kv.add_sequence(1));
+    bool waiting = false;
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
+    CHECK(waiting);
+    CHECK_EQ(e.kv.ensure(1, (all + 1) * e.bs(), -1, &waiting), RAD_E_FULL);
+    CHECK(!waiting);                              /* no future grant can exceed the full carve */
+    e.kv.set_flex_room(tokens);
+    bool deny = true;
+    e.kv.set_fleet_reclaim([&](int64_t, bool* pending) {
+        if (deny) { if (pending) *pending = true; return (int)RAD_E_FULL; }
+        return (int)RAD_OK;
+    });
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
+    CHECK(waiting);                               /* allowance was optimistic; actual grant denied */
+    e.kv.set_fleet_reclaim([](int64_t, bool*) { return (int)RAD_E_NOMEM; });
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_NOMEM);
+    CHECK(!waiting);                              /* a backing failure is an operational error */
+    deny = false;
+    e.kv.set_fleet_reclaim([&](int64_t, bool*) { return (int)RAD_OK; });
+    CHECK_OK(e.kv.ensure(1, tokens, -1, &waiting));
+    CHECK(!waiting);
+}
+
 TEST(a_request_past_the_mark_takes_the_loan_back) {
     Lender e;
     CHECK_OK(e.build());

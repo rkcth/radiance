@@ -224,7 +224,7 @@ Every quantiser except `m2xfp4`, `ggml`, `cast` and `import` takes the grid opti
 | option | |
 |---|---|
 | `codes` | `i2`..`i8`, `i16`, `i32` symmetric; `u1`..`u8`, `u16` with `zero=`; `fp8_e4m3`, `fp8_e5m2`, `fp6_e2m3`, `fp6_e3m2`, `fp4_e2m1` |
-| `table` | a codebook the codes index instead: `nf4`, `iq4nl`, `w4nl`, `w5nl`, `binary` (one bit), `ternary`, or the values, `;`-separated |
+| `table` | a codebook the codes index instead: `nf4`, `iq4nl`, `w4nl`, `w5nl`, `w6nl`, `binary` (one bit), `ternary`, or the values, `;`-separated |
 | `group=N` / `block=RxC` | where the scales sit; `*` is a whole extent |
 | `scale` | f32, bf16, f16, fp8_e4m3, e8m0; under `scale2` also an integer sub-scale, u4..u8, i6, i8 |
 | `scale2`, `group2` / `block2` | a second scale level the first is relative to (default the whole tensor) |
@@ -244,7 +244,8 @@ so a grid libquant can write is usable only once a kernel library takes it. libr
 floats; fp8 rows (Flash-Next's mixing and MTP fc matrices, its n-gram table); int8 block rows (the
 W8A8 trunk and lm_head), plain or rotated (`i8*bf16[1x128]/fwht128`, IQ8R); the IQR forms
 ([IQR.md](IQR.md)); the routed experts as int4 (`i4*bf16[1x128]/fwht128`), rotated int8, IQR or
-the `w4nl`/`w5nl` codebooks under E4M3 scales ([MOE-W4.md](MOE-W4.md)); the dense w4 and w8 GEMM
+the `w4nl`/`w5nl`/`w6nl` codebooks under E4M3 scales ([MOE-W4.md](MOE-W4.md),
+[MOE-W6.md](MOE-W6.md)); the dense w4 and w8 GEMM
 rows and the MXFP4 rows a drafter's linears take; and the 2-bit draft head. Every encoding also decodes through the core, which the
 converter's error report, the oracle and the quantisers' tests use.
 

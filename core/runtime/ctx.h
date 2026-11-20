@@ -21,6 +21,7 @@
 #include "rank_barrier.h"
 #include "residency.h"
 #include "stager.h"
+#include "wtab.h"
 #include "device/device.h"
 
 #include <atomic>
@@ -221,8 +222,8 @@ public:
 
     int  init(const CtxDesc& d);
     void shutdown();
-    int drain_streams();
-    int64_t arena_allocation_bytes() const { return arena_.bytes(); }
+    /* Both compute lanes must finish before their operands may be reassigned. */
+    int quiesce();
 
     /* ---------------------------------------------------------- the hot path */
     int issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
@@ -291,6 +292,32 @@ public:
         return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
     }
 
+    /* ---------------------------------------------------------- a checkpoint inside the step
+     * (RadBatch::ckpt_cut, rad_ckpt_snap). The engine arms the rank before it releases such a
+     * step: `stage` is this rank's checkpoint stage (KVManager::ckpt_stage), laid out as a
+     * checkpoint slot; per KV group, the sequence's committed state slot (-1: not stateful), the
+     * group's offset in the stage and its bytes a layer. Disarmed (stage null) for every other
+     * step. */
+    void set_ckpt_snap(void* stage, const std::vector<int32_t>& slot,
+                       const std::vector<int64_t>& off, const std::vector<int64_t>& lb) {
+        snap_stage_ = stage;
+        snap_slot_ = slot;
+        snap_off_ = off;
+        snap_lb_ = lb;
+        snap_done_.resize(kv_.size());
+        for (size_t g = 0; g < kv_.size(); ++g) snap_done_[g].assign(kv_[g].layer_slot.size(), 0);
+    }
+    int ckpt_snap(rad_kvgroup g, int layer);
+    /* Whether the armed step snapshotted group `g`'s pool layer `li` (a group-local index, as the
+     * stage lays it out); a layer the step left alone holds the snapshot's state at the step's end
+     * and the engine copies it in (Engine::save_checkpoints). */
+    bool ckpt_snapped(size_t g, int64_t li) const {
+        if (g >= snap_done_.size()) return false;
+        for (size_t i = 0; i < kv_[g].layer_slot.size(); ++i)
+            if (kv_[g].layer_slot[i] == li && snap_done_[g][i]) return true;
+        return false;
+    }
+
     /* ---------------------------------------------------------- routing (spec §5.5) */
     int route_report(int layer, const RadRouting* r);
     /* Layer `layer`'s row of the card-side histogram, when it holds `n_expert` counts; null
@@ -357,6 +384,9 @@ public:
     void        dump_profile() const;      /* spec §16, opt-in, with its caveat printed */
     const char* step_error() const { return step_fail_.c_str(); }
     int64_t     stream_waits() const { return n_stream_waits_; }
+    /* Weight-table patch dispatches issued so far (runtime/wtab.h): one for an op's tables where
+     * their changed entries fit one block. Tests read it. */
+    int64_t     wtab_patches() const { return n_wtab_patches_; }
     /* Lane 1 has work lane 0 has not joined (lane1_pending_). */
     bool        lane1_pending() const { return lane1_pending_; }
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
@@ -487,6 +517,22 @@ private:
     /* Brings the table's device array up to date on the current stream: every entry on the first
      * issue, afterwards the queued ones. */
     int  table_refresh(rad_op h, int operand, WeightTable& t);
+    /* The patches of one op's tables, gathered (runtime/wtab.h). A routed GEMM names four to eight
+     * tables (a class of experts each, weights and scales), and in a pass the stager armed for
+     * each of them changes a few entries at every issue; a dispatch a table put four ordered
+     * launches in front of every routed GEMM of a prefill chunk (384 a chunk on Flash-Next at two
+     * ranks, each a packet the card's processor takes in turn). While `wtab_gather_` is set
+     * (issue_body, over its operands) table_refresh appends to `wtab_acc_` and dispatches only a
+     * full block; wtab_flush dispatches the rest on the current stream before the op is launched.
+     * The writes and their order against every reader are the same: they are behind the stream's
+     * earlier work and in front of the op that reads the tables, whichever dispatch carries them,
+     * and no two of them name one entry (an entry is patched once an issue).
+     *
+     * Not while recording: there a refresh is host work the tape names (kTapeTable) and replays
+     * per table, and a gathered dispatch would land on the tape as a packet. */
+    WtabPatch wtab_acc_;
+    bool      wtab_gather_ = false;
+    int  wtab_flush();
     /* ------------------------------------------------------------------ recorded passes
      *
      * A decode pass repeats step after step: same kernels, arguments and queues. The host work
@@ -570,7 +616,7 @@ private:
                   int rec1);
     int  haz_mark(PassTape& t);
 
-    static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    static constexpr size_t  kTapes      = 48;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;
@@ -673,6 +719,11 @@ private:
     Program*        program_   = nullptr;
     Registry*       registry_  = nullptr;   /* CtxDesc::registry */
     std::vector<KVPoolBinding> kv_;   /* by rad_kvgroup; RAD_OPK_KV resolves through it */
+    /* set_ckpt_snap */
+    void*                snap_stage_ = nullptr;
+    std::vector<int32_t> snap_slot_;
+    std::vector<int64_t> snap_off_, snap_lb_;
+    std::vector<std::vector<uint8_t>> snap_done_;   /* [group][model layer] snapshotted */
     ResidencyTable* residency_ = nullptr;
     OpStager*       stager_ = nullptr;
     bool            staging_ = false;     /* the stager armed for the pass being issued */
@@ -851,6 +902,7 @@ private:
 
     int64_t n_issues_ = 0;
     int64_t n_stream_waits_ = 0;
+    int64_t n_wtab_patches_ = 0;
     int64_t n_host_syncs_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};

@@ -65,6 +65,7 @@ struct VramFacts {
      * per queue on an R9700, 8x the ring). */
     int     n_queues    = 0;
     int64_t queue_bytes = 0;
+    int64_t queue_scratch = 0;   /* resident queue scratch (rad_dev_resident_scratch_bytes), once a card */
     /* The next-layer expert prefetch's ring and buffers (xprefetch.h), when enabled; its stream is
      * one of `n_queues`. */
     int64_t prefetch    = 0;

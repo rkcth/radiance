@@ -251,3 +251,43 @@ IQ4R-L-V4 is 24% below the official FP8 checkpoint's KL (8.766 bpw, 0.00389) at 
 IQ2R-L-V4, at 2.8 bpw, is below the AWQ-tuned MXFP4 checkpoint (4.994 bpw, 0.03824). The design, the
 kernels and the measurements are in the IQR-V4 technical report
 (radiance.stilldeadco.de/whitepapers/iqr-v4.pdf).
+
+### Keeping the native MTP head with a split target
+
+For a **dense 64-layer Qwen3.8-27B checkpoint that actually ships the native `mtp.*` weights**,
+the optional `q38-27b-native-mtp-u2.recipe` adds that block at index 64. It drafts with rotated
+int8 linears and a replicated 2-bit projection of the original `lm_head.weight`. Verification
+still uses the target's vocabulary-weighted classes; no BF16 output matrix is added to the
+container. For IQ4R-S-V4, from the repository root:
+
+```sh
+python3 tools/vhead.py --keep-lm-head "$BF16" "$VHEAD" data/vhead/q38-27b-vhead-4.0.cls
+rad-convert "$VHEAD/model.safetensors.index.json" --arch qwen35 \
+    --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \
+    --recipe data/recipes/q38-27b-native-mtp-u2.recipe \
+    --recipe data/recipes/q38-27b-iq4r-s-v4.recipe -o target-with-mtp.rad
+```
+
+Use a fresh `VHEAD` directory on the same filesystem as the BF16 shards and export `CALIB` as
+for the target recipe. To retain an existing calibrated target, pass `--reuse original.rad` with
+the **same source, target recipe and calibration** and write a new file. Check the converter's
+reuse count and that the plan includes `mtp.fc.weight`, `blk.64.*` and `mtp.draft_head.weight`.
+
+To fit the U2 draft head to its actual inputs, run with `--calib-corpus FILE`, `--calib-dir DIR`,
+`--calib-layers 64:65` and `--num-speculative-tokens 0`. Layer 64 is the MTP block beside a
+64-layer trunk; this records `gram.r0.mtp.draft_head.bin` without loading the draft projection or
+generating proposals. Use `--calib-corpus`, not `--kld-record`, and select the virtual layer alone:
+this skips the trunk's separate int8 Hessian capture and allows tensor parallelism. Leave draft
+coupling off. Use `q38-27b-native-mtp-u2-gptq.recipe` in place of the RTN overlay, set
+`MTP_CALIB=DIR` and keep `CALIB` pointed at the target recipe's original Hessians. The base
+IQ4R-S-V4 recipe stays unchanged. The serving plugin is `qwen35_w8a8` (rotated int8 activations),
+not the deprecated block-FP8 plugin.
+
+No external drafter is needed. At serve time `num-speculative-tokens: auto` and
+`draft-window: adaptive` use the native chain; startup should report `'mtp' drafts`, not prompt
+lookup alone. `num-speculative-tokens: 0` leaves the extra block unloaded. An older split-head
+file without these weights does not acquire MTP by changing a flag. A supplied DFlash2 model
+still takes precedence. For optional coupled sampling, load `libr4d,spechub` and set
+`draft-coupling: on`; proposals then come from the U2 head's top eight. Coupled sampling
+preserves the target law, not fixed-seed text. As with other verify paths, different batch
+widths can flip a nearly tied greedy token.

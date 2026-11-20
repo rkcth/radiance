@@ -687,10 +687,67 @@ std::vector<MoeFmt> moe_formats() {
         { "w4nl64a8h", nl("w4nl", 64), { "codes", "table" }, { "scale", "scale.1" } },
         { "w4nl32a8h", nl("w4nl", 32), { "codes", "table" }, { "scale", "scale.1" } },
         { "w5nl64a8h", nl("w5nl", 64), { "codes", "table" }, { "scale", "scale.1" } },
+        { "w6nl64a8h", nl("w6nl", 64), { "codes", "table" }, { "scale", "scale.1" } },
     };
 }
 
 }  /* namespace */
+
+TEST(w6nl_all_codes_have_independent_bit_planes_and_round_trip) {
+    NEED_LIBQUANT();
+    constexpr int64_t N = 64, K = 256;
+    Opts qopt;
+    qopt.s("table", "w6nl").i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32")
+        .s("block2", "*x*").f("scale2_value", 0x1p-13).s("transform", "fwht128");
+    Quantised q = quantise(quantizer("rtn"), qopt, "blk.0.ffn_down_exps.0.weight", N, K,
+                           draw(N * K, 187, 1.0f));
+    REQUIRE_EQ(q.status, RAD_OK);
+    REQUIRE_EQ(q.enc.plane[0].dtype, (uint32_t)RAD_U6);
+    const int64_t row = rad_enc_row_bytes(RAD_U6, K);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k)
+            rad_store_code(q.planes[0].data() + n * row, RAD_U6, k, (int)((k + n * 17) % 64));
+    Opts kp;
+    kp.i("N", N).i("K", K).i("group", 128).s("dtype", "w6nl64a8h");
+    Selection s = select(q, N, K, { "codes", "table" });
+    RadLayout L{};
+    REQUIRE_EQ(nMoeW4.layout(kp.data(), kp.n(), B, &q.enc, s.sel.data(), s.t.data(), 2, &L), RAD_OK);
+    REQUIRE_EQ(L.bytes, N * K * 6 / 8);
+    std::vector<uint8_t> packed((size_t)L.bytes);
+    REQUIRE_EQ(nMoeW4.relayout(kp.data(), kp.n(), B, &q.enc, s.sel.data(), s.t.data(), 2,
+                               packed.data(), L.bytes), RAD_OK);
+    for (int64_t n = 0; n < N; ++n) for (int64_t k = 0; k < K; ++k) {
+        const uint8_t* r = packed.data() + n * K * 6 / 8;
+        const int want = (int)((k + n * 17) % 64);
+        const int lo = (r[(k / 8) * 4 + k % 4] >> ((k % 8 / 4) * 4)) & 15;
+        uint32_t h = 0, sign = 0;
+        std::memcpy(&h, r + K / 2 + (k / 32) * 4, 4);
+        std::memcpy(&sign, r + K / 2 + K / 8 + (k / 32) * 4, 4);
+        const uint32_t bit = 8u * (uint32_t)(k % 4) + 7u - (uint32_t)((k % 32) / 4);
+        CHECK_EQ(lo | (int)(((h >> bit) & 1u) << 4) | (int)(((sign >> bit) & 1u) << 5), want);
+    }
+    std::vector<std::vector<uint8_t>> backbuf;
+    Selection back = select(q, N, K, { "codes", "table" }, &backbuf);
+    REQUIRE_EQ(nMoeW4.unrelayout(kp.data(), kp.n(), B, &q.enc, back.sel.data(), packed.data(),
+                                 L.bytes, back.t.data(), 2), RAD_OK);
+    CHECK(backbuf[0] == q.planes[0]);
+    CHECK(backbuf[1] == q.planes[(size_t)s.sel[1]]);
+    /* A table with the right shape but different values must never reach the hard-coded GPU LUT. */
+    float bad = 0.0f;
+    std::memcpy(q.planes[(size_t)s.sel[1]].data(), &bad, sizeof bad);
+    s = select(q, N, K, { "codes", "table" });
+    CHECK_EQ(nMoeW4.relayout(kp.data(), kp.n(), B, &q.enc, s.sel.data(), s.t.data(), 2,
+                             packed.data(), L.bytes), RAD_E_DTYPE);
+    Selection scale = select(q, N, K, { "scale", "scale.1" });
+    RadLayout LS{};
+    REQUIRE_EQ(nMoeW4.layout(kp.data(), kp.n(), BSCALE, &q.enc, scale.sel.data(), scale.t.data(), 2,
+                              &LS), RAD_OK);
+    std::vector<uint8_t> scales((size_t)LS.bytes);
+    const float wrong_scale = 0x1p-12f;
+    std::memcpy(q.planes[(size_t)scale.sel[1]].data(), &wrong_scale, sizeof wrong_scale);
+    CHECK_EQ(nMoeW4.relayout(kp.data(), kp.n(), BSCALE, &q.enc, scale.sel.data(), scale.t.data(), 2,
+                             scales.data(), LS.bytes), RAD_E_DTYPE);
+}
 
 /* The four-class hooks are the two-class hooks extended. moe_gemm_q_mod4's class q is operands 2/3
  * at N/K for q = 0 and 2q+4/2q+5 at N_q/K_q after it, and each is stored and read back exactly as

@@ -184,10 +184,9 @@ inline long long calib_target() {
  * from an exercised one: libquant reads a per-expert file only when it holds several times K
  * rows. `domain` is what the tap summed; a reader quantising in another domain converts the file
  * itself (libquant's calib_sum). */
-inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
-                             uint32_t domain, int rank) {
-    const char* dir = calib_dir();
-    if (!dir || !h || k <= 0) return false;
+inline bool calib_write_host_to(const char* dir, const float* h, int64_t k, long long rows,
+                                 const char* what, uint32_t domain, int rank) {
+    if (!dir || !*dir || !h || k <= 0) return false;
     char path[512];
     std::snprintf(path, sizeof path, "%s/gram.r%d.%s.bin", dir, rank, what);
     FILE* f = std::fopen(path, "wb");
@@ -211,6 +210,11 @@ inline bool calib_write_host(const float* h, int64_t k, long long rows, const ch
     return okw;
 }
 
+inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
+                             uint32_t domain, int rank) {
+    return calib_write_host_to(calib_dir(), h, k, rows, what, domain, rank);
+}
+
 /* The same file from a device accumulator: copied back on the block's stream, then written. */
 inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const char* what,
                         uint32_t domain) {
@@ -221,6 +225,19 @@ inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const c
     if (rad_memcpy_async(h.data(), p, (int64_t)h.size() * 4, rad_stream(c)) < 0) return false;
     rad_stream_sync(rad_stream(c));
     return calib_write_host(h.data(), k, rows, what, domain, rad_rank(c));
+}
+
+/* A selected architecture tap may use the build context's directory directly, rather than the
+ * legacy process environment helper above. */
+inline bool calib_write_to(RadCtx* c, rad_buf b, int64_t k, long long rows, const char* what,
+                           uint32_t domain, const char* dir) {
+    if (!dir || !*dir || !b || k <= 0) return false;
+    void* p = rad_buf_ptr(c, b);
+    if (!p) return false;
+    std::vector<float> h((size_t)(k * k));
+    if (rad_memcpy_async(h.data(), p, (int64_t)h.size() * 4, rad_stream(c)) < 0) return false;
+    if (rad_stream_sync(rad_stream(c)) < 0) return false;
+    return calib_write_host_to(dir, h.data(), k, rows, what, domain, rad_rank(c));
 }
 
 /* A pinned host buffer of at least `bytes`, one per instance (slot), held for the process
@@ -344,8 +361,24 @@ private:
     std::string             scope_;
 };
 
-/* Returns the first negative status from a declare step. */
-#define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) return _s; } while (0)
+/* Returns the first negative status from a declare step, and says where the status crossed. A
+ * step can return a status with no message of its own, and a failed declare would then report
+ * the status alone. Every level the status passes prints one line, innermost first, so the lines
+ * read as the path from the step that failed up to the plugin's declare. */
+#ifdef __FILE_NAME__
+#define RAD_ARCH_FILE __FILE_NAME__
+#else
+#define RAD_ARCH_FILE __FILE__
+#endif
+#define RAD_ARCH_TRY(expr)                                                                  \
+    do {                                                                                    \
+        int _s = (expr);                                                                    \
+        if (_s < 0) {                                                                       \
+            fprintf(stderr, "radiance: declare: %s, from %s:%d\n", rad_strerror(_s),        \
+                    RAD_ARCH_FILE, __LINE__);                                               \
+            return _s;                                                                      \
+        }                                                                                   \
+    } while (0)
 
 /* ================================================================== C++-side decl helpers */
 /* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in
@@ -676,8 +709,13 @@ inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
 }
 /* The `prefetch` of `w`'s first `bytes` where a library serves it; 0 otherwise. A plugin declares
  * none where the deployment turns the reads off (RadBuildCtx::weight_prefetch_off). */
-inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes) {
+inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes, int64_t blocks = 0) {
     if (!w || bytes <= 0 || !rad_op_declared(b, "prefetch")) return 0;
+    /* `blocks`: the workgroups reading, where the architecture measured its own count (docs/OPS.md);
+     * 0 leaves the kernel's. Stated only when asked, so a declaration without it is what it was. */
+    if (blocks > 0)
+        return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes), RAD_INT("blocks", blocks)),
+                      RAD_WEIGHTS(w));
     return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes)), RAD_WEIGHTS(w));
 }
 
@@ -1464,6 +1502,46 @@ inline void batch_split(const RadBatch* b, int64_t* n_seq_dec, int64_t* n_tok_de
         case RAD_PHASE_DECODE:  *n_seq_dec = b->n_seq;       *n_tok_dec = b->n_tok;       break;
         default:                *n_seq_dec = b->n_seq_decode; *n_tok_dec = b->n_tok_decode; break;
     }
+}
+
+/* What a step's attention reads of the QSA selection (AttnGatedFP8::qsa_use), which decides what
+ * the indexer issues for the layer (QsaIndexer::step, docs/QSA.md "Below the bound"):
+ *
+ *   kQsaSelect  score and select, per layer: a step past the exactness bound, a streamed group,
+ *               and every step of a block that did not ask for the forms below;
+ *   kQsaUnread  nothing reads the selection: the step is entirely at or below the bound and its
+ *               attention is the dense one, or the sparse row over the sequence's own block table
+ *               (one row a sequence), which is what the selection would be. The indexer stores its
+ *               keys and tail and issues no query, score or select;
+ *   kQsaOnce    the attention reads a selection (the sparse row a query) on a step entirely at or
+ *               below the bound: every complete block is taken whatever it scores, so the
+ *               selection depends on the positions and the block table alone and is the same
+ *               bytes at every layer. The first full-attention layer of the pass issues it;
+ *               no later layer issues a query, a score or a select. */
+enum QsaUse : int { kQsaSelect = 0, kQsaUnread = 1, kQsaOnce = 2 };
+
+/* Ops of a chain that is independent of a block's own, for the block to issue behind its ordered
+ * launches. A recorded pass lets a launch start beside the last ordered one when it touches
+ * nothing in flight (Ctx::haz_mark). A dependent chain issued in one piece is therefore a row of
+ * ordered launches, each paid in turn; issued one op behind each of the block's own ordered
+ * launches, every op of it is unordered behind the block's launch in front of it, and still
+ * behind its own predecessor, which that launch already waited for. The block calls `at(k)` for
+ * k = 0, 1, 2, ... behind its ordered launches in turn, and the owner issues what is left once
+ * the block returns. The chain must read nothing the block writes and write nothing the block
+ * touches, and its buffers must be excluded from sharing (rad_buf_concurrent): they are in use at
+ * launches the linear order puts after their last declared use. */
+struct SideOps {
+    void (*fn)(void* u, int stage) = nullptr;
+    void* u = nullptr;
+    void at(int stage) const { if (fn) fn(u, stage); }
+};
+
+/* RADIANCE_DEBUG_QSA_EAGER: every step is kQsaSelect, each layer issuing its own selection. An
+ * instrument for comparing that sequence with the forms above (the text must not move); read
+ * once. */
+inline bool qsa_eager() {
+    static const bool on = std::getenv("RADIANCE_DEBUG_QSA_EAGER") != nullptr;
+    return on;
 }
 
 /* The step batch's entry for one declared KV group (built once per step by the core, spec §8). */

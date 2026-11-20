@@ -55,7 +55,7 @@ template <int MT, bool CHAIN>
 __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
-  if (CHAIN) r4d_chain_wait();
+  if (CHAIN) r4d_chain_wait_vec();
   extern __shared__ float red[];              // WV*SK*256 floats: one 16x16 tile per (column, split)
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;

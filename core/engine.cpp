@@ -3,7 +3,7 @@
  * their own files (engine_priv.h).
  */
 #include "engine_priv.h"
-#include "engine_hostmem.h"
+#include "place/expert_memory.h"
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
@@ -21,7 +21,6 @@
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
-#include "service.h"
 #include "server/front.h"
 #include "server/server.h"
 #include "server/sink.h"
@@ -44,9 +43,7 @@
 #include <utility>
 #include <vector>
 #include <thread>
-#include <system_error>
 #include <sys/mman.h>
-#include <csignal>
 #include <unistd.h>
 
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -54,12 +51,6 @@
 #endif
 
 namespace rad {
-
-namespace {
-std::atomic<bool> g_signalled{false};
-void on_signal(int) { g_signalled.store(true, std::memory_order_relaxed); }
-}
-
 
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
 namespace {
@@ -281,14 +272,75 @@ Engine::Engine(Config cfg)
  * the compute stream waits for it, so memory leaving the card must wait for it here: a gather over
  * a range just unbacked is a GPU memory fault. The compute stream goes first because the copy is
  * ordered after it. */
-void Engine::drain_streams() {
-    const int dev = dev_current();
-    for (auto& rk : ranks_) {
-        (void)rad_stream_sync(rk->ctx.stream());
-        if (RadStream t = rk->mover.transfer_stream()) (void)rad_stream_sync(t);
-        rk->tierx.quiesce();
+int Engine::drain_streams() {
+    const int device = dev_current();
+    int status = RAD_OK;
+    for (auto& rank : ranks_) {
+        auto check = [&](int rc, const char* stream) {
+            if (rc >= 0) return;
+            RAD_ERR("memory handoff: rank %d %s did not drain: %s (%s)", rank->index,
+                    stream, rad_strerror(rc), rad_dev_last_error());
+            if (status >= 0) status = rc;
+        };
+        if (RadStream stream = rank->ctx.stream()) check(rank->ctx.quiesce(), "compute streams");
+        if (RadStream stream = rank->mover.transfer_stream()) check(rad_stream_sync(stream), "expert transfer stream");
+        check(rank->tierx.quiesce(), "KV transfer stream");
     }
-    (void)rad_dev_set(dev);
+    if (map_fence_pending_.load(std::memory_order_acquire)) {
+        const int rc = dev_settle_maps();
+        if (rc >= 0) map_fence_pending_.store(false, std::memory_order_release);
+        else if (status >= 0) status = rc;
+    }
+    if (device >= 0 && rad_dev_set(device) < 0 && status >= 0) status = RAD_E_DEVICE;
+    memory_fence_status_.store(status, std::memory_order_release);
+    return status;
+}
+
+int Engine::drain_tier_streams() {
+    const int device = dev_current();
+    int status = RAD_OK;
+    for (auto& rank : ranks_) {
+        const int rc = rank->tierx.quiesce();
+        if (rc < 0) {
+            RAD_ERR("KV ownership handoff: rank %d transfer did not drain: %s", rank->index,
+                    rad_strerror(rc));
+            if (status >= 0) status = rc;
+        }
+    }
+    if (device >= 0 && rad_dev_set(device) < 0 && status >= 0) status = RAD_E_DEVICE;
+    if (status < 0) memory_fence_status_.store(status, std::memory_order_release);
+    return status;
+}
+
+int Engine::report_tier_jobs(std::vector<TierJob>& jobs, const std::vector<char>& ok,
+                             uint64_t now) {
+    /* A failed restore may have written a follower's shard even when the leader failed first.
+     * Shared block IDs cannot be recycled until every rank's transfer has stopped. */
+    bool failed = ok.size() < jobs.size();
+    for (char good : ok) failed = failed || !good;
+    if (failed) RAD_TRY(drain_tier_streams());
+    return ranks_[0]->tierx.report_pass(jobs, ok, now);
+}
+
+int Engine::prepare_unload() {
+    if (!producers_stopped()) return RAD_E_STATE;
+    return drain_streams();
+}
+
+int Engine::retry_memory_fence() {
+    if (producers_stopped()) return prepare_unload();
+    /* A parked loop sleeps in hold_point and cannot service a quiet callback. Refuse
+     * promptly; unload can retry after an explicit producer shutdown. */
+    if (parked_.load(std::memory_order_acquire)) return RAD_E_STATE;
+    if (stopping_.load(std::memory_order_acquire) || !serving_.load(std::memory_order_acquire))
+        return RAD_E_STATE;
+    return run_quiet([] { return RAD_OK; });
+}
+
+int Engine::release_deferred_quietly() {
+    RAD_TRY(drain_streams());
+    sched_.release_deferred();
+    return RAD_OK;
 }
 
 std::vector<int> Engine::rank_devices() const {
@@ -302,7 +354,13 @@ std::vector<int> Engine::rank_devices() const {
  * drained before the loop answers, so the fleet may page the memory out at once. */
 void Engine::hold_point(StallWatch* watch) {
     if (!hold_req_.load(std::memory_order_acquire)) return;
-    drain_streams();
+    if (hold_status_.load(std::memory_order_acquire) < 0) return;
+    const int status = drain_streams();
+    if (status < 0) {
+        hold_status_.store(status, std::memory_order_release);
+        hold_cv_.notify_all();
+        return;
+    }
     hold_ack_.store(true, std::memory_order_release);
     /* A park lasts as long as the fleet keeps the model off its cards. The loop sleeps until the
      * hold clears or the engine stops, waking once a second besides to mark the step watch, so a
@@ -374,17 +432,21 @@ int Engine::park(int64_t drain_ms, const PageOut& req, PageResult* got, std::str
             return RAD_E_STATE;
         }
     }
+    hold_status_.store(RAD_OK, std::memory_order_release);
     hold_req_.store(true, std::memory_order_release);
     sched_.wake();
     for (int i = 0; i < 60000 && !hold_ack_.load(std::memory_order_acquire); ++i) {
-        if (loop_status_.load(std::memory_order_acquire) < 0) break;
+        if (loop_status_.load(std::memory_order_acquire) < 0 ||
+            hold_status_.load(std::memory_order_acquire) < 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (!hold_ack_.load(std::memory_order_acquire)) {
         hold_release();
         front_->attach(name, front_aliases_, srv_);
-        *why = "the step loop did not come to rest";
-        return RAD_E_STATE;
+        const int status = hold_status_.load(std::memory_order_acquire);
+        *why = status < 0 ? "the device streams did not drain; memory remains resident"
+                          : "the step loop did not come to rest";
+        return status < 0 ? status : RAD_E_STATE;
     }
     const auto t1 = clk::now();
     EngineScope es(owner_, name.c_str());
@@ -393,24 +455,43 @@ int Engine::park(int64_t drain_ms, const PageOut& req, PageResult* got, std::str
      * (nothing runs, so no block is live), and the activation arena above its fixed region:
      * transients live within one step, and the loop rests between steps. A unit still in a slot
      * the arena lent keeps the arena copied. */
+    /* Reclaim can itself submit copies. Any failure aborts the handoff before paging or
+     * discarding memory, and leaves the engine owned and charged for a fenced retry. */
+    auto refuse = [&](int status, const char* operation) {
+        memory_fence_status_.store(status, std::memory_order_release);
+        (void)xflex_settle();
+        *why = std::string(operation) + "; memory remains owned";
+        hold_release();
+        front_->attach(name, front_aliases_, srv_);
+        return status;
+    };
     std::vector<std::pair<const void*, int64_t>> spare;
     for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) continue;
+        if (rad_dev_set(r->device) < 0) return refuse(RAD_E_DEVICE, "selecting the park device failed");
         if (r->mover.flex_capacity() > 0) {
-            (void)r->mover.reclaim(Mover::kLendKV, 0, &r->heat);
-            (void)r->mover.reclaim(Mover::kLendArena, 0, &r->heat);
-            (void)r->mover.reclaim(Mover::kLendFleet, 0, &r->heat);
+            for (int lender : {Mover::kLendKV, Mover::kLendArena, Mover::kLendFleet})
+                if (const int rc = r->mover.reclaim(lender, 0, &r->heat); rc < 0)
+                    return refuse(rc, "recalling expert slots failed");
         }
-        /* The fleet's loan is unbacked, not copied: nothing in it outlives the recall. */
-        if (r->xflex.committed() > 0 && r->mover.loan_held(Mover::kLendFleet) == 0)
-            (void)r->xflex.decommit(0, r->xflex.size());
-        if (r->heat.enabled() && r->mover.drop_slab(&r->heat, &spare) < 0)
-            RAD_WARN("rank %d: the expert slab could not be emptied for the park; it is copied", r->index);
+        if (r->heat.enabled())
+            if (const int rc = r->mover.drop_slab(&r->heat, &spare); rc < 0)
+                return refuse(rc, "emptying the expert slab failed");
         const int64_t fixed = r->program.arena_fixed_bytes, top = r->ctx.arena_bytes();
         if (r->ctx.arena_base() && top > fixed && r->mover.loan_held(Mover::kLendArena) == 0)
             spare.push_back({ (const char*)r->ctx.arena_base() + fixed, top - fixed });
     }
+    if (const int rc = drain_streams(); rc < 0) return refuse(rc, "post-recall device fence failed");
+    for (auto& r : ranks_) {
+        if (rad_dev_set(r->device) < 0) return refuse(RAD_E_DEVICE, "selecting the park device failed");
+        if (r->mover.loan_held(Mover::kLendFleet) == 0) {
+            if (const int rc = r->mover.set_loan(Mover::kLendFleet, 0); rc < 0)
+                return refuse(rc, "withdrawing the expert loan failed");
+            if (const int rc = r->xflex.decommit(0, r->xflex.size()); rc < 0)
+                return refuse(rc, "unbacking the expert loan failed");
+        }
+    }
     if (!spare.empty()) dev_page_discard(owner_, spare);
+    xflex_restore_.clear();
     (void)xflex_settle();
     if (cfg_.prefix_cache) (void)sched_.reset_prefix_cache();
     const auto t2 = clk::now();
@@ -421,7 +502,9 @@ int Engine::park(int64_t drain_ms, const PageOut& req, PageResult* got, std::str
     if (rc < 0) {
         /* Whatever left comes back, and the model serves as before. */
         *why = std::string("paging out failed: ") + rad_dev_last_error();
-        (void)page_back_in(nullptr);
+        if (page_back_in(nullptr) < 0)
+            fatal("model %s: paging rollback failed; refusing to resume with missing weights or backing",
+                  name.c_str());
         hold_release();
         front_->attach(name, front_aliases_, srv_);
         return rc;
@@ -441,16 +524,21 @@ int64_t Engine::flex_release(int64_t bytes, bool preempt, int64_t wait_ms, bool 
     const bool has_kv = kv && ranks_[0]->kv.flex();
     if (!has_kv && xflex_bytes_.load() <= 0) return 0;
     std::unique_lock<std::mutex> lk(flex_mu_);
+    if (flex_pending_.load(std::memory_order_acquire)) return RAD_E_STATE;
     flex_want_ = bytes;
     flex_preempt_ = preempt;
     flex_kv_ = has_kv;
-    flex_got_ = -1;
+    /* One owner holds this handoff until completion or timeout. A service that was waiting
+     * on the mutex must recheck pending before touching this or a subsequent request. */
+    flex_got_ = 0;
+    flex_done_ = false;
+    flex_status_ = RAD_OK;
     flex_pending_.store(true, std::memory_order_release);
     flex_cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] {
-        return flex_got_ >= 0 || stopping_.load(std::memory_order_acquire);
+        return flex_done_ || stopping_.load(std::memory_order_acquire);
     });
     flex_pending_.store(false, std::memory_order_release);
-    return flex_got_ > 0 ? flex_got_ : 0;
+    return flex_done_ && flex_status_ < 0 ? flex_status_ : std::max<int64_t>(flex_got_, 0);
 }
 
 /* On the step loop's thread, between steps with nothing issued ahead: the expert slab's fleet loan
@@ -460,12 +548,25 @@ int64_t Engine::flex_release(int64_t bytes, bool preempt, int64_t wait_ms, bool 
 void Engine::flex_service() {
     if (!flex_pending_.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(flex_mu_);
-    if (flex_got_ >= 0) return;
-    drain_streams();
+    if (!flex_pending_.load(std::memory_order_acquire) || flex_done_) return;
+    flex_status_ = drain_streams();
+    if (flex_status_ < 0) {
+        flex_done_ = true;
+        flex_cv_.notify_all();
+        return;
+    }
     /* The experts' loan first: giving it back is an address change for each unit in it. */
     const int64_t xgot = xflex_give(flex_want_);
+    if (xgot < 0) {
+        flex_status_ = (int)xgot;
+        memory_fence_status_.store(flex_status_, std::memory_order_release);
+        flex_done_ = true;
+        flex_cv_.notify_all();
+        return;
+    }
     if (xgot >= flex_want_ || !flex_kv_) {
         flex_got_ = xgot;
+        flex_done_ = true;
         flex_cv_.notify_all();
         return;
     }
@@ -512,6 +613,7 @@ void Engine::flex_service() {
     flex_got_ = xgot + std::max<int64_t>(before - ranks_[0]->pools.kv().committed(), 0);
     RAD_INFO("flex: asked for %s, the cache could give %lld of %lld tokens, gave back %s",
              humanb(flex_want_).c_str(), (long long)take, (long long)want, humanb(flex_got_).c_str());
+    flex_done_ = true;
     flex_cv_.notify_all();
 }
 
@@ -530,38 +632,118 @@ int64_t Engine::xflex_settle() {
  * bytes given back on each card. The slab does not grow again for five seconds, so the model that
  * asked for the room gets it first. */
 int64_t Engine::xflex_give(int64_t bytes) {
-    const int64_t cur = xflex_bytes_.load(std::memory_order_acquire);
-    if (bytes <= 0 || cur <= 0) return 0;
-    const int64_t g = std::max<int64_t>(VMem::granularity(), 1);
-    int64_t to = std::max<int64_t>(cur - (bytes + g - 1) / g * g, 0);
-    for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) continue;
-        if (const int st = r->mover.reclaim(Mover::kLendFleet, to, &r->heat); st < 0)
-            RAD_WARN("expert flex: rank %d could not recall its slab to %s: %s", r->index,
-                     humanb(to).c_str(), rad_strerror(st));
-        /* What a unit still holds stays backed. */
-        to = std::max(to, (r->mover.loan_held(Mover::kLendFleet) + g - 1) / g * g);
+    const int64_t current = xflex_bytes_.load(std::memory_order_acquire);
+    if (bytes <= 0 || current <= 0) return 0;
+    const int64_t granule = std::max<int64_t>(VMem::granularity(), 1);
+    const int64_t amount = bytes >= current ? current : align_up(bytes, granule);
+    const int64_t target = std::max<int64_t>(current - amount, 0);
+    std::vector<int64_t> keep(ranks_.size()), offer(ranks_.size());
+    int64_t previous_usable = current;
+    /* Physical backing can differ after a failed grow. A recall may reduce, never increase,
+     * each rank's published capacity. Any still-held units remain physically backed. */
+    for (size_t index = 0; index < ranks_.size(); ++index) {
+        auto& rank = *ranks_[index];
+        if (rad_dev_set(rank.device) < 0) return RAD_E_DEVICE;
+        const int64_t suffix = rank.xflex.committed_suffix();
+        const int64_t usable = std::min(rank.mover.loan_offered(Mover::kLendFleet), suffix);
+        previous_usable = std::min(previous_usable, usable);
+        offer[index] = std::min(target, usable);
+        if (rank.mover.flex_capacity() > 0) {
+            const int status = rank.mover.reclaim(Mover::kLendFleet, offer[index], &rank.heat);
+            if (status < 0) return status;
+        }
+        const int64_t held = align_up(rank.mover.loan_held(Mover::kLendFleet), granule);
+        if (held > suffix) return RAD_E_STATE;
+        keep[index] = std::max(offer[index], held);
     }
-    for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) continue;
-        const int64_t top = r->xflex.size();
-        (void)r->mover.set_loan(Mover::kLendFleet, to);
-        if (const int st = r->xflex.decommit(std::max<int64_t>(top - cur, 0), cur - to); st < 0)
-            RAD_WARN("expert flex: rank %d could not unback %s: %s (%s)", r->index,
-                     humanb(cur - to).c_str(), rad_strerror(st), rad_dev_last_error());
+    for (size_t index = 0; index < ranks_.size(); ++index)
+        RAD_TRY(ranks_[index]->mover.set_loan(Mover::kLendFleet, offer[index]));
+    int status = RAD_OK;
+    for (size_t index = 0; index < ranks_.size(); ++index) {
+        auto& rank = *ranks_[index];
+        int rc = rad_dev_set(rank.device);
+        if (rc >= 0) rc = rank.xflex.decommit(0, std::max<int64_t>(rank.xflex.size() - keep[index], 0));
+        if (rc < 0) {
+            RAD_WARN("expert flex: rank %d backing recall failed: %s (%s)", rank.index,
+                     rad_strerror(rc), rad_dev_last_error());
+            if (status >= 0) status = rc;
+        }
     }
     (void)rad_dev_set(ranks_[0]->device);
-    const int64_t left = xflex_settle();
+    const int64_t remaining = xflex_settle();
     xflex_retry_ns_ = rad_mono_ns() + 5000000000ull;
-    const int64_t got = std::max<int64_t>(cur - left, 0);
-    if (got > 0)
-        RAD_INFO("expert flex: the slab gave back %s a card, keeps %s", humanb(got).c_str(),
-                 humanb(left).c_str());
-    return got;
+    if (status < 0) return status;
+    const int64_t released = std::max<int64_t>(current - remaining, 0);
+    if (released > 0) xflex_restore_.recalled(previous_usable, *std::min_element(offer.begin(), offer.end()));
+    if (released > 0)
+        RAD_INFO("expert flex: the slab gave back %s a card, keeps %s", humanb(released).c_str(),
+                 humanb(remaining).c_str());
+    return released;
 }
 
-/* Every tenth of a second on the step loop. While the engine has been busy in the last five
- * seconds, the slab grows a GiB at a time into memory the fleet says no model holds, and grows
+/* Full suffix commits are idempotent. In particular, a previous partial TP operation may have
+ * left fewer pages on one rank than the fleet's conservative maximum reports. Never skip those
+ * pages just because another rank still has them. A failed grow keeps its partial backing
+ * charged and its old loans unchanged; rolling back the whole range could unmap live experts. */
+int Engine::xflex_grow_to(int64_t bytes, ExpertMemoryOps& memory) {
+    if (bytes <= 0 || memory.rank_count() != ranks_.size()) return RAD_E_INVAL;
+    int64_t missing = 0;
+    for (size_t rank = 0; rank < ranks_.size(); ++rank) {
+        const VMem& range = memory.memory(rank);
+        if (bytes > range.size()) return RAD_E_INVAL;
+        missing = std::max(missing, bytes - range.committed_bytes(range.size() - bytes, bytes));
+    }
+    const bool granted = missing > 0;
+    if (granted && !broker_->flex_grow(rank_devices(), missing)) return RAD_E_FULL;
+    struct Reservation {
+        VramBroker* broker;
+        ~Reservation() { if (broker) broker->flex_done(); }
+    } reservation{granted ? broker_ : nullptr};
+    for (size_t rank = 0; rank < ranks_.size(); ++rank) {
+        int status = memory.select(rank);
+        if (status >= 0) {
+            VMem& range = memory.memory(rank);
+            status = memory.commit(rank, range.size() - bytes, bytes);
+        }
+        if (status < 0) {
+            if (const int fence = memory.settle(); fence < 0) {
+                map_fence_pending_.store(true, std::memory_order_release);
+                memory_fence_status_.store(fence, std::memory_order_release);
+            }
+            xflex_settle();
+            return status;
+        }
+    }
+    /* A previous commit may have mapped its pages but failed the translation-settle step.
+     * Even an entirely idempotent retry must complete that fence before exposing the pages. */
+    const int settled = memory.settle();
+    if (settled < 0) {
+        map_fence_pending_.store(true, std::memory_order_release);
+        memory_fence_status_.store(settled, std::memory_order_release);
+        xflex_settle();
+        return settled;
+    }
+    if (map_fence_pending_.load(std::memory_order_acquire) && drain_streams() < 0)
+        return memory_fence_status();
+    for (size_t rank = 0; rank < ranks_.size(); ++rank) {
+        const VMem& range = memory.memory(rank);
+        if (!range.is_committed(range.size() - bytes, bytes)) {
+            xflex_settle();
+            return RAD_E_STATE;
+        }
+    }
+    for (auto& rank : ranks_) {
+        if (rank->mover.loan_offered(Mover::kLendFleet) < bytes)
+            RAD_TRY(rank->mover.set_loan(Mover::kLendFleet, bytes));
+    }
+    xflex_settle();
+    return RAD_OK;
+}
+
+/* Every tenth of a second on the step loop. While recently busy, or restoring backing a
+ * peer's recall removed, the slab grows a GiB at a time into memory the fleet says no model
+ * holds. Idle restoration stops at its previous watermark and never advertises eviction demand.
+ * The slab grows
  * again only once the units fill what it already has, leaving no more than the turnover slots and
  * half a step empty (an empty slot is VRAM nothing uses). A refusal is remembered, so the fleet
  * can make room for it (expert_flex_wanted), and asked again a second later; a backing that fails
@@ -573,49 +755,55 @@ void Engine::xflex_tick(bool busy) {
     if (now - xflex_ns_ < 100000000ull) return;
     xflex_ns_ = now;
     const int64_t cur = xflex_bytes_.load(std::memory_order_acquire);
-    if (cur >= xflex_cap_ || now - xflex_busy_ns_ > 5000000000ull) {
+    // Physical charge is the maximum across ranks. Only a settled suffix offered on
+    // every rank is usable, and can satisfy an idle restoration watermark.
+    int64_t usable = map_fence_pending_.load(std::memory_order_acquire) ? 0 : cur;
+    for (const auto& rank : ranks_)
+        usable = std::min({usable, rank->xflex.committed_suffix(),
+                           rank->mover.loan_offered(Mover::kLendFleet)});
+    const bool idle_restore = now - xflex_busy_ns_ > 5000000000ull;
+    const int64_t restore_limit = xflex_restore_.limit(usable, xflex_cap_);
+    const int64_t limit = idle_restore ? restore_limit : xflex_cap_;
+    if (idle_restore) xflex_want_.store(0, std::memory_order_release);
+    if (usable >= limit) {
         xflex_want_.store(0, std::memory_order_release);
         return;
     }
-    if (now < xflex_retry_ns_) return;
+    if (now < xflex_retry_ns_ || (idle_restore && !xflex_restore_.ready(now))) return;
     const Mover& m0 = ranks_[0]->mover;
     const int64_t g = std::max<int64_t>(VMem::granularity(), 1);
-    const int64_t step = std::min<int64_t>(((int64_t)1 << 30) / g * g, xflex_cap_ - cur);
+    const int64_t step = std::min<int64_t>(((int64_t)1 << 30) / g * g, limit - usable);
     /* Still filling: what the loans offer and no unit holds, past the slots kept free for swaps. */
     const int64_t kept = m0.turnover_bytes();
-    if (m0.flex_offered_bytes() - m0.flex_used_bytes() > kept + step / 2) return;
-    if (!broker_->flex_grow(rank_devices(), step)) {
-        xflex_want_.store(xflex_cap_ - cur, std::memory_order_release);
-        xflex_retry_ns_ = now + 1000000000ull;
-        return;
-    }
-    struct Landed { VramBroker* b; ~Landed() { b->flex_done(); } } landed{ broker_ };
-    const int64_t to = cur + step;
-    bool ok = true;
-    for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) { ok = false; break; }
-        const int64_t top = r->xflex.size();
-        if (r->xflex.commit(std::max<int64_t>(top - to, 0), std::min(step, top)) < 0) { ok = false; break; }
-    }
-    if (!ok) {
-        RAD_WARN("expert flex: backing %s more a card failed (%s); trying again later",
-                 humanb(step).c_str(), rad_dev_last_error());
-        for (auto& r : ranks_) {
-            if (rad_dev_set(r->device) < 0) continue;
-            const int64_t top = r->xflex.size();
-            (void)r->xflex.decommit(std::max<int64_t>(top - to, 0), step);
-        }
-        (void)rad_dev_set(ranks_[0]->device);
-        xflex_retry_ns_ = now + 5000000000ull;
-        return;
-    }
-    for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) continue;
-        (void)r->mover.set_loan(Mover::kLendFleet, to);
-    }
+    if (usable == cur && m0.flex_offered_bytes() - m0.flex_used_bytes() > kept + step / 2) return;
+    struct RankMemory final : ExpertMemoryOps {
+        std::vector<std::unique_ptr<Rank>>& ranks;
+        explicit RankMemory(std::vector<std::unique_ptr<Rank>>& r) : ranks(r) {}
+        size_t rank_count() const override { return ranks.size(); }
+        VMem& memory(size_t rank) override { return ranks[rank]->xflex; }
+        int select(size_t rank) override { return rad_dev_set(ranks[rank]->device); }
+    } memory(ranks_);
+    const int64_t to = usable + step;
+    const int status = xflex_grow_to(to, memory);
     (void)rad_dev_set(ranks_[0]->device);
-    xflex_bytes_.store(to, std::memory_order_release);
+    if (status < 0) {
+        if (status == RAD_E_FULL) {
+            xflex_want_.store(xflex_restore_.refused(now, idle_restore, xflex_cap_ - usable),
+                              std::memory_order_release);
+            if (!idle_restore) xflex_retry_ns_ = now + 1000000000ull;
+        } else {
+            xflex_want_.store(0, std::memory_order_release);
+            xflex_retry_ns_ = now + 5000000000ull;
+            RAD_WARN("expert flex: growing to %s a card failed: %s (%s)",
+                     humanb(to).c_str(), rad_strerror(status), rad_dev_last_error());
+        }
+        return;
+    }
     xflex_want_.store(0, std::memory_order_release);
+    (void)xflex_restore_.limit(to, xflex_cap_);
+    if (idle_restore && to >= restore_limit)
+        RAD_INFO("expert flex: restored previous %s of backing a card while idle; "
+                 "cached expert fill continues", humanb(to).c_str());
     if (to >= xflex_cap_ || cur == 0)
         RAD_INFO("expert flex: the slab grows into memory no model holds: %s a card of up to %s",
                  humanb(to).c_str(), humanb(xflex_cap_).c_str());
@@ -726,6 +914,7 @@ int Engine::unpark_with(std::string* why, int64_t* left) {
 }
 
 int Engine::run_quiet(const std::function<int()>& fn) {
+    std::lock_guard<std::mutex> caller(quiet_call_mu_);
     std::unique_lock<std::mutex> lk(quiet_mu_);
     quiet_fn_ = &fn;
     quiet_done_ = false;
@@ -747,8 +936,8 @@ void Engine::quiet_service() {
     std::lock_guard<std::mutex> lk(quiet_mu_);
     if (quiet_done_ || !quiet_fn_) return;
     const int dev = dev_current();
-    drain_streams();
-    quiet_rc_ = (*quiet_fn_)();
+    quiet_rc_ = drain_streams();
+    if (quiet_rc_ >= 0) quiet_rc_ = (*quiet_fn_)();
     (void)rad_dev_set(dev);
     quiet_done_ = true;
     quiet_cv_.notify_all();
@@ -767,7 +956,12 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
-    stop_supplemental_text();
+    /* A destructor cannot retain ownership for a retry. Do not unwind through allocations
+     * the device might still use: the established device-fault policy is a process restart. */
+    if (!producers_stopped() || drain_streams() < 0)
+        fatal("model %s: refusing to free memory after a failed device fence; exiting for restart",
+              cfg_.served_model_name.c_str());
+    depth_log_stats("final");
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -805,16 +999,10 @@ Engine::~Engine() {
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill
      * landing in a freed arena is a GPU memory fault. */
     for (auto& r : ranks_) {
-        (void)rad_dev_set(r->device);
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
         r->tierx.quiesce();
     }
-    for (auto& r : ranks_) {
-        (void)rad_dev_set(r->device);
-        r->ctx.shutdown();
-    }
-    sched_.fini();
-    gen_.reset();
+    for (auto& r : ranks_) r->ctx.shutdown();
     if (cards_claimed_) {
         const std::vector<int> cards = rank_devices();
         (void)rad_dev_cards_claim(cards.data(), (int)cards.size(), 0);
@@ -822,15 +1010,12 @@ Engine::~Engine() {
     }
     /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
      * since a pass reads them. Safe after a failed bring-up. */
-    for (auto& r : ranks_) {
-        (void)rad_dev_set(r->device);
-        r->kv.free_stream(rad_device_allocator());
-    }
+    for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
     step_state_fini();
-    for (auto& r : ranks_) {
-        (void)rad_dev_set(r->device);
-        r.reset();
-    }
+    /* The step batch's staging, events and media buffers (BatchBuilder), freed while the ranks'
+     * KV managers the scheduler releases sequences into still exist. A process that unloads
+     * models would otherwise keep every engine's. */
+    sched_.fini();
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
     table_copies_.clear();
@@ -900,6 +1085,8 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
+    sc.draft_verify_block = cfg_.draft_verify_block;
+    sc.draft_verify_traversal = cfg_.draft_verify_traversal;
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
@@ -1037,6 +1224,9 @@ void Engine::tiering_dispatch(Rank& r, int step) {
      * credited; the next unstaged step swaps on them. */
     std::vector<Swap> swaps;
     if (!r.stager.staged() && r.heat.step(&swaps) < 0) return;
+    /* What the turnover slots follow (MoverConfig::turnover_adaptive). A staged step proposes
+     * nothing and holds the turnover filled anyway (below), so it is not a quiet step. */
+    if (!r.stager.staged()) r.mover.swap_demand((int64_t)swaps.size());
     for (const Swap& s : swaps) {
         /* Contract: every proposed unit is busy until `issue` takes it or `abandon` returns it;
          * a dropped proposal stays busy forever. */
@@ -1230,7 +1420,8 @@ int Engine::prepare_release(const RadBatch* b) {
      * parked, so no allocation races the read. */
     kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
-    return RAD_OK;
+    /* A checkpoint inside the step: every rank's Ctx copies into its stage (Ctx::set_ckpt_snap). */
+    return ckpt_stage_arm(b);
 }
 
 int Engine::issue_ahead(const RadBatch** out) {
@@ -1240,7 +1431,9 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (flex_pending_.load(std::memory_order_acquire) || quiet_pending_.load(std::memory_order_acquire))
         return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
-        sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
+        /* --draft-depth adaptive: the row's own chain (Engine::depth_row_nodes); else the rounds
+         * every row ran. */
+        sched_.expect_draft(serial_row_[(size_t)i].seq, depth_row_nodes(i));
     for (int i = 0; i < block_rows_; ++i)
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
@@ -1298,10 +1491,7 @@ int Engine::step_loop() {
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    /* In shared mode the lock covers a complete text step including draft
-     * passes and proposal publication. A forward pass issued ahead would
-     * remain live when the image engine takes the next turn. */
-    pipelining_ = !shared_ && !cfg_.kld() && !cfg_.calib() && !embedding_ &&
+    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
     early_ids_ = !cfg_.kld() && !embedding_;
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
@@ -1329,23 +1519,6 @@ int Engine::step_loop() {
      * Every iteration, idle or not, marks progress, so only a stuck step is reported. */
     rad::StallWatch step_watch("step", 20000);
     while (!stopping_.load(std::memory_order_acquire)) {
-        std::unique_lock<std::mutex> dispatch;
-        if (shared_) {
-            dispatch = std::unique_lock<std::mutex>(shared_->dispatch_);
-            const auto image_has_turn = [this] {
-                return shared_->image_dispatch_waiters_.load(std::memory_order_acquire) != 0 ||
-                       (shared_->image_waiting_.load(std::memory_order_acquire) &&
-                        shared_->text_issued_);
-            };
-            shared_->turn_.wait_for(dispatch, std::chrono::milliseconds(1), [&] {
-                return stopping_.load(std::memory_order_acquire) || shared_->failed() ||
-                       !image_has_turn();
-            });
-            if (stopping_.load(std::memory_order_acquire)) break;
-            if (shared_->failed()) return fail_loop(RAD_E_STATE);
-            if (image_has_turn()) continue;
-            if (const int st = shared_->enter_text(); st < 0) return fail_loop(st);
-        }
         step_watch.progress();
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
@@ -1367,6 +1540,7 @@ int Engine::step_loop() {
         const uint64_t woke = issued ? 0 : sched_.wake_seq();
         if (issued) sched_.promote_next();
         else        b = sched_.step();
+        if (memory_fence_status() < 0) return fail_loop(memory_fence_status());
         if (!b) {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
@@ -1381,8 +1555,7 @@ int Engine::step_loop() {
              * may be what blocks the next admission. Drain the streams first so no in-flight pass
              * still reads them. */
             if (sched_.has_deferred()) {
-                for (auto& rk : ranks_) (void)rad_stream_sync(rk->ctx.stream());
-                sched_.release_deferred();
+                if (const int rc = release_deferred_quietly(); rc < 0) return fail_loop(rc);
             }
             tier_tick();
             /* A park waits here once the tiers' copies have landed, before the idle work that
@@ -1398,12 +1571,10 @@ int Engine::step_loop() {
              * lengthens, up to 20 ms, which the periodic idle work above tolerates. Polling at
              * 1 ms woke an idle engine a thousand times a second. */
             if (idle < 200) ++idle;
-            if (dispatch.owns_lock()) dispatch.unlock();
             sched_.wait_idle(woke, std::chrono::microseconds(idle * 100));
             continue;
         }
         idle = 0;
-        if (shared_ && shared_->active_) ++shared_->text_steps_during_image_;
         if (t_on) phase_mark(PH_PLAN);
 
         clear_fresh_states();
@@ -1684,13 +1855,6 @@ int Engine::step_loop() {
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
-        if (shared_ && shared_->active_ && cfg_.n_spec > 0) {
-            for (size_t i = 0; i < plan.e.size(); ++i) {
-                if (plan.e[i].n_spec <= 0 || so.first_row[i] < 0) continue;
-                shared_->drafts_verified_during_image_ += plan.e[i].n_spec;
-                shared_->drafts_accepted_during_image_ += so.accepted[i];
-            }
-        }
         /* The step has drained, so its counters are readable. A chunk that produced no row did not
          * wait, so its copy is read on a later step; a finished prompt or request always produced
          * a row. */
@@ -1714,6 +1878,8 @@ int Engine::step_loop() {
          * immediately for a kind that is not its own. */
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
+        /* --draft-depth-load: the step's time and tokens, for the rule's rate and prices. */
+        if (depth_load_on_) depth_step_note(b, so);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
         sched_.step_finished();
@@ -1951,6 +2117,45 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the checkpoint stage */
+/* After the KV carve, the snapshot store and Scheduler::init. Every rank carved a stage or none
+ * did (KVManager::plan_groups decides on the same config and plans). */
+int Engine::ckpt_stage_open() {
+    bool staged = !ranks_.empty() && ck_store_.enabled();
+    for (auto& rk : ranks_) staged = staged && rk->kv.ckpt_stage() != nullptr;
+    if (!staged) return RAD_OK;
+    ranks_[0]->kv.ckpt_stage_layout(&ck_stage_off_, &ck_stage_lb_);
+    ckpt_inside_ = ckpt_snap_ok_;
+    sched_.set_ckpt_inside(ckpt_inside_);
+    RAD_INFO("checkpoint stage: %s a rank on the card; %s",
+             humanb(ranks_[0]->kv.ckpt_stage_bytes()).c_str(),
+             ckpt_inside_ ? "a prompt's tail snapshot is taken inside its last chunk"
+                          : "every snapshot at a chunk's end");
+    return RAD_OK;
+}
+
+int Engine::ckpt_stage_arm(const RadBatch* b) {
+    if (ck_stage_off_.empty()) return RAD_OK;
+    const StepEntry* in = nullptr;
+    if (b && b->ckpt_cut > 0)
+        for (const StepEntry& e : sched_.plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) in = &e;
+    if (!in) {
+        for (auto& rk : ranks_) rk->ctx.set_ckpt_snap(nullptr, ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+        return RAD_OK;
+    }
+    if (in->ckpt_tok + 1 != b->ckpt_cut || !state_slots_of(in->seq, &ckpt_slots_)) {
+        RAD_ERR("step %d: sequence %llu's checkpoint inside the step (row %d) is not the batch's "
+                "(%d), or its state slots are gone", b->step, (unsigned long long)in->seq,
+                (int)in->ckpt_tok, (int)b->ckpt_cut);
+        return RAD_E_STATE;
+    }
+    /* The step writes the stage; the last snapshot left it on the same stream (save_checkpoints). */
+    for (auto& rk : ranks_)
+        rk->ctx.set_ckpt_snap(rk->kv.ckpt_stage(), ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+    return RAD_OK;
+}
+
 /* Snapshot after the step that produced the state. Linear state is what the chunk's last token
  * leaves, so the chunker ended the chunk at the checkpoint and copy 0 holds exactly that state; a
  * window snapshot is the window's rows behind the checkpoint, which may lie inside the chunk
@@ -1979,12 +2184,26 @@ int Engine::save_checkpoints() {
                             (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
                     return RAD_E_STATE;
                 }
-                for (auto& rk : ranks_) {
+                /* A checkpoint inside the step is in the stage already (rad_ckpt_snap) and goes
+                 * to the host slot from there in one copy; one at the chunk's end is copied from
+                 * the live slots. */
+                const bool inside = e.ckpt_tok + 1 < e.n_tokens && !ck_stage_off_.empty();
+                for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                    auto& rk = ranks_[ri];
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                    const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
-                                                         (int)ckpt_slots_.size(),
-                                                         e.ckpt_slot, rk->ctx.stream(),
-                                                         &ckpt_win_);
+                    int s = RAD_OK;
+                    if (!inside) {
+                        s = rk->kv.checkpoint_save(ckpt_slots_.data(), (int)ckpt_slots_.size(),
+                                                   e.ckpt_slot, rk->ctx.stream(), &ckpt_win_);
+                    } else {
+                        /* The layers the step did not snapshot (rad_ckpt_snap) are the ones it did
+                         * not change: a drafter head's state, which moves only in the drafter's
+                         * passes behind this copy. */
+                        s = rk->kv.checkpoint_stage_rest(
+                            ckpt_slots_.data(), (int)ckpt_slots_.size(), rk->ctx.stream(),
+                            [&](size_t g, int64_t li) { return rk->ctx.ckpt_snapped(g, li); });
+                        if (s >= 0) s = rk->kv.checkpoint_stage_out(e.ckpt_slot, rk->ctx.stream());
+                    }
                     if (s < 0) {
                         RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
                                 "%d: %s", rk->index, (unsigned long long)e.seq,
@@ -1994,6 +2213,30 @@ int Engine::save_checkpoints() {
                     }
                 }
                 if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                /* RADIANCE_DEBUG_CKPT_HASH=1: wait for the snapshot and log a digest of each
+                 * rank's shard, to compare two builds' snapshots byte for byte. A debugging aid:
+                 * it drains the streams. */
+                static const bool hash_on = [] {
+                    const char* h = std::getenv("RADIANCE_DEBUG_CKPT_HASH");
+                    return h && h[0] == '1';
+                }();
+                if (hash_on) {
+                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                        auto& rk = ranks_[ri];
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        (void)rad_stream_sync(rk->ctx.stream());
+                        const unsigned char* p = (const unsigned char*)rk->kv.checkpoint_ptr(e.ckpt_slot);
+                        uint64_t h = 0xcbf29ce484222325ull;
+                        const int64_t nb = rk->kv.checkpoint_bytes();
+                        for (int64_t j = 0; p && j < nb; ++j) { h ^= p[j]; h *= 0x100000001b3ull; }
+                        RAD_INFO("ckpt-hash seq=%llu pos=%lld rank=%zu inside=%d bytes=%lld %016llx",
+                                 (unsigned long long)e.seq,
+                                 (long long)(e.ctx_len + e.ckpt_tok + 1), ri,
+                                 (int)(e.ckpt_tok + 1 < e.n_tokens), (long long)nb,
+                                 (unsigned long long)h);
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                }
             }
             return RAD_OK;
         });
@@ -2042,15 +2285,13 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
     bool host_failed = false;
-    /* Step-wide sibling of the scheduler's kMaxScoredCandidates: that cap bounds one request's
-     * candidate list; nothing bounded the step's UNION, which grows toward the whole vocabulary.
-     * The pinned readback's size used to be discovered by ATTEMPTING it -- the cancel path below
-     * fired only when a gigabyte-scale page-locked allocation failed, so on a box that survives
-     * the attempt the bytes stay pinned forever (the buffer is grow-only). The cap is sixteen
-     * maximally-loaded requests -- d1's questions name a few dozen ids each, so every real
-     * scored step lands far under it. A step past it is refused the way an allocation failure
-     * refuses: the scored requests cancel, the engine does not, and the box is never asked to
-     * pin anything to find out. */
+    /* The step-wide sibling of the scheduler's kMaxScoredCandidates. That cap bounds one
+     * request's candidate list; this one bounds the step's union of them, which otherwise grows
+     * toward the whole vocabulary. The readback below is pinned host memory sized by the union and
+     * never shrinks, so a step is refused by its count before the allocation is tried: a
+     * gigabyte-scale pin that succeeds would stay pinned. The cap is sixteen requests at the
+     * per-request maximum; a scored request names a few dozen ids. A step past it is refused the
+     * way an allocation failure is: the scored requests cancel and the engine goes on. */
     static const size_t kMaxScoredStepIds = 1u << 16;
     if (score_only_ && score_ids_.size() > kMaxScoredStepIds) {
         RAD_ERR("scored rows: the step names %zu candidate rows, over the step budget of %zu; "
@@ -2262,11 +2503,11 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
              * really got. */
             acc = accept_cut_at_eog(out, acc,
-                                    [&](int32_t t) { return is_eog(t); });
+                                    [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
 
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
-            so.eos[i]      = is_eog(so.token[i]) ? 1 : 0;
+            so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
             if (tree) {
                 if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
                 for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
@@ -2303,7 +2544,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             continue;
         }
         so.token[i] = so.rows[(size_t)so.first_row[i]];
-        so.eos[i]   = is_eog(so.token[i]) ? 1 : 0;
+        so.eos[i]   = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
         if (e.req && e.req->sp.n_probs >= 0)
             RAD_TRY(row_logprobs(so, so.first_row[i], so.token[i]));
         /* Advance the grammar on every rank: each builds the mask for its own vocabulary shard from
@@ -2500,7 +2741,7 @@ void Engine::tier_tick() {
             const std::vector<char> ok(P.copy.size(), good ? 1 : 0);
             {
                 const auto lk = sched_.hold();
-                lead.tierx.report_pass(P.copy, ok, now);
+                if (report_tier_jobs(P.copy, ok, now) < 0) return;
             }
             P.copy.clear();
         }
@@ -2545,7 +2786,7 @@ void Engine::tier_tick() {
         if (!jobs.empty()) {
             const std::vector<char> ok(jobs.size(), 1);
             const auto lk = sched_.hold();
-            lead.tierx.report_pass(jobs, ok, now);
+            if (report_tier_jobs(jobs, ok, now) < 0) return;
         }
     }
 }
@@ -2582,7 +2823,7 @@ bool Engine::flush_copies() {
             }
             if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
             const std::vector<char> ok(P.copy.size(), good ? 1 : 0);
-            lead.tierx.report_pass(P.copy, ok, rad_mono_ns());
+            if (report_tier_jobs(P.copy, ok, rad_mono_ns()) < 0) return false;
             P.copy.clear();
             landed = landed || good;
         }
@@ -2628,8 +2869,9 @@ void Engine::clear_fresh_states() {
     ranks_[0]->kv.clear_state_clears();
 }
 
-int Engine::prepare_runtime() {
+int Engine::serve(std::unique_ptr<StallWatch> watch) {
     EngineScope es(owner_, cfg_.served_model_name.c_str());
+    startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
         RAD_ERR("serve: start() has not run, or stopped at --debug-graph");
         return RAD_E_STATE;
@@ -2786,7 +3028,8 @@ int Engine::prepare_runtime() {
             }
             /* Back to rank 0's device: the admission continues by growing rank 0's pool. */
             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-            ranks_[0]->tierx.report_pass(jobs, ok, rad_mono_ns());
+            if (report_tier_jobs(jobs, ok, rad_mono_ns()) < 0)
+                return RestoreResult::Cut;
             /* Rebind every entry that came back, not only the leading run: the tiers already
              * marked each resident at its new blocks. A job's blocks are one per entry slot. */
             const std::vector<int32_t>& cg = pc.entry_groups();
@@ -2797,7 +3040,7 @@ int Engine::prepare_runtime() {
                 if (rb != RAD_OK) {
                     /* No entry to land in: release the reserved blocks and forget the tier record,
                      * which would otherwise release them later from under their next owner. */
-                    ranks_[0]->tierx.quiesce();
+                    if (drain_tier_streams() < 0) return RestoreResult::Cut;
                     for (size_t k = 0; k < cg.size() && k < j.blocks.size(); ++k)
                         if (j.blocks[k] >= 0) ranks_[0]->kv.release_block(cg[k], j.blocks[k]);
                     ranks_[0]->tiers.forget(j.key);
@@ -2883,167 +3126,69 @@ int Engine::prepare_runtime() {
          * Qwen3.8-Flash-Next at TP2 (two R9700, 12 GiB host pool) the span loses to one-interval
          * steps up to 12K tokens and wins from 18K, hence eight intervals. With every expert on
          * the card there is no such cost and every lone prefill spans. */
-        sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
-                                ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+        const int64_t span_auto = stage_rows > 0 && arena_span_rows_ > 0
+                                      ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0;
+        /* --prefill-span-min N says it for the deployment: where the routed pass covers the whole
+         * spanned step (--prefill-span-pass step) the span pays from the second interval on. */
+        sched_.set_span_min(cfg_.prefill_span_min >= 0 ? cfg_.prefill_span_min : span_auto);
     }
+    RAD_TRY(ckpt_stage_open());
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
-    return RAD_OK;
-}
+    if (const int xs = xstats_open(); xs < 0) return xs;
 
-int Engine::start_runtime() {
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
     step_status_.store(RAD_OK, std::memory_order_release);
     loop_status_.store(RAD_OK, std::memory_order_release);
     done_.reserve((size_t)cfg_.max_seqs);
-    rank_threads_.reserve((size_t)cfg_.tp);
-    RAD_TRY(xstats_open());
 
-    stepper_done_.store(false, std::memory_order_release);
-    try {
-        for (int i = 0; i < cfg_.tp; ++i)
-            rank_threads_.emplace_back([this, i] {
-                EngineScope es(owner_, cfg_.served_model_name.c_str());
-                rank_loop(i);
-            });
-        stepper_ = std::thread([this] {
-            EngineScope es(owner_, cfg_.served_model_name.c_str());
-            if (gen_) gen_loop(); else step_loop();
-            stepper_done_.store(true, std::memory_order_release);
-        });
-    } catch (const std::system_error& e) {
-        RAD_ERR("starting engine workers: %s", e.what());
-        stop_runtime();
-        return RAD_E_STATE;
-    }
-    return RAD_OK;
-}
-
-void Engine::stop_runtime() {
-    if (shared_) {
-        const std::lock_guard lock(shared_->dispatch_);
-        stopping_.store(true, std::memory_order_release);
-        shared_->turn_.notify_all();
-    } else {
-        stopping_.store(true, std::memory_order_release);
-    }
-    wake_hold();
-    if (barrier_) barrier_->abort();
-    if (stepper_.joinable()) {
-        for (int t = 0; !stepper_done_.load(std::memory_order_acquire); ++t) {
-            if (t == 30000)
-                fatal("model %s: step loop did not stop within five minutes",
-                      cfg_.served_model_name.c_str());
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        stepper_.join();
-    }
-    for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
-    xstats_close();
-}
+    producers_stopped_.store(false, std::memory_order_release);
+    for (int i = 0; i < cfg_.tp; ++i)
+        rank_threads_.emplace_back([this, i] {
+            EngineScope es(owner_, cfg_.served_model_name.c_str());
+            rank_loop(i);
+        });
+    std::atomic<bool> stepped{false};
+    std::thread stepper([this, &stepped] {
+        EngineScope es(owner_, cfg_.served_model_name.c_str());
+        if (gen_) gen_loop(); else step_loop();
+        stepped.store(true, std::memory_order_release);
+    });
 
-int Engine::start_supplemental_text() {
-    if (ranks_.empty() || program().is_pass_driven() || program().logits_buf == RAD_NULL_HANDLE) {
-        RAD_ERR("supplemental serving requires a text-generating primary model");
-        return RAD_E_UNSUPPORTED;
-    }
-    const int device = cfg_.supplemental_text_device;
-    for (const auto& rank : ranks_) {
-        if (rank->device == device) {
-            RAD_ERR("--supplemental-text-device must be outside the primary text%s rank layout",
-                    shared_ ? " and image" : "");
-            return RAD_E_INVAL;
-        }
-    }
-    RadDeviceProps primary_device{}, supplemental_device{};
-    RAD_TRY(rad_dev_props(ranks_.front()->device, &primary_device));
-    if (device >= rad_dev_count() || rad_dev_props(device, &supplemental_device) < 0) {
-        RAD_ERR("--supplemental-text-device %d is unavailable", device);
-        return RAD_E_DEVICE;
-    }
-    if (std::string_view(primary_device.arch) != supplemental_device.arch) {
-        RAD_ERR("the supplemental device must match the primary device architecture");
-        return RAD_E_UNSUPPORTED;
-    }
-
-    const int64_t host_pool_mib = cfg_.supplemental_text_host_pool_mib;
-    if (host_pool_mib > 0) {
-        // The primary has already allocated its weights, so check the RAM and
-        // cgroup headroom that remain before starting the supplemental model.
-        std::string why;
-        if (!lockable_room(host_pool_mib * 1024 * 1024, 0,
-                           host_headroom_bytes(), false, &why)) {
-            RAD_ERR("--supplemental-text-host-pool-mib %lld: %s",
-                    (long long)host_pool_mib, why.c_str());
-            return RAD_E_NOMEM;
-        }
-    }
-
-    Config cfg;
-    cfg.model = cfg_.supplemental_text_model;
-    cfg.radiance_home = cfg_.radiance_home;
-    cfg.kernel_hierarchy = cfg_.kernel_hierarchy;
-    cfg.accept_reference_kernels = cfg_.accept_reference_kernels;
-    cfg.proceed_incompatible = cfg_.proceed_incompatible;
-    cfg.device_ordinals = {device};
-    cfg.host_pool_mib = host_pool_mib;
-    if (cfg_.given.count("--supplemental-text-host-pool-mib"))
-        cfg.given["--host-pool-mib"] = "--supplemental-text-host-pool-mib";
-    cfg.host_headroom_mib = cfg_.host_headroom_mib;
-    cfg.gpu_headroom_mib = cfg_.gpu_headroom_mib;
-    cfg.max_ctx = cfg_.max_ctx;
-    cfg.max_seqs = cfg_.max_seqs;
-    cfg.n_spec = 0;
-
-    auto engine = std::make_shared<Engine>(std::move(cfg));
-    engine->service_role_ = Engine::ServiceRole::SupplementalText;
-    engine->reuse_registry_ = true;
-    engine->occupied_arch_plugins_.insert(plugins_.arch_plugin);
-    if (shared_)
-        engine->occupied_arch_plugins_.insert(shared_->image_->plugins_.arch_plugin);
-    RAD_TRY(engine->start());
-    RAD_TRY(engine->start_text_endpoint(engine, std::chrono::steady_clock::now() +
-                                       std::chrono::minutes(3), &supplemental_text_endpoint_));
-    supplemental_text_ = std::move(engine);
-    RAD_INFO("supplemental text startup check passed for '%s' on device %d, host expert pool %lld MiB",
-             supplemental_text_endpoint_->limits.model_id.c_str(), device,
-             (long long)supplemental_text_->cfg_.host_pool_mib);
-    return rad_dev_set(ranks_.front()->device);
-}
-
-void Engine::stop_supplemental_text() {
-    if (!supplemental_text_) return;
-    supplemental_text_->stop_runtime();
-    supplemental_text_->sched_.shutdown("the supplemental text service stopped", RAD_E_STATE);
-    supplemental_text_endpoint_.reset();
-    supplemental_text_.reset();
-}
-
-int Engine::serve(std::unique_ptr<StallWatch> watch) {
-    EngineScope es(owner_, cfg_.served_model_name.c_str());
-    startup_watch_ = std::move(watch);
-    RAD_TRY(prepare_runtime());
-
-    int status;
     if (cfg_.kld() || cfg_.calib() || cfg_.diagnose_mode()) {
-        RAD_TRY(start_runtime());
         print_startup_report(RAD_OK);
         startup_watch_.reset();
-        status = cfg_.diagnose_mode() ? run_diagnose() : cfg_.kld() ? run_kld() : run_calib();
-        stop_runtime();
-    } else {
-        if (!cfg_.supplemental_text_model.empty()) RAD_TRY(start_supplemental_text());
-        status = run_server();
-        stop_supplemental_text();
     }
+    int s = cfg_.diagnose_mode() ? run_diagnose()
+          : cfg_.kld()           ? run_kld()
+          : cfg_.calib()         ? run_calib()
+                                 : run_server();
     startup_watch_.reset();
 
+    /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
+     * and an unfinished request still writes there (server.h). */
+    stopping_.store(true, std::memory_order_release);
+    wake_hold();
+    barrier_->abort();
+    /* A step loop that does not come back holds its cards and every model waiting for them, and
+     * only a restart can free them, so past five minutes the process exits as for a GPU fault. */
+    for (int t = 0; !stepped.load(std::memory_order_acquire); ++t) {
+        if (t == 30000)
+            fatal("model %s: the step loop has not come back five minutes after it was stopped; "
+                  "exiting so a restart can bring the server back", cfg_.served_model_name.c_str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (stepper.joinable()) stepper.join();
+    for (auto& t : rank_threads_) if (t.joinable()) t.join();
+    rank_threads_.clear();
+    producers_stopped_.store(true, std::memory_order_release);
+    xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
-    return ls < 0 ? ls : status;
+    return ls < 0 ? ls : s;
 }
 
 /* The state slots a sequence owns, one per KV group, -1 where the group is not stateful. Read from
@@ -3302,6 +3447,26 @@ SamplingParams Engine::sampling_defaults() const {
     return resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
 }
 
+/* A token the model's chat format writes as one of its call delimiters is a call boundary, not a
+ * turn's: a reply that closes a call with it must be able to write the next call and text after
+ * it. A checkpoint that also lists the token in generation_config.json's eos ids would end every
+ * tool-calling turn there, so the id leaves the vocabulary's end-of-generation set. This runs
+ * once the vocabulary and the plugins are both loaded (the reply format can be the architecture
+ * plugin's) and before anything reads the set: the scheduler and the cards' step state, which cut
+ * accepted drafts at it, the grammar index and the reply parser's terminators. */
+int Engine::demote_call_delimiters() {
+    if (!vocab_own_ || vocab_own_->chat_template().empty()) return RAD_OK;
+    const std::vector<int32_t> dropped = vocab_own_->drop_named_eog(
+        server::ChatTemplateBridge::eog_call_markers(*vocab_own_,
+                                                     rad_tools_chat_format(plugins_, meta_)));
+    if (dropped.empty()) return RAD_OK;
+    for (int32_t id : dropped)
+        RAD_WARN("vocab: token %d \"%s\" is listed as end-of-generation by the checkpoint's "
+                 "generation_config.json and is one of this model's tool-call delimiters; a turn "
+                 "does not end on it", id, vocab_->text(id).c_str());
+    return build_vocab_view();
+}
+
 /* The HTTP server over the engine. `/v1/completions`, `/v1/chat/completions`, `/v1/models`,
  * `/metrics` and `/health` are live. `/v1/embeddings` answers 501 unless the program is an
  * embedding program, and so do image, video and audio content parts unless the program declared an
@@ -3310,116 +3475,14 @@ SamplingParams Engine::sampling_defaults() const {
  * grammar and lazy triggers reach the sampler and its derived reply parser comes back through
  * IChatTemplate::apply. */
 int Engine::run_server() {
-    return with_server_dependencies([this](server::Deps& d, server::ServerOptions& o) -> int {
-        if (!shared_) {
-            RAD_TRY(configure_supplemental_text(o));
-            return serve_http(d, o);
-        }
-        SharedService::GeneratorEndpoint initial;
-        RAD_TRY(shared_->describe_generator(&initial));
-        if (o.model_id == initial.model_id) {
-            RAD_ERR("text and image models need distinct served names");
-            return RAD_E_INVAL;
-        }
-        RAD_TRY(shared_->register_image_models(o.model_id, initial.model_id));
-        o.image_model_id = initial.model_id;
-        o.image_model_ids = [this] { return shared_->image_model_ids(); };
-        o.image_status = [this] { return shared_->image_status(); };
-        if (shared_->image_template_.lora.enabled())
-            o.image_lora_names = [this] { return shared_->image_lora_names(); };
-        o.pin_image_loras = [this](const auto& in, auto* out, auto* lease, auto* why, bool reclaim_cache) {
-            return shared_->pin_image_loras(in, out, lease, why, reclaim_cache);
-        };
-        o.unload_image = [this](const auto& model, const auto& cancelled, auto* why) {
-            return shared_->unload_image_admin(model, cancelled, why);
-        };
-        o.queue_image = [this](const auto& model, size_t bytes, size_t max_waiters, size_t max_bytes,
-                               const auto& cancelled, auto* endpoint, auto* hold, auto* timing,
-                               auto* why) {
-            SharedService::GeneratorEndpoint selected;
-            const int status = shared_->queue_generator(model, server::GeneratorKind::Image, bytes, max_waiters,
-                max_bytes, cancelled, &selected, hold, timing, why);
-            *endpoint = std::move(selected.image);
-            return status;
-        };
-        o.queue_audio = [this](const auto& model, size_t bytes, size_t max_waiters, size_t max_bytes,
-                               const auto& cancelled, auto* endpoint, auto* hold, auto* why) {
-            SharedService::GeneratorEndpoint selected;
-            server::ImageDispatchTiming timing;
-            const int status = shared_->queue_generator(model, server::GeneratorKind::Audio, bytes, max_waiters,
-                max_bytes, cancelled, &selected, hold, &timing, why);
-            *endpoint = std::move(selected.audio);
-            return status;
-        };
-        o.queue_video = [this](const auto& model, size_t bytes, size_t max_waiters, size_t max_bytes,
-                               const auto& cancelled, auto* endpoint, auto* hold, auto* why) {
-            SharedService::GeneratorEndpoint selected;
-            server::ImageDispatchTiming timing;
-            const int status = shared_->queue_generator(model, server::GeneratorKind::Video,
-                bytes, max_waiters, max_bytes, cancelled, &selected, hold, &timing, why);
-            *endpoint = std::move(selected.video);
-            return status;
-        };
-        o.generator_kind = [this](const auto& model) { return shared_->generator_kind(model); };
-        o.acquire_image = [this] { return shared_->acquire_image(); };
-        o.load_image = [this](const std::string& path, const std::string& name, std::string* why) {
-            return shared_->load_image_admin(path, name, why);
-        };
-        o.register_image = [this](const std::string& path, const std::string& name, std::string* why) {
-            return shared_->register_image_admin(path, name, why);
-        };
-        RAD_TRY(configure_supplemental_text(o));
-        shared_->publish_generator(std::move(initial));
-        return serve_http(d, o);
-    });
-}
-
-int Engine::configure_supplemental_text(server::ServerOptions& options) {
-    const auto endpoint = supplemental_text_endpoint_;
-    if (!endpoint) return RAD_OK;
-    const auto& model = endpoint->limits.model_id;
-    if (model == options.model_id || (shared_ && shared_->image_models_.contains(model))) {
-        RAD_ERR("supplemental text model name conflicts with an existing model: '%s'", model.c_str());
-        return RAD_E_DUPLICATE;
-    }
-    options.supplemental_text = endpoint;
-    options.text_selection_max_ctx = endpoint->limits.max_ctx;
-    options.select_text = [engine = supplemental_text_, endpoint](const auto& name, const auto&,
-                                                                 auto* out, auto* why) -> int {
-        if (name != endpoint->limits.model_id) return RAD_E_NOTFOUND;
-        if (engine->loop_status_.load(std::memory_order_acquire) < 0) {
-            *why = "the supplemental text worker stopped";
-            return RAD_E_STATE;
-        }
-        *out = endpoint;
-        return RAD_OK;
-    };
-    return RAD_OK;
-}
-
-int Engine::with_server_dependencies(
-    const std::function<int(server::Deps&, server::ServerOptions&)>& use) {
     /* The rank-0 sampler lets admission refuse, by name, a request whose sampling stage has no
      * kernel (IScheduler::admit). The tiers are passed even when they move nothing, because they
      * hold the session table the sessions view reads. */
-    struct TextEndpointOwner {
-        TextEndpointOwner(Engine& engine)
-            : scheduler(&engine.sched_, engine.ranks_.empty() ? nullptr : &engine.ranks_[0]->sampler,
-                        engine.ranks_.empty() ? nullptr : &engine.ranks_[0]->tiers),
-              tokenizer(std::make_shared<server::TokenizerBridge>(engine.vocab_)),
-              grammar(engine.vocab_view_.get()) {}
-
-        server::SchedulerBridge scheduler;
-        std::shared_ptr<server::TokenizerBridge> tokenizer;
-        server::ChatTemplateBridge chat;
-        server::GrammarBridge grammar;
-        std::shared_ptr<mm::Processor> processor;
-        std::shared_ptr<server::MultimodalBridge> multimodal;
-    };
-    auto text_endpoint = std::make_shared<TextEndpointOwner>(*this);
-    const auto& tokenizer = text_endpoint->tokenizer;
-    auto& tok_bridge = *tokenizer;
-    auto& chat_bridge = text_endpoint->chat;
+    server::SchedulerBridge sched_bridge(&sched_, ranks_.empty() ? nullptr : &ranks_[0]->sampler,
+                                        ranks_.empty() ? nullptr : &ranks_[0]->tiers);
+    server::TokenizerBridge tok_bridge(vocab_);
+    server::ChatTemplateBridge chat_bridge;
+    server::GrammarBridge grammar_bridge(vocab_view_.get());
 
     /* One snapshot function feeds both the live view (spec §16) and the web dashboard, so they
      * cannot disagree. It runs on the drawing thread and must not slow the engine: it reads the
@@ -3439,8 +3502,8 @@ int Engine::with_server_dependencies(
         c.vram_total = pr.vram_bytes;
         card_facts.push_back(std::move(c));
     }
-    server::LiveView::Source snap = [this, text_endpoint, card_facts](server::LiveSnapshot& s) {
-        server::snapshot_from(text_endpoint->scheduler.metrics(), &s);
+    server::LiveView::Source snap = [this, &sched_bridge, card_facts](server::LiveSnapshot& s) {
+        server::snapshot_from(sched_bridge.metrics(), &s);
         s.model = meta_.name && *meta_.name ? meta_.name : "radiance";
 
         s.cards.clear();
@@ -3586,12 +3649,11 @@ int Engine::with_server_dependencies(
     };
 
     server::Deps d{};
-    d.text_owner = text_endpoint;
-    d.sched = &text_endpoint->scheduler;
+    d.sched = &sched_bridge;
     d.background = &background_jobs_;
     d.front = front_;
     d.tok   = &tok_bridge;
-    d.grammar = &text_endpoint->grammar;
+    d.grammar = &grammar_bridge;
     d.live  = snap;
     d.stuck_ms = [] { return dev_stuck_ms(); };
     /* The control vector, when one was found. The admin endpoint flips the
@@ -3647,15 +3709,6 @@ int Engine::with_server_dependencies(
     const bool have_tpl = !gen_ && vocab_ && !vocab_->chat_template().empty() &&
                           chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
                           chat_bridge.ready();
-    /* A token this format writes as one of its own call delimiters is a call boundary, not a
-     * turn's: a reply that closes a call with it must be able to write the next one, and text
-     * after it. A container that also declares it end-of-generation would cut every tool-calling
-     * turn there, so the id leaves the decoder's stop set. */
-    eog_demoted_ = chat_bridge.eog_call_markers();
-    for (int32_t id : eog_demoted_)
-        RAD_WARN("vocab: token %d \"%s\" is end-of-generation and one of this model's "
-                 "tool-call delimiters; a turn no longer ends on it", id,
-                 vocab_->text(id).c_str());
     if (embedding_) {
         /* No chat endpoint: the model's template, when it has one, renders a `messages` input. */
         if (have_tpl) embed_info.tpl = &chat_bridge;
@@ -3803,6 +3856,12 @@ int Engine::with_server_dependencies(
             for (const auto& [n, w] : u) uses.push_back({ n, w });
             return gen_lora_acquire(uses, slot, hold, note, e);
         };
+        o.gen_lora_validate = [this](const std::vector<std::pair<std::string, double>>& choices,
+                                     std::string* err) {
+            std::vector<LoraUse> uses;
+            for (const auto& [name, weight] : choices) uses.push_back({name, weight});
+            return gen_lora_validate(uses, err);
+        };
         o.gen_lora_names = [this] { return gen_lora_names(); };
         o.lora_load = [this](const std::string& n, const std::string& d, std::string* e) {
             return lora_load(n, d, e);
@@ -3835,8 +3894,8 @@ int Engine::with_server_dependencies(
     /* Media, when the program declared an encoder. The processor's geometry comes from the
      * container and the encoder states its own; patch width and merge must agree, checked here
      * rather than found as garbage rows. */
-    auto& mm_proc = text_endpoint->processor;
-    auto& mm_bridge = text_endpoint->multimodal;
+    std::unique_ptr<mm::Processor> mm_proc;
+    std::unique_ptr<server::MultimodalBridge> mm_bridge;
     /* How the model hears, for the speech routes: the plugin's RadAudioFormat copied out. */
     server::SpeechFormat speech_fmt;
     const RadEncoderDecl& encd = ranks_[0]->program.encoder;
@@ -3862,6 +3921,31 @@ int Engine::with_server_dependencies(
             return RAD_E_INVAL;
         }
         if (vc.family == mm::Family::Gemma4) {
+            /* A two-sided paged window is exact for image spans no longer than the window.
+             * Limit what the processor admits if a rank cannot run the long-span variant. */
+            if (encd.bidirectional) {
+                for (const auto& rank : ranks_) {
+                    long long window = 0;
+                    bool ahead = false;
+                    for (const OpInfo& op : rank->program.ops) {
+                        if (op.op == "attn_paged_ahead" || op.op == "attn_paged_qrow_ahead")
+                            for (const Band& b : op.bands)
+                                ahead = ahead || b.dom[RAD_DOMAIN_HOST] || b.dom[RAD_DOMAIN_DEVICE];
+                        if (op.op == "attn_paged" || op.op == "attn_paged_qrow") {
+                            long long causal = 1, w = 0;
+                            if (op.base.get_i("causal", &causal) && causal == 0 &&
+                                op.base.get_i("window", &w) && w > 0)
+                                window = window > 0 ? std::min(window, w) : w;
+                        }
+                    }
+                    if (!ahead && window > 0 && window < vc.max_patches / encd.merge)
+                        vc.max_patches = window * encd.merge;
+                }
+                if (vc.max_patches < encd.max_patches)
+                    RAD_INFO("media: image spans are limited to %lld soft tokens because the "
+                             "loaded kernels cannot attend beyond the sliding window",
+                             (long long)(vc.max_patches / encd.merge));
+            }
             if (cfg_.image_min_pixels || cfg_.image_max_pixels || cfg_.video_min_pixels ||
                 cfg_.video_max_pixels || cfg_.video_min_frames) {
                 RAD_ERR("media: this model's processor sizes images and video frames by a token "
@@ -3941,17 +4025,18 @@ int Engine::with_server_dependencies(
         }
         if (vc.family == mm::Family::Gemma4 &&
             (int64_t)std::max(vc.image_soft_tokens, vc.video_soft_tokens) * vc.merge * vc.merge >
-                encd.max_patches) {
-            RAD_ERR("media: an image of %d soft tokens or a video frame of %d is more patches than "
-                    "one encoder pass holds (--mm-max-patches %lld)", vc.image_soft_tokens,
-                    vc.video_soft_tokens, (long long)encd.max_patches);
+                vc.max_patches) {
+            RAD_ERR("media: an image of %d soft tokens or a video frame of %d exceeds this "
+                    "deployment's limit of %lld soft tokens per segment; lower --image-tokens "
+                    "or --video-max-frame-tokens", vc.image_soft_tokens, vc.video_soft_tokens,
+                    (long long)(vc.max_patches / encd.merge));
             return RAD_E_INVAL;
         }
-        mm_proc = std::make_shared<mm::Processor>();
+        mm_proc = std::make_unique<mm::Processor>();
         const int pi = mm_proc->init(
             vc,
-            [tokenizer](const std::string& t) {
-                return tokenizer->encode(t, /*add_special=*/false, /*parse_special=*/false);
+            [&tok_bridge](const std::string& t) {
+                return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/false);
             },
             [this](const std::string& t) { return vocab_->find(t); });
         if (pi < 0) {
@@ -4066,7 +4151,7 @@ int Engine::with_server_dependencies(
         }
         ac.merge = (int32_t)aend.merge;
         ac.max_frames = aend.max_patches;
-        if (!mm_proc) mm_proc = std::make_shared<mm::Processor>();
+        if (!mm_proc) mm_proc = std::make_unique<mm::Processor>();
         if (const int rc = mm_proc->init_audio(ac, &why); rc < 0) {
             RAD_ERR("the '%s' encoder's audio front end cannot be built: %s",
                     ranks_[0]->program.audio_encoder_name.c_str(), why.c_str());
@@ -4087,7 +4172,7 @@ int Engine::with_server_dependencies(
                      ac.hop * 1000 / ac.rate, ac.merge, (long long)aend.max_patches);
     }
     if (mm_proc) {
-        mm_bridge = std::make_shared<server::MultimodalBridge>(
+        mm_bridge = std::make_unique<server::MultimodalBridge>(
             mm_proc.get(), encd.modalities | aend.modalities);
         d.mm = mm_bridge.get();
         if (speech_fmt.transcribes() && o.allow_audio) {
@@ -4123,22 +4208,13 @@ int Engine::with_server_dependencies(
         }
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
-    };
+    } image_bridge;
     if (!img_gen_ && cfg_.image_gen_max_refs > 0)
         RAD_WARN("--image-gen-max-refs: this model makes no images; ignored");
     if (!img_gen_ && cfg_.image_gen_max_pixels > 0 &&
         (!vid_gen_ || ranks_[0]->program.video_gen.max_area > cfg_.image_gen_max_pixels))
         RAD_WARN("--image-gen-max-pixels: the selected model does not use this limit; ignored");
     if (img_gen_) {
-        struct ImageEndpointOwner {
-            std::shared_ptr<server::TokenizerBridge> tokenizer;
-            std::shared_ptr<mm::Processor> processor;
-            ImageBridge bridge;
-        };
-        auto endpoint = std::make_shared<ImageEndpointOwner>();
-        endpoint->tokenizer = tokenizer;
-        endpoint->processor = mm_proc;
-        auto& image_bridge = endpoint->bridge;
         const Program& pg = ranks_[0]->program;
         const RadGeneratorDecl& gd = pg.generator;
         server::ImageGenInfo& in = image_bridge.inf;
@@ -4205,7 +4281,7 @@ int Engine::with_server_dependencies(
         in.cond_opts = gd.cond_opts;
         image_bridge.drv = img_gen_;
         image_bridge.proc = mm_proc.get();
-        d.images = { &image_bridge, &tok_bridge, endpoint };
+        d.images = &image_bridge;
         /* The served model id is the generator's own name (qwen-image-2.1), not the container's
          * architecture name. */
         if (cfg_.served_model_name.empty() && !in.name.empty()) {
@@ -4243,15 +4319,8 @@ int Engine::with_server_dependencies(
         }
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
-    };
+    } audio_bridge;
     if (aud_gen_) {
-        struct AudioEndpointOwner {
-            std::shared_ptr<server::TokenizerBridge> tokenizer;
-            AudioBridge bridge;
-        };
-        auto endpoint = std::make_shared<AudioEndpointOwner>();
-        endpoint->tokenizer = tokenizer;
-        auto& audio_bridge = endpoint->bridge;
         const Program& pg = ranks_[0]->program;
         const RadAudioGenDecl& ad = pg.audio_gen;
         server::AudioGenInfo& in = audio_bridge.inf;
@@ -4280,7 +4349,7 @@ int Engine::with_server_dependencies(
         in.ref_max = ad.ref_max;
         audio_bridge.drv = aud_gen_;
         audio_bridge.plugins = &plugins_;
-        d.audio = { &audio_bridge, &tok_bridge, endpoint };
+        d.audio = &audio_bridge;
         if (cfg_.served_model_name.empty() && !in.name.empty()) {
             o.model_id = in.name;
             decide("--served-model-name", o.model_id, "an audio generator: its own name");
@@ -4330,19 +4399,8 @@ int Engine::with_server_dependencies(
         }
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
-    };
+    } video_bridge;
     if (vid_gen_) {
-        struct VideoEndpointOwner {
-            std::shared_ptr<server::TokenizerBridge> tokenizer;
-            std::shared_ptr<mm::Processor> processor;
-            std::shared_ptr<server::MultimodalBridge> multimodal;
-            VideoBridge bridge;
-        };
-        auto endpoint = std::make_shared<VideoEndpointOwner>();
-        endpoint->tokenizer = tokenizer;
-        endpoint->processor = mm_proc;
-        endpoint->multimodal = mm_bridge;
-        auto& video_bridge = endpoint->bridge;
         const Program& pg = ranks_[0]->program;
         const RadVideoGenDecl& vd = pg.video_gen;
         server::VideoGenInfo& in = video_bridge.inf;
@@ -4373,8 +4431,8 @@ int Engine::with_server_dependencies(
         in.upscale_refine = vd.upscale_refine;
         in.step_evals = vd.sched_kind != 0;
         in.unipc_only = vd.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC;
-        in.guidance = vd.guidance != 0;
         in.guidance_cfg_only = vd.guidance == RAD_VIDEO_GUIDANCE_CFG;
+        in.guidance = vd.guidance != 0;
         for (int i = 0; i < 8; ++i) in.guidance_default[i] = vd.guidance_default[i];
         in.default_negative = pg.vgen_str.default_negative;
         in.image_cond = vd.image_cond != 0;
@@ -4395,7 +4453,7 @@ int Engine::with_server_dependencies(
         in.max_enc_samples = vd.max_enc_samples;
         in.enc_ratio = vd.enc_ratio;
         video_bridge.drv = vid_gen_;
-        d.videos = { &video_bridge, &tok_bridge, mm_bridge.get(), endpoint };
+        d.videos = &video_bridge;
         if (cfg_.served_model_name.empty() && !in.name.empty()) {
             o.model_id = in.name;
             decide("--served-model-name", o.model_id, "a video generator: its own name");
@@ -4418,14 +4476,16 @@ int Engine::with_server_dependencies(
                  cfg_.mm_max_patches == 0 ? "is served text only (--mm-max-patches 0)"
                                           : "takes no images or video");
 
-    return use(d, o);
-}
+    server::Server srv(d, o);
+    srv_ = &srv;
+    struct ClearSrv { server::Server** p; ~ClearSrv() { *p = nullptr; } } clear_srv{ &srv_ };
+    if (cfg_.max_queued_requests <= 0)
+        decide("--max-queued-requests", std::to_string(srv.queue_cap()), "8 x --max-num-seqs");
 
-int Engine::validate_server_options(server::Server& srv, bool has_chat_template) {
     /* A default the template refuses would 400 every chat request that relies on it. Bad
      * --chat-template-kwargs stop startup; --reasoning-effort only warns, since clients that send
      * their own effort are unaffected. */
-    if (has_chat_template && (!cfg_.chat_template_kwargs.empty() || !cfg_.reasoning_effort.empty())) {
+    if (d.chat && (!cfg_.chat_template_kwargs.empty() || !cfg_.reasoning_effort.empty())) {
         std::string kw_why, eff_why;
         srv.check_template_defaults(&kw_why, &eff_why);
         if (!kw_why.empty()) {
@@ -4440,7 +4500,7 @@ int Engine::validate_server_options(server::Server& srv, bool has_chat_template)
     }
     /* Log the efforts the template accepts (a client sending another gets this set in its 400,
      * and /server_info shows it). A map target the template refuses stops startup. */
-    if (has_chat_template) {
+    if (d.chat) {
         const std::vector<std::string> efforts = srv.probe_reasoning_efforts();
         std::string mapped;
         for (const auto& [from, to] : cfg_.reasoning_effort_map)
@@ -4472,78 +4532,11 @@ int Engine::validate_server_options(server::Server& srv, bool has_chat_template)
                 why.c_str());
         return RAD_E_INVAL;
     }
-    return RAD_OK;
-}
-
-int Engine::start_text_endpoint(const std::shared_ptr<Engine>& engine_lease,
-                                std::chrono::steady_clock::time_point deadline,
-                                std::shared_ptr<const server::TextEndpoint>* out) {
-    if (engine_lease.get() != this || !out || *out || barrier_ ||
-        std::chrono::steady_clock::now() >= deadline)
-        return RAD_E_INVAL;
-    if (ranks_.empty() || program().is_pass_driven() || program().logits_buf == RAD_NULL_HANDLE)
-        return RAD_E_UNSUPPORTED;
-
-    RAD_TRY(prepare_runtime());
-    return with_server_dependencies([&](server::Deps& deps, server::ServerOptions& options) {
-        server::Server probe(deps, options);
-        RAD_TRY(validate_server_options(probe, deps.chat != nullptr));
-        auto endpoint = probe.retain_text_endpoint(engine_lease);
-        if (!endpoint) return (int)RAD_E_UNSUPPORTED;
-
-        RAD_TRY(start_runtime());
-        std::string why;
-        int status;
-        try {
-            status = probe.probe_text_completion(deadline, &why);
-        } catch (...) {
-            stop_runtime();
-            sched_.shutdown("supplemental text readiness check threw", RAD_E_STATE);
-            throw;
-        }
-        if (status >= 0) status = loop_status_.load(std::memory_order_acquire);
-        if (status < 0) {
-            RAD_ERR("supplemental text startup check for '%s': %s", options.model_id.c_str(),
-                    why.empty() ? rad_strerror(status) : why.c_str());
-            stop_runtime();
-            sched_.shutdown("supplemental text readiness check failed", status);
-            return status;
-        }
-        *out = std::move(endpoint);
-        return (int)RAD_OK;
-    });
-}
-
-int Engine::serve_http(server::Deps& d, server::ServerOptions& o) {
-    server::Server srv(d, o);
-    srv_ = &srv;
-    struct ClearSrv { server::Server** p; ~ClearSrv() { *p = nullptr; } } clear_srv{ &srv_ };
-    if (cfg_.max_queued_requests <= 0)
-        decide("--max-queued-requests", std::to_string(srv.queue_cap()), "8 x --max-num-seqs");
-
-    RAD_TRY(validate_server_options(srv, d.chat != nullptr));
-    if (shared_) RAD_TRY(shared_->image_->start_runtime());
-    if (const int status = start_runtime(); status < 0) {
-        if (shared_) shared_->image_->stop_runtime();
-        return status;
-    }
-    if (shared_) {
-        const int status = shared_->verify_generator(shared_->acquire_generator());
-        if (status < 0) {
-            shared_->shutdown_images(status);
-            shared_->image_->stop_runtime();
-            stop_runtime();
-            return status;
-        }
-    }
-    print_startup_report(RAD_OK);
+    if (!cfg_.report_once) print_startup_report(RAD_OK);
     const char* const keyed = o.api_key.empty() ? "" : "; a bearer key is required";
-    if (shared_)
-        RAD_INFO("serving text '%s' and images '%s' on http://%s:%d%s",
-                 o.model_id.c_str(), o.image_model_id.c_str(), o.host.c_str(), o.port, keyed);
-    else if (embedding_)
-        RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501%s)",
-                 o.host.c_str(), o.port, keyed);
+    if (embedding_)
+        RAD_INFO("model %s serves  (/v1/embeddings; completions and chat are 501%s)",
+                 cfg_.served_model_name.c_str(), keyed);
     else if (aud_gen_)
         RAD_INFO("model %s serves  (/v1/audio/speech; completions and chat are 501%s)",
                  cfg_.served_model_name.c_str(), keyed);
@@ -4554,9 +4547,9 @@ int Engine::serve_http(server::Deps& d, server::ServerOptions& o) {
         RAD_INFO("model %s serves  (/generate, /send and /status/{uid}; completions and "
                  "chat are 501%s)", cfg_.served_model_name.c_str(), keyed);
     else if (gen_)
-        RAD_INFO("serving on http://%s:%d  (/v1/images/generations%s; completions and chat are "
-                 "501%s)", o.host.c_str(), o.port,
-                 d.images && d.images.gen->info().max_refs > 0 ? " and /v1/images/edits" : "", keyed);
+        RAD_INFO("model %s serves  (/v1/images/generations%s; completions and chat are "
+                 "501%s)", cfg_.served_model_name.c_str(),
+                 d.images && d.images->info().max_refs > 0 ? " and /v1/images/edits" : "", keyed);
     else
         RAD_INFO("model %s serves  (/v1/completions%s%s)", cfg_.served_model_name.c_str(),
                  d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",
@@ -4568,99 +4561,56 @@ int Engine::serve_http(server::Deps& d, server::ServerOptions& o) {
      * calls `snap`. Scoped here so its thread is joined before Deps goes out of scope. */
     std::unique_ptr<server::LiveView> live;
     if (cfg_.live_view) {
-        live = std::make_unique<server::LiveView>(d.live);
+        live = std::make_unique<server::LiveView>(snap);
         live->start();
     }
 
-    int rc = RAD_OK;
-    if (front_) {
-        /* Startup ends here; a quiet server from now on is an idle one. */
-        startup_watch_.reset();
-        srv.note_ready(startup_begin_ns_);
-        front_->attach(cfg_.served_model_name, front_aliases_, &srv);
-        serving_.store(true, std::memory_order_release);
-        RAD_INFO("model %s: ready", cfg_.served_model_name.c_str());
-        while (!front_->stopping() && !stop_requested_.load(std::memory_order_acquire)) {
-            if (loop_status_.load(std::memory_order_acquire) < 0) {
-                RAD_ERR("model %s: stopping: the step loop failed with %s",
-                        cfg_.served_model_name.c_str(),
-                        rad_strerror(loop_status_.load(std::memory_order_acquire)));
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    /* A model serves behind the process's front (server/front.h); the process's signals are the
+     * fleet's (fleet/fleet.cpp). This model ends when the front stops or the fleet asks it to. */
+    if (!front_) {
+        RAD_ERR("model %s: no front to serve behind", cfg_.served_model_name.c_str());
+        if (live) live->stop();
+        return RAD_E_STATE;
+    }
+    /* Startup ends here; a quiet server from now on is an idle one. */
+    startup_watch_.reset();
+    srv.note_ready(startup_begin_ns_);
+    front_->attach(cfg_.served_model_name, front_aliases_, &srv);
+    serving_.store(true, std::memory_order_release);
+    RAD_INFO("model %s: ready", cfg_.served_model_name.c_str());
+    while (!front_->stopping() && !stop_requested_.load(std::memory_order_acquire)) {
+        if (loop_status_.load(std::memory_order_acquire) < 0) {
+            RAD_ERR("model %s: stopping: the step loop failed with %s",
+                    cfg_.served_model_name.c_str(),
+                    rad_strerror(loop_status_.load(std::memory_order_acquire)));
+            break;
         }
-        serving_.store(false, std::memory_order_release);
-        /* The responses already handed out run to their end, for as long as the stop allows: a
-         * stream holds its lease until the client has it all or leaves. Past that the server ends
-         * them (Server::retire stops every stream and job), and they let go at once. */
-        const int64_t drain = stop_drain_ms_.load(std::memory_order_relaxed);
-        if (!front_->detach(cfg_.served_model_name, (int)std::min<int64_t>(drain, INT32_MAX))) {
-            RAD_WARN("model %s: responses still open after %lld ms; ending them",
-                     cfg_.served_model_name.c_str(), (long long)drain);
-            srv.retire();
-            /* `srv` lives in this frame and a response names it to the last, so it cannot go while one
-             * is held. Past five minutes the model is wedged, and the process exits as for a GPU fault
-             * so a restart brings the others back. */
-            for (int min = 1; !front_->detach(cfg_.served_model_name, 60000); ++min) {
-                if (min >= 5)
-                    fatal("model %s: responses still held %d minutes after they were ended; exiting "
-                          "so a restart can bring the server back", cfg_.served_model_name.c_str(), min);
-                RAD_WARN("model %s: responses still held %d minute(s) after they were ended",
-                         cfg_.served_model_name.c_str(), min);
-            }
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    serving_.store(false, std::memory_order_release);
+    /* The responses already handed out run to their end, for as long as the stop allows: a
+     * stream holds its lease until the client has it all or leaves. Past that the server ends
+     * them (Server::retire stops every stream and job), and they let go at once. */
+    const int64_t drain = stop_drain_ms_.load(std::memory_order_relaxed);
+    if (!front_->detach(cfg_.served_model_name, (int)std::min<int64_t>(drain, INT32_MAX))) {
+        RAD_WARN("model %s: responses still open after %lld ms; ending them",
+                 cfg_.served_model_name.c_str(), (long long)drain);
         srv.retire();
-    } else {
-        struct sigaction sa {};
-        sa.sa_handler = on_signal;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = SA_RESETHAND;      /* a second one takes the default disposition and kills */
-        sigaction(SIGINT,  &sa, nullptr);
-        sigaction(SIGTERM, &sa, nullptr);
-
-        std::atomic<bool> watching{true};
-        std::thread watcher([&] {
-            while (watching.load(std::memory_order_relaxed)) {
-                if (g_signalled.load(std::memory_order_relaxed)) {
-                    RAD_INFO("stopping: draining in-flight requests");
-                    srv.stop();
-                    return;
-                }
-                /* The step loop died and its requests were already failed (Engine::fail_loop); stop
-                 * the transport so no new request is queued. */
-                if (shared_ ? shared_->failed() : loop_status_.load(std::memory_order_acquire) < 0) {
-                    const int status = loop_status_.load(std::memory_order_acquire);
-                    if (shared_) shared_->shutdown_images(status < 0 ? status : RAD_E_STATE);
-                    RAD_ERR("stopping: an engine loop failed with %s",
-                            rad_strerror(status < 0 ? status : RAD_E_STATE));
-                    srv.stop();
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        });
-
-        /* Startup ends here; a quiet server from now on is an idle one. */
-        startup_watch_.reset();
-        srv.note_ready(startup_begin_ns_);
-        rc = srv.run();
-        /* The watcher tests `watching` first, so clearing it ends the thread without a second stop;
-         * run() has already torn the transport down. Joining costs up to one sleep interval. */
-        watching.store(false, std::memory_order_relaxed);
-        watcher.join();
+        /* `srv` lives in this frame and a response names it to the last, so it cannot go while one
+         * is held. Past five minutes the model is wedged, and the process exits as for a GPU fault
+         * so a restart brings the others back. */
+        for (int min = 1; !front_->detach(cfg_.served_model_name, 60000); ++min) {
+            if (min >= 5)
+                fatal("model %s: responses still held %d minutes after they were ended; exiting "
+                      "so a restart can bring the server back", cfg_.served_model_name.c_str(), min);
+            RAD_WARN("model %s: responses still held %d minute(s) after they were ended",
+                     cfg_.served_model_name.c_str(), min);
+        }
     }
+    srv.retire();
     if (live) live->stop();
-    /* Drain while the workers can still acknowledge cancellation. Join them before the
-     * server and bridges go out of scope: in-flight Request::sink pointers reach into srv. */
-    srv.stop();
-    if (supplemental_text_) {
-        stop_supplemental_text();
-        srv.stop();
-    }
-    if (shared_ && shared_->image_) shared_->image_->stop_runtime();
-    stop_runtime();
     const int st = loop_status_.load(std::memory_order_acquire);
-    return shared_ && shared_->failed() ? RAD_E_STATE : st < 0 ? st : rc;
+    return st < 0 ? st : RAD_OK;
 }
 
 }  /* namespace rad */

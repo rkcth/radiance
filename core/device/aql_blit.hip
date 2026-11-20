@@ -250,6 +250,75 @@ extern "C" int rad_aql_blit_ranges(void* dst, const void* src, uint64_t prefix,
     return launched();
 }
 
+/* aql::chain_probe's pair (aql.h). The reader's load has one address for the whole wave and
+ * nothing in the kernel writes there, so the compiler makes it a scalar load: served from the
+ * scalar data cache, which the wait must have emptied (chain_kernel.h) for the kernel to see the
+ * store in front of it. */
+namespace {
+__global__ __launch_bounds__(64) void r4dchain_probe_store(unsigned* __restrict__ x, unsigned v) {
+    rad_chain_wait();
+    x[threadIdx.x] = v;
+    rad_chain_done();
+}
+__global__ __launch_bounds__(32) void r4dchain_probe_load(const unsigned* __restrict__ x,
+                                                          unsigned* __restrict__ seen) {
+    rad_chain_wait();
+    const unsigned v = x[0];
+    if (threadIdx.x == 0) seen[blockIdx.x] = v;
+    rad_chain_done();
+}
+/* aql::chain_marks's kernel: where it stores comes from its arguments alone. */
+__global__ __launch_bounds__(32) void r4dchain_probe_mark(unsigned* __restrict__ seen, unsigned v) {
+    rad_chain_wait();
+    if (threadIdx.x == 0) seen[v - 1u] = v;
+    rad_chain_done();
+}
+
+/* aql::chain_asks's kernel: a card-side copy like r4dchain_copy16 that says whether there was a
+ * chain record in its argument slot when it started. A block that found none counts nothing in
+ * rad_chain_done, so it counts by the address in its arguments instead and the launches behind
+ * it do not wait for it for good. */
+__global__ __launch_bounds__(kThreads) void r4dchain_probe_ask(const u32x4* __restrict__ src,
+                                                               u32x4* __restrict__ dst, uint64_t n,
+                                                               unsigned* __restrict__ seen, unsigned v,
+                                                               unsigned long long* __restrict__ ctr) {
+    const bool found = rad_chain_rec() != nullptr;
+    rad_chain_wait();
+    const uint64_t stride = (uint64_t)gridDim.x * kThreads;
+    for (uint64_t i = (uint64_t)blockIdx.x * kThreads + threadIdx.x; i < n; i += stride) dst[i] = src[i];
+    if (threadIdx.x == 0)
+        __hip_atomic_fetch_or(&seen[v - 1u], found ? v : (v | 0x80000000u), __ATOMIC_RELAXED,
+                              __HIP_MEMORY_SCOPE_AGENT);
+    rad_chain_done();
+    if (!found && threadIdx.x == 0)
+        __hip_atomic_fetch_add(ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+}
+}  // namespace
+
+extern "C" int rad_aql_probe_ask(const void* src, void* dst, uint64_t bytes, unsigned* seen, unsigned v,
+                                 unsigned long long* ctr, void* stream) {
+    const uint64_t n = bytes / 16;
+    hipLaunchKernelGGL(r4dchain_probe_ask, dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads), 0,
+                       (hipStream_t)stream, (const u32x4*)src, (u32x4*)dst, n, seen, v, ctr);
+    return launched();
+}
+
+extern "C" int rad_aql_probe_mark(unsigned* seen, unsigned v, void* stream) {
+    hipLaunchKernelGGL(r4dchain_probe_mark, dim3(1), dim3(32), 0, (hipStream_t)stream, seen, v);
+    return launched();
+}
+
+extern "C" int rad_aql_probe_store(unsigned* x, unsigned v, void* stream) {
+    hipLaunchKernelGGL(r4dchain_probe_store, dim3(1), dim3(64), 0, (hipStream_t)stream, x, v);
+    return launched();
+}
+
+extern "C" int rad_aql_probe_load(const unsigned* x, unsigned* seen, unsigned blocks, void* stream) {
+    if (blocks == 0) return 0;
+    hipLaunchKernelGGL(r4dchain_probe_load, dim3(blocks), dim3(32), 0, (hipStream_t)stream, x, seen);
+    return launched();
+}
+
 extern "C" int rad_aql_blit_fill(void* dst, int value, uint64_t bytes, void* stream) {
     if (bytes == 0) return 0;
     const hipStream_t s = (hipStream_t)stream;

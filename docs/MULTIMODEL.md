@@ -138,6 +138,7 @@ server:
 cards: all                 # or a list of card indices; models never leave this set
 memory:
   gpu-headroom-mib: 160    # per card, as before
+  card-headroom-mib: {0: 4096}        # card 0 (the desktop's) keeps 4 GiB free instead
   host-mib: 40960          # pinned host RAM the fleet may hold: parked weights, KV host tier, pools
   disk-tier: /var/cache/radiance      # prefix-cache disk tier and park files
 
@@ -177,6 +178,7 @@ models:
     tp: 1
     priority: 60
     max-num-seqs: 64
+    cards: [1]             # only ever on card 1, e.g. to keep it off the card that drives a display
 
 groups:
   rag: { together: [qwen, embed] }          # load embed whenever qwen loads, and the reverse
@@ -196,9 +198,9 @@ scheduler:
 |---|---|
 | `server:` | `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `log` (`info`/`debug`/`trace`), `radiance-home`, `kernels`, `download-dir`, `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
 | `cards:` | `all` or a list of card indices |
-| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `host-mib`, `host-headroom-mib`, `disk-tier` |
+| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier` |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive`, `stuck-exit`, `warm-up` |
-| `defaults:` / `models.<name>:` | every per-model flag: model source, TP, placement, KV, scheduler, spec decode, LoRA, request defaults and limits, media limits, offline modes, debug; plus the fleet keys `aliases`, `priority`, `pin`, `ttl`, `flex`, `park` |
+| `defaults:` / `models.<name>:` | every per-model flag: model source, TP, placement, KV, scheduler, spec decode, LoRA, request defaults and limits, media limits, offline modes, debug; plus the fleet keys `aliases`, `priority`, `pin`, `ttl`, `flex`, `park`, `cards` |
 | `groups:` | `together` / `exclusive` lists |
 
 A key at the wrong level is refused with the level it belongs to. An unknown key is refused with
@@ -208,7 +210,8 @@ adds more.
 ### 4.4 Single-model use
 
 A one-model YAML is the only way to run one model too. `radiance --model X ...` is refused with a
-message that prints the equivalent YAML, so a migration is copy and paste. Offline modes (KL
+message that prints the equivalent YAML, so a migration is copy and paste
+([`GUIDE.md`](GUIDE.md) §7.3 covers what else a 1.x deployment changes). Offline modes (KL
 recording, calibration, the diagnose workload) run from a one-model YAML with the `kld-*` /
 `calib-*` / `diagnose` keys on that model;
 the process does that job and exits, as today.
@@ -640,6 +643,13 @@ resident on before (its RAM copy is per rank and per card's shard; a different c
 same shards). TP groups that need peer links prefer card sets with P2P. Within an engine's life its
 card set is fixed; moving it is an unload and reload.
 
+A model with its own `cards: [N, ...]` is placed on those cards only: the choice above runs over
+its list instead of the fleet's, so it waits for room there rather than load elsewhere. The list is
+among the top-level `cards:` and has at least `tp` entries. It is not an engine setting, but a
+reload that changes it unloads the model, which then loads again on the new list. Without the key,
+or with `cards: all`, a model may use any card of the fleet. On a machine whose cards differ, or
+where one card also drives a display, this keeps a model off the card it should not take.
+
 ### 8.5 Groups
 
 - `together: [a, b]`: loading one loads the others; parking one parks the others. A request for any
@@ -680,6 +690,15 @@ from them in place). The highest priority goes first, then the most recently use
 engine (`Engine::fill_host`): host memory is mapped at the chunks (`dev_page_fill_begin`) and the
 weights in them are read from the container and laid out into it, as a restore's refill does, with
 every write clipped to the batch's chunks (a weight running into the next batch is read for each).
+New host-fill batches also wait while any model has an active response or retained background-job
+lease. Continuous traffic can postpone warming; demand-driven restores still proceed. A request
+arriving during an already-started batch can overlap that batch. The GiB limit bounds its bytes,
+not its duration, and brief dashboard leases can also defer the next batch.
+Container-backed weights are filled with CPU copies and CPU relayouts, using ordinary read
+windows rather than GPU upload streams or pinned staging. Every output write stays inside the
+selected chunks. A background batch exceeding the reconstruction staging limits is skipped for
+the rest of that park; its missing chunks remain available for demand restore. The separate disk
+spill readback and foreground restore paths still use device transfers where needed.
 Such a copy is exact until the mover writes the chunk, so a park after the restore keeps it and
 leaves by the swap; once written, or dropped for room, the chunk is refilled from the container
 again. Nothing of it ever comes from the card.
@@ -732,12 +751,13 @@ beside A's, because a prefill junction launches more blocks than a card runs at 
 advances from there. Qwen3.8-27B (IQ4R-S-V4) prefilling beside Gemma 4 12B decoding, both TP 2 on
 the same two R9700, stopped within 12 s of load, and the process then ignored its stop signal.
 
-So every engine of more than one rank claims its cards when it starts, and on a card with more than
+So every engine claims its cards when it starts, including a single-rank engine that can occupy
+wave slots beside another engine's collective. On a card with more than
 one claim a chained launch keeps its barrier bit while a collective may still run on its queue.
 Only the collectives' own blocks then wait on a card for another card, and those are few enough at
 decode to leave the other engine its slots. The claim that makes a card shared returns once
 everything issued on that card before it has finished, so nothing launched under the old rule is
-left. A model alone on its cards, or beside single-card models only, launches as before. A claim
+left. A model alone on its cards keeps every chained launch. A claim
 lasts as long as the engine does: a parked model still holds its own.
 
 With the rule the same load ran 200 s without a stop (335 requests), as did both models prefilling
@@ -796,7 +816,11 @@ Everything §3-§11 describe is built and measured on the test host of §13 (two
   The disk tier keeps a parked engine (its copies written to `memory.disk-tier` in the background,
   its host memory let go under pressure); a model unloaded outright still loads from its container.
 - A tiered-MoE cache that lends to its expert slab does not run as flex: it keeps its claim (the
-  slab grows through the fleet's loan instead, §6.7).
+  slab grows through the fleet's loan instead, §6.7). Its claim is still sized by `flex.kv.min-tokens`
+  (§6.3), and since the cache never grows past it, set it to the tokens the model must serve at
+  once: unset, the floor is one sequence at the context bound. Qwen3.8-Flash-Next at 4 x 262144 in
+  a fleet of four on two R9700: 2.27 GiB a card, one full-length session; with `min-tokens:
+  1048576`, 7.30 GiB, 3.7 sessions (a model alone in its file claims the card and gets 4.0).
 - Unified memory (gfx1151) parks nothing useful: host RAM is the card's memory. Not tested there.
 
 ---

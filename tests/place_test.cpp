@@ -221,56 +221,6 @@ TEST(planner_reports_what_did_not_fit) {
     CHECK(p.report(f.prog).find("DID NOT FIT") != std::string::npos);
 }
 
-TEST(gdn_state_users_stage_offloaded_weights_on_gpu_backends) {
-    for (const char* op : {"gdn_conv_prep", "gdn_conv_update", "gdn_recurrent_update",
-                           "gdn_conv_recurrent_update", "gdn_conv_recurrent_update_had"}) {
-        Fixture f;
-        const rad_weight embedding = f.weight("token_embd.weight", MiB, RAD_ACCESS_VOCAB, -1, -1);
-        f.op("embed", {embedding}, true);
-        rad_weight last = 0;
-        for (int layer = 0; layer < 6; ++layer) {
-            last = f.weight("blk." + std::to_string(layer) + ".weight", MiB,
-                            RAD_ACCESS_PER_TOKEN, layer, -1);
-            f.op(op, {last}, true);
-        }
-        Config cfg = base_config();
-        cfg.placement = "layer_offload";
-        cfg.vram_weights_mib = 5;
-        cfg.host_pool_mib = 8;
-        PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
-        Plan gpu;
-        REQUIRE_EQ(Planner(in).plan(&gpu), RAD_OK);
-        CHECK(gpu.weight[last].tier == Tier::HostPinned);
-        CHECK(gpu.weight[last].site == Site::DeviceStaged);
-        CHECK(gpu.host_runs.empty());
-        CHECK(!gpu.prefetch.empty());
-        CHECK(gpu.totals.bytes[(int)Tier::VRAM] + gpu.slab_overhead <= gpu.vram_budget);
-
-        in.host_backend = true;
-        Plan cpu;
-        REQUIRE_EQ(Planner(in).plan(&cpu), RAD_OK);
-        CHECK(cpu.weight[last].tier == Tier::HostPageable);
-        CHECK(cpu.weight[last].site == Site::Host);
-        CHECK(cpu.prefetch.empty());
-    }
-}
-
-TEST(gpu_placement_refuses_gdn_state_without_a_device_kernel) {
-    Fixture f;
-    const rad_weight w = f.weight("blk.0.conv.weight", MiB, RAD_ACCESS_PER_TOKEN, 0, -1);
-    f.op("gdn_conv_prep", {w}, true);
-    f.prog.ops.back().bands.front().dom[RAD_DOMAIN_DEVICE].row = nullptr;
-    Config cfg = base_config();
-    cfg.vram_weights_mib = 8;
-    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
-    Plan gpu;
-    CHECK_EQ(Planner(in).plan(&gpu), RAD_E_NOKERNEL);
-
-    in.host_backend = true;
-    Plan cpu;
-    CHECK_EQ(Planner(in).plan(&cpu), RAD_OK);
-}
-
 TEST(planner_host_runs_are_contiguous) {
     Fixture f;
     build_dense(f, 8, 1 * MiB, /*host_kernel=*/true);
@@ -2158,6 +2108,9 @@ struct LoanRig {
     /* None by default: on a slab this small the production count would leave most of the loan
      * empty. Tests of turnover set their own. */
     int         turnover = 0;
+    /* MoverConfig::turnover_adaptive and its floor, for the test of it. */
+    bool        adaptive = false;
+    int         floor = 0;
 
     explicit LoanRig(int n_expert = 8) : hf(n_expert) {}
 
@@ -2166,6 +2119,8 @@ struct LoanRig {
         RAD_TRY(h.init(hf.plan, hp));
         MoverConfig mc;
         mc.turnover_slots = turnover;
+        mc.turnover_adaptive = adaptive;
+        if (adaptive) mc.turnover_floor = floor;
         RAD_TRY(m.init(hf.f.prog, hf.plan, mc));
         RAD_TRY(rad_stream_create(&compute, 0));
         RAD_TRY(m.bind_compute_stream(compute));
@@ -2260,6 +2215,69 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
     std::sort(at.begin(), at.end());
     for (size_t k = 1; k < at.size(); ++k)
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
+}
+
+/* MoverConfig::turnover_adaptive: the slots kept free follow the swaps asked for. A quiet run keeps
+ * only the floor free and fills the rest; steps that propose swaps get three steps' worth of
+ * their mean back, up to the configured count, by drops (nothing crosses the link for them); and
+ * a quiet run gives them up again, each a copy in. */
+TEST(an_adaptive_turnover_follows_the_swaps_asked_for) {
+    LoanRig r(24);
+    r.turnover = 4;
+    r.adaptive = true;
+    r.floor = 1;
+    CHECK_OK(r.build());
+    CHECK_EQ(r.m.turnover_slots(), (int64_t)4);          /* the most it keeps */
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);            /* and what it starts from */
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    const int64_t slots = r.m.flex_capacity() / stride;
+    CHECK(r.pooled() > slots);
+    REQUIRE(slots > 4);
+
+    auto settle = [&](int64_t proposed, int steps) {
+        for (int k = 0; k < steps; ++k) {
+            r.m.swap_demand(proposed);
+            CHECK_OK(r.dispatch());
+        }
+        for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) CHECK_OK(r.dispatch());
+        for (int k = 0; k < 4; ++k) CHECK_OK(r.dispatch());
+    };
+
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();) {
+        r.m.swap_demand(0);
+        CHECK_OK(r.dispatch());
+    }
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 1) * stride);
+
+    /* One swap a step, step after step: the mean reaches one, and three steps of it are three. */
+    const uint64_t d2h = r.m.stats().d2h_bytes, h2d = r.m.stats().h2d_bytes;
+    settle(1, 600);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)3);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 3) * stride);
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)2);
+    /* Two a step would ask for six: the configured count bounds it. */
+    settle(2, 600);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)4);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 4) * stride);
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)3);
+    CHECK_EQ(r.m.stats().d2h_bytes, d2h);                /* the drops crossed no link */
+    CHECK_EQ(r.m.stats().h2d_bytes, h2d);
+
+    /* Quiet again: back to the floor, and the three slots are filled again. */
+    settle(0, 800);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 1) * stride);
+    CHECK(r.m.stats().h2d_bytes > h2d);
+
+    /* Off, the count is the configured one whatever is asked for. */
+    LoanRig s(24);
+    s.turnover = 4;
+    CHECK_OK(s.build());
+    s.m.swap_demand(0);
+    CHECK_OK(s.dispatch());
+    CHECK_EQ(s.m.turnover_now(), (int64_t)4);
 }
 
 /* The turnover slots stay free, and a shrinking loan does not take them for good. The fill stops
@@ -2593,55 +2611,6 @@ TEST(a_recall_takes_the_slots_back_before_it_returns) {
     for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
         CHECK_OK(r.dispatch());
     CHECK(resident_count(r.h, r.hf.plan) > r.planned);
-}
-
-TEST(image_loan_recalls_and_refills_experts_with_host_backing) {
-    LoanRig r;
-    CHECK_OK(r.build());
-    Loan image;
-    for (LoanStrip& strip : image.strips) {
-        strip.unit_bytes = 1;
-        strip.unit_tokens = 1;
-    }
-    CHECK_OK(stamp_units(r, false, nullptr));
-    Loan replacement;
-    for (LoanStrip& strip : replacement.strips) {
-        strip.unit_bytes = 1;
-        strip.unit_tokens = 1;
-    }
-    const int64_t original_capacity = r.m.flex_capacity();
-    const uint64_t d2h = r.m.stats().d2h_bytes;
-    const int64_t lendable = r.m.lendable_host_bytes();
-    REQUIRE(lendable > 0);
-
-    for (int cycle = 0; cycle < 3; ++cycle) {
-        Loan& lender = cycle % 2 == 0 ? image : replacement;
-        CHECK_OK(r.m.lend_from(Mover::kLendImage, lender.strips));
-        const int64_t amount = r.m.loan_ceiling(Mover::kLendImage);
-        REQUIRE(amount > 0);
-        CHECK_OK(r.m.set_loan(Mover::kLendImage, amount));
-        CHECK_EQ(r.m.detach_image_loan(), RAD_E_STATE);
-        for (Deadline dl; (r.m.loan_held(Mover::kLendImage) == 0 || any_busy(r.h, r.hf.plan))
-                          && !dl.passed();)
-            CHECK_OK(r.dispatch());
-        CHECK(r.m.loan_held(Mover::kLendImage) > 0);
-        CHECK(resident_count(r.h, r.hf.plan) > r.planned);
-        CHECK_OK(r.m.reclaim(Mover::kLendImage, 0, &r.h));
-        CHECK_EQ(r.m.loan_held(Mover::kLendImage), (int64_t)0);
-        CHECK_EQ(r.m.stats().d2h_bytes, d2h);
-        CHECK_EQ(r.m.stats().donated, (uint64_t)0);
-        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
-            CHECK(!lender.inside(r.addr(u)));
-        CHECK_OK(r.m.detach_image_loan());
-        CHECK_EQ(r.m.flex_capacity(), original_capacity);
-        CHECK_EQ(r.m.loan_ceiling(Mover::kLendImage), (int64_t)0);
-        CHECK_EQ(r.m.lendable_host_bytes(), lendable);
-        CHECK_OK(rad_memset_async(lender.mem, 0x5a, 2 * Loan::kStrip, r.compute));
-        CHECK_OK(rad_stream_sync(r.compute));
-        int bad = 0;
-        CHECK_OK(stamp_units(r, true, &bad));
-        CHECK_EQ(bad, 0);
-    }
 }
 
 /* An idle server still fills what it is lent, via its own tick, so a loan made while idle is not
@@ -3943,30 +3912,6 @@ TEST(tower_ram_pins_every_tower_unit_in_the_pool_and_costs_no_vram) {
     CHECK_EQ(plan2.tower_host_bytes, 0ll);
 }
 
-TEST(layer_offload_only_counts_layers_that_can_leave_vram) {
-    Fixture f;
-    build_dense(f, /*layers=*/4, /*per_layer=*/4 * MiB, /*host_kernel=*/true);
-    add_tower(f, /*first_layer=*/4, /*blocks=*/6, /*per_block=*/8 * MiB);
-    Config cfg = base_config();
-    cfg.placement = "layer_offload";
-    cfg.vram_weights_mib = 9;
-    cfg.host_pool_mib = 8;
-    cfg.tower_resolved = TablePlacement::Ram;
-    cfg.tower_host_mib = 50;
-    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
-    Plan plan;
-    REQUIRE_EQ(Planner(in).plan(&plan), RAD_OK);
-    CHECK_EQ(plan.tower_host_bytes, 50 * MiB);
-    CHECK_EQ(plan.totals.bytes[(int)Tier::VRAM], 9 * MiB);
-    CHECK_EQ(plan.slab_overhead, 0ll);
-    for (const MoveUnit& unit : plan.units) {
-        if (unit.layer < 0) continue;
-        if (unit.layer < 2) CHECK(unit.site == Site::Device);
-        else if (unit.layer < 4) CHECK(unit.site == Site::Host);
-        else CHECK(unit.site == Site::DeviceZeroCopy);
-    }
-}
-
 /* A tower too large for its room is refused, and so is ram for a program with no tower (the
  * resolver only picks Ram when the footprint found one, so that is a wiring fault). */
 TEST(tower_ram_refuses_a_pool_too_small_and_a_program_with_no_tower) {
@@ -4756,6 +4701,43 @@ TEST(expert_pin_top_keeps_the_hottest_resident) {
     CHECK_EQ(pinned, 4);
     CHECK_EQ(hot_pinned, 4);
     CHECK(p.report(f.prog).find("pinned hot") != std::string::npos);
+}
+
+/* Real profiles carry per-layer shares in [0, 1] (xs_profile_load divides by the layer's total), so
+ * the cut must not assume integer gaps between shares: F = 0.25 pins the hottest quarter, not every
+ * resident expert. */
+TEST(expert_pin_top_cuts_fractional_shares) {
+    Fixture f;
+    build_moe_layers(f, 2, 8, 1 * MiB, 0);
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e) {
+            RadFileProfile r{};
+            r.layer = l;
+            r.expert = e;
+            r.share = (float)(e + 1) / 36.0f;
+            prof.push_back(r);
+        }
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1024;
+    c.expert_pin_top = 0.25f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    int pinned = 0, hot_pinned = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0 || !mu.pinned) continue;
+        ++pinned;
+        if (mu.expert >= 6) ++hot_pinned;
+    }
+    CHECK_EQ(pinned, 4);
+    CHECK_EQ(hot_pinned, 4);
 }
 
 TEST(expert_pin_top_zero_pins_nothing) {

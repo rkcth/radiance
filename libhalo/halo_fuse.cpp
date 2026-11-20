@@ -762,8 +762,8 @@ extern "C" int halo_fuse_add_rmsnorm(const RadParam* p, int n_p, uint64_t presen
  * in-place pair the fold replaces. Its rows are attn_paged's (token, head) pairs, so its `M` is the
  * band's query rows times the head count (a bound, which is how its shim reads it) and its `n` is
  * `head_dim`. */
-extern "C" int halo_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64_t present,
-                                              int step, RadFuseStep* out) {
+static int fuse_attn_paged_gate(const RadParam* p, int n_p, uint64_t present, int step,
+                                RadFuseStep* out, const char* gate_op) {
     if (!out) return RAD_E_INVAL;
     auto opt = [present](int i) { return opt_opd(present, i); };
     const int64_t q_len = pi(p, n_p, "q_len"), nh = pi(p, n_p, "n_head");
@@ -780,7 +780,7 @@ extern "C" int halo_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint6
         return s.wire({ 0, 1, 2, 3, opt(4), opt(5), opt(6), 7 });
     }
     case 1: {
-        Step s(out, "gate_quant_fp8");
+        Step s(out, gate_op);
         s.pint("M", (long long)(seqs * q_len * nh)).pint("n", (long long)hd)
          .mirror(p, n_p, "group").pstr("dtype", "bf16").mirror(p, n_p, "act");
         return s.wire({ 8, 7, 9, 10, 7 });   /* gate, x, q, scale, out_bf16 */
@@ -788,6 +788,15 @@ extern "C" int halo_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint6
     default:
         return RAD_E_NOTFOUND;
     }
+}
+extern "C" int halo_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64_t present,
+                                              int step, RadFuseStep* out) {
+    return fuse_attn_paged_gate(p, n_p, present, step, out, "gate_quant_fp8");
+}
+/* attn_paged_gate_had_quant -- the same two steps with gate_had_quant_i8g as the second. */
+extern "C" int halo_fuse_attn_paged_gate_had_quant(const RadParam* p, int n_p, uint64_t present,
+                                                  int step, RadFuseStep* out) {
+    return fuse_attn_paged_gate(p, n_p, present, step, out, "gate_had_quant_i8g");
 }
 
 /* ==========================================================================================

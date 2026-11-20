@@ -3,7 +3,6 @@
 #include "cpu_blas.h"
 
 #include "rad_plugin.h"
-#include "engine_hostmem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <regex>
 #include <thread>
 #include <sys/stat.h>
@@ -136,16 +136,27 @@ void mm_tn(const float* A, const float* B, float* C, int64_t m, int64_t k, int64
 void orth(float* Y, int64_t n, int64_t l) {
     std::vector<double> col((size_t)n);
     for (int64_t j = 0; j < l; ++j) {
+        double original_norm2 = 0.0;
+        for (int64_t r = 0; r < n; ++r) {
+            col[(size_t)r] = Y[r * l + j];
+            original_norm2 += col[(size_t)r] * col[(size_t)r];
+        }
+        // Keep both projection passes in double scratch. Rounding each subtraction
+        // to float can turn a dependent column's residue into a spurious basis vector.
         for (int pass = 0; pass < 2; ++pass)
             for (int64_t i = 0; i < j; ++i) {
-                double d = 0.0;
-                for (int64_t r = 0; r < n; ++r) d += (double)Y[r * l + i] * Y[r * l + j];
-                for (int64_t r = 0; r < n; ++r) Y[r * l + j] -= (float)(d * Y[r * l + i]);
+                double dot = 0.0;
+                for (int64_t r = 0; r < n; ++r) dot += Y[r * l + i] * col[(size_t)r];
+                for (int64_t r = 0; r < n; ++r) col[(size_t)r] -= dot * Y[r * l + i];
             }
-        double nn = 0.0;
-        for (int64_t r = 0; r < n; ++r) nn += (double)Y[r * l + j] * Y[r * l + j];
-        const double inv = nn > 1e-30 ? 1.0 / std::sqrt(nn) : 0.0;
-        for (int64_t r = 0; r < n; ++r) Y[r * l + j] = (float)(Y[r * l + j] * inv);
+        double norm2 = 0.0;
+        for (const double value : col) norm2 += value * value;
+        // The tolerance follows the original column's scale and projection count,
+        // rather than the number of zero rows used to pad the matrix.
+        const double tolerance = std::numeric_limits<float>::epsilon() * std::max<int64_t>(1, j);
+        const double inverse = norm2 > original_norm2 * tolerance * tolerance
+                                   ? 1.0 / std::sqrt(norm2) : 0.0;
+        for (int64_t r = 0; r < n; ++r) Y[r * l + j] = (float)(col[(size_t)r] * inverse);
     }
 }
 
@@ -375,69 +386,6 @@ const char* AdapterFile::kind_name() const {
     return kName[k];
 }
 
-int AdapterSnapshots::acquire(const std::string& path, uint64_t budget, int64_t host_headroom,
-                              std::shared_ptr<const Source>* out, std::string* err,
-                              int64_t* pressure_bytes) {
-    if (pressure_bytes) *pressure_bytes = 0;
-    out->reset();
-    const std::lock_guard lock(mutex_);
-
-    /* The caller supplies a canonical local path. Include timestamps and inode in
-     * the key so atomic replacements leave existing request holds undisturbed. */
-    const auto revision = [](const struct stat& st) {
-#ifdef __APPLE__
-        const auto& modified = st.st_mtimespec;
-        const auto& changed = st.st_ctimespec;
-#else
-        const auto& modified = st.st_mtim;
-        const auto& changed = st.st_ctim;
-#endif
-        return fmt("%llu:%llu:%lld:%lld:%lld:%lld:%lld",
-                   (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
-                   (long long)st.st_size, (long long)modified.tv_sec, (long long)modified.tv_nsec,
-                   (long long)changed.tv_sec, (long long)changed.tv_nsec);
-    };
-    struct stat before{};
-    if (::stat(path.c_str(), &before) != 0 || !S_ISREG(before.st_mode))
-        return fail(err, RAD_E_NOTFOUND, "adapter source is no longer a local file");
-    if (before.st_size < 8) return fail(err, RAD_E_FORMAT, "adapter source is incomplete");
-    const std::string key = revision(before);
-    for (auto it = sources_.begin(); it != sources_.end();) {
-        if (auto source = it->second.lock()) {
-            if (it->first == key) {
-                *out = std::move(source);
-                return RAD_OK;
-            }
-            ++it;
-        } else {
-            it = sources_.erase(it);
-        }
-    }
-
-    const auto bytes = static_cast<uint64_t>(before.st_size);
-    const uint64_t used = used_->load(std::memory_order_relaxed);
-    if (used > budget || bytes > budget - used)
-        return fail(err, RAD_E_FULL, "the queued adapter snapshot budget is full");
-    std::string why;
-    if (!lockable_room(before.st_size, 0, host_headroom, false, &why)) {
-        if (pressure_bytes) *pressure_bytes = before.st_size;
-        return fail(err, RAD_E_FULL, "host memory for a queued adapter snapshot: " + why);
-    }
-
-    auto source = std::make_shared<Source>();
-    used_->fetch_add(bytes, std::memory_order_relaxed);
-    source->charge_.used = used_;
-    source->charge_.bytes = bytes;
-    TRY(source->file.open_snapshot(path, bytes, err));
-    struct stat after{};
-    if (::stat(path.c_str(), &after) != 0 || key != revision(after))
-        return fail(err, RAD_E_STATE, "adapter source changed while being snapshotted");
-    source->revision = key;
-    sources_.emplace(key, source);
-    *out = std::move(source);
-    return RAD_OK;
-}
-
 /* ================================================================== deltas */
 int module_delta(const FileModule& m, double w, Delta* out, std::string* err) {
     *out = Delta{};
@@ -637,7 +585,7 @@ void truncate(const Delta& d, int64_t r, std::vector<float>* B, std::vector<floa
         mm_tn(d.B.data(), Y, t.data(), d.r, N, l);
         mm_tn(d.A.data(), t.data(), X, K, d.r, l);
     };
-    const int64_t l = std::min({ r + 8, N, K });
+    const int64_t l = std::min({ r + 8, N, K, d.rank_bound > 0 ? d.rank_bound : r + 8 });
     /* A fixed sketch: the same adapter composes to the same bytes on every rank and every load. */
     std::vector<float> Om((size_t)(K * l));
     uint64_t st = 0x2545F4914F6CDD1Dull ^ (uint64_t)(N * 1315423911ull + K);

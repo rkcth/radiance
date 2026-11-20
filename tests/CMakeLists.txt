@@ -15,7 +15,7 @@
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test wan_umt5_test)
+set(RAD_TESTS_NO_CORE minimaxh3_limits_test wan_umt5_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -89,6 +89,7 @@ set_target_properties(harness_fixture PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAK
 # Binaries registered as several entries, <bin>_shard<k> running `<bin> --shard k/n`, so their
 # cases run in parallel and no entry is the fast tier's long pole.
 set(RAD_TEST_SHARDS_gbnf_test 4)
+set(RAD_TEST_SHARDS_mtp_rrs_test 14)  # chi-square statistics: ~5 CPU minutes in all (the adaptive depth's rules and their controls are ~2 of them); fourteen ctest entries of under a minute and a half each
 
 # ------------------------------------------------------------------ the environment of every test
 #
@@ -102,8 +103,8 @@ set(RAD_TEST_SHARDS_gbnf_test 4)
 # entries below run the device tests on a card.
 #
 # RAD_TEST_STRICT=1: a plugin or fixture this build makes is never legitimately absent, so a test
-# that cannot find one fails rather than skips. RAD_TEST_TMPDIR defaults to the build tree, on
-# disk, where O_DIRECT works. Set RAD_TEST_TMP_ROOT to use a different fixture directory.
+# that cannot find one fails rather than skips. RAD_TEST_TMPDIR puts radtest::tmpdir() in the build
+# tree, on disk, where O_DIRECT works.
 #
 # RAD_TEST_CPU_BUDGET: a unit binary that spends more CPU seconds than this fails (rad_test.h), so
 # a slow case or a spinning thread pool is caught when it lands. Sanitised and Debug builds run
@@ -123,17 +124,17 @@ if(RAD_ASAN OR RAD_TSAN OR CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(RAD_TEST_TIMEOUT 600)
   set(RAD_TEST_CPU_BUDGET 0)
 endif()
-set(RAD_TEST_TMP_ROOT "${CMAKE_BINARY_DIR}/tmp" CACHE PATH
-    "Root for test fixtures; use a native filesystem for tests that replace open files")
-file(MAKE_DIRECTORY "${RAD_TEST_TMP_ROOT}")
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tmp)
 set(RAD_TEST_OMP_ENV "OMP_WAIT_POLICY=passive" "OMP_NUM_THREADS=${RAD_TEST_OMP_THREADS}")
 set(RAD_TEST_CARD_ENV "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home" ${RAD_TEST_OMP_ENV}
-                      "RAD_TEST_STRICT=1" "RAD_TEST_TMPDIR=${RAD_TEST_TMP_ROOT}"
+                      "RAD_TEST_STRICT=1" "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp"
                       ${RAD_TEST_SAN_ENV})
 set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 
 # Binaries that need more CPU than the default budget, and what costs it. Lower an entry when its
 # cost comes down, so the tripwire stays tight.
+set(RAD_TEST_CPU_BUDGET_mtp_rrs_test 100)  # chi-square over 2e5..4e5 seeds a case
+set(RAD_TEST_CPU_BUDGET_mtp_block_test 40)  # exact enumeration (g up to 4) plus ~1.6e6 chi-square steps over the real shared verify code
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
@@ -281,9 +282,18 @@ foreach(t ${RAD_TESTS})
   # engine binary.
   if(n STREQUAL "mem_test")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
-    add_dependencies(${n} radtest_rows)
   endif()
-  if(n STREQUAL "dspark_device_test")
+  if(n STREQUAL "spechub_device_test")
+    # The device verify rows against their host rows: on a card, so it carries the gpu label and
+    # the card environment (without either it would pass having checked nothing).
+    if(RAD_HIP_FOUND AND TARGET spechub)
+      add_test(NAME ${n} COMMAND ${n})
+      set_tests_properties(${n} PROPERTIES
+        LABELS gpu
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
+  elseif(n STREQUAL "dspark_device_test")
     if(RAD_HIP_FOUND AND TARGET libr4d)
       add_dependencies(${n} libr4d)
       add_test(NAME ${n} COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
@@ -339,6 +349,7 @@ endif()
 # so a one-card build for another family skips those cases instead of failing strict mode.
 if(TARGET libr4d)
   target_compile_definitions(plugin_test PRIVATE RAD_TEST_HAS_LIBR4D=1)
+  target_compile_definitions(shipped_plugins_test PRIVATE RAD_TEST_HAS_LIBR4D=1)
   add_dependencies(plugin_test libr4d)
 endif()
 
@@ -353,6 +364,12 @@ if(TARGET spechub)
     target_compile_definitions(spechub_wiring_test PRIVATE RAD_SPECHUB_WITH_DEVICE=1)
   endif()
   add_dependencies(spechub_wiring_test spechub)
+  # spechub_device_test runs the plugin's device verify rows against their host rows on a card
+  # (skips without one); it needs the same library path.
+  target_link_libraries(spechub_device_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(spechub_device_test PRIVATE
+    RAD_SPECHUB_LIB="${RAD_PLUGIN_OUT}/kernels/spechub.so")
+  add_dependencies(spechub_device_test spechub)
   # sample_test's coupling case declares a Sampler with draft_coupling set and needs the verify
   # op the spechub plugin carries (its host row); it skips when the library is absent.
   add_dependencies(sample_test spechub)
@@ -369,7 +386,7 @@ endif()
 # the host backend; convert_test runs rad-convert on the same checkpoints. Both start the built
 # binaries as children, so they depend on them and on every plugin the checkpoints select
 # (llama_fp8 for convert_test's --set of an fp8 quantization_config).
-set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf16 lfm2_bf16 gemma4 gemma4_bf16
+set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf16 lfm2_bf16 lfm3_bf16 gemma4 gemma4_bf16
                  llama_dense_fp8 llama_fp8 qwenimage21)
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
@@ -399,21 +416,7 @@ endforeach()
 # 6 to 17 s by build type and load, mostly libref's GEMMs and decode steps and the engine's own
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
-  # The fixture exercises draft coupling and Qwen3-ASR through loaded plugins.
-  add_dependencies(engine_e2e_test spechub qwen3asr_bf16)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
-  set_property(TEST engine_e2e_test APPEND PROPERTY ENVIRONMENT "RAD_E2E_SKIP_VISION_EDIT=1")
-  add_test(NAME shared_single_image_rank_e2e COMMAND engine_e2e_test
-    shared_service_serves_text_and_repeated_images_on_one_listener)
-  set_tests_properties(shared_single_image_rank_e2e PROPERTIES LABELS "e2e" SKIP_RETURN_CODE 77
-    ENVIRONMENT "${RAD_TEST_ENV};RAD_E2E_SINGLE_IMAGE_RANK=1" TIMEOUT 300)
-  add_test(NAME shared_pageable_image_snapshot_e2e COMMAND engine_e2e_test
-    shared_service_serves_text_and_repeated_images_on_one_listener)
-  set_tests_properties(shared_pageable_image_snapshot_e2e PROPERTIES LABELS "e2e" SKIP_RETURN_CODE 77
-    ENVIRONMENT "${RAD_TEST_ENV};RAD_E2E_PAGEABLE_IMAGE_SNAPSHOT=1" TIMEOUT 300)
-  add_test(NAME qwen_vision_edit_e2e COMMAND engine_e2e_test qwen_image_with_vision_serves_an_edit)
-  set_tests_properties(qwen_vision_edit_e2e PROPERTIES LABELS "e2e" SKIP_RETURN_CODE 77
-    ENVIRONMENT "${RAD_TEST_ENV}" TIMEOUT 600)
 endif()
 if(TARGET clef_decision_test)
   set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
@@ -470,6 +473,20 @@ if(RAD_HIP_FOUND AND TARGET r4d_selftest)
     LABELS "slow;gpu"
     TIMEOUT 2400
     ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+endif()
+
+# ================================================================== the chained waits' scalar-cache flush
+#
+# A chained kernel whose wait is r4d_chain_wait_vec skips `s_dcache_inv` (libr4d/r4d_chain.h). This
+# compiles every unit with a chained kernel to gfx1201 assembly with the build's own flags and fails
+# on a kernel that skips it and has a scalar load, from anything but its argument segment, behind
+# its acquire. No card needed; it recompiles the kernels (minutes), hence `slow`.
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(RAD_HIP_FOUND AND Python3_FOUND AND CMAKE_EXPORT_COMPILE_COMMANDS)
+  add_test(NAME chain_scalar_audit
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/chain_scalar_audit.py
+                   ${CMAKE_BINARY_DIR} ${CMAKE_BINARY_DIR}/chain_scalar_audit --check)
+  set_tests_properties(chain_scalar_audit PROPERTIES LABELS "slow" TIMEOUT 1800)
 endif()
 
 # ================================================================== libhalo's interface parity
@@ -875,6 +892,8 @@ add_test(NAME artifact_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
 if(RAD_PYTHON3)
+  add_test(NAME vhead_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/vhead_test.py)
+  set_tests_properties(vhead_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77 TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME spark25_validation_test

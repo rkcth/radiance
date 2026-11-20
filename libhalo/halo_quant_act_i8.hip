@@ -81,7 +81,7 @@ __global__ __launch_bounds__(THR) void halo_r4dchain_quant_act_i8(
 #define HALO_QAI8_MAXG 256
 
 template <int THR>
-__global__ __launch_bounds__(THR) void halo_quant_act_i8_asum_kernel(
+__device__ __forceinline__ void halo_quant_act_i8_asum_kernel_body(
     const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
     float* __restrict__ Asum, int K, int group, int Mpad) {
   const int row = blockIdx.x;
@@ -121,6 +121,17 @@ __global__ __launch_bounds__(THR) void halo_quant_act_i8_asum_kernel(
     Asum[(size_t)g * Mpad + row] = (float)gs[g];
 }
 
+/* halo_quant_act_i8_asum_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int THR, class CH = HaloUnchained>
+__global__ __launch_bounds__(THR)
+void halo_quant_act_i8_asum_kernel(
+    const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
+    float* __restrict__ Asum, int K, int group, int Mpad) {
+    if (CH::on) halo_chain_wait();
+    halo_quant_act_i8_asum_kernel_body<THR>(A, Q, S, Asum, K, group, Mpad);
+    if (CH::on) halo_chain_done();
+}
+
 // The plugin ABI entry point (RadLaunchFn); a refused shape is a status code, not a throw. See
 // libhalo/halo_args.h.
 //
@@ -129,6 +140,7 @@ __global__ __launch_bounds__(THR) void halo_quant_act_i8_asum_kernel(
 enum { QA_X = 0, QA_Q, QA_S, QA_ASUM };
 
 extern "C" int halo_rad_quant_act_i8(const RadArgs* args, RadStream stream) {
+    HaloChainScope halo_chs_(halo_chain_small(args, 64));   /* halo_chain.h */
   int emit_rc = RAD_OK;
   const RadTensor* x  = halo_opt(args, QA_X);
   const RadTensor* q  = halo_opt(args, QA_Q);
@@ -175,7 +187,7 @@ extern "C" int halo_rad_quant_act_i8(const RadArgs* args, RadStream stream) {
   const long long mpad = ((M + 15) / 16) * 16;
   if (halo_numel(as) < (K / group) * mpad) return HALO_NO(RAD_E_SCRATCH);
 
-#define HALO_QAI8A_LAUNCH(T) emit_rc = HALO_EMIT(stream, (halo_quant_act_i8_asum_kernel<T>),        \
+#define HALO_QAI8A_LAUNCH(T) emit_rc = HALO_EMIT(stream, (halo_chain_flag() ? halo_quant_act_i8_asum_kernel<T, r4dchain> : halo_quant_act_i8_asum_kernel<T, HaloUnchained>),        \
     dim3((int)M), dim3(T), 0, (const __hip_bfloat16*)halo_p(x), (signed char*)halo_wp(q),          \
     (float*)halo_wp(sc), (float*)halo_wp(as), (int)K, (int)group, (int)mpad)
   switch (thr) {

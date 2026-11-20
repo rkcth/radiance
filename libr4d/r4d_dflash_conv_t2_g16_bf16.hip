@@ -27,7 +27,7 @@ __global__ __launch_bounds__(DFC_THREADS) void r4dchain_dflash_conv(
     const r4d_u16* __restrict__ base, r4d_u16* __restrict__ out,
     int H, int dpitch, int NG, int vpr, int blockmask)
 {
-  r4d_chain_wait();
+  r4d_chain_wait_vec();
   const int hv = blockIdx.x * DFC_THREADS + threadIdx.x;
   r4d_dflash_conv_body<TAPS, GROUP>(x, delta, base, out, H, dpitch, NG, vpr,
                                     blockmask, blockIdx.y, hv);

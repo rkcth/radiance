@@ -16,6 +16,7 @@
 //
 // A masked tail tile means K/SK need only be a multiple of 8 (VEC), not of 256: masking is at
 // lane granularity and no lane ever holds a partial 128-bit load.
+#include "halo_chain.h"
 #include "halo.h"
 #include "halo_gemm_args.h"
 #include <hip/hip_runtime.h>
@@ -30,7 +31,7 @@ typedef int    int4v  __attribute__((ext_vector_type(4)));
 typedef __bf16 bf162  __attribute__((ext_vector_type(2)));   // v_dot2_f32_bf16 operand
 
 template <int MT, int TEMPORAL>
-__global__ __launch_bounds__(1024) void halo_gemm_bf16_nt_m16_kernel(
+__device__ __forceinline__ void halo_gemm_bf16_nt_m16_kernel_body(
         const __hip_bfloat16* __restrict__ A, const __hip_bfloat16* __restrict__ W,
         __hip_bfloat16* __restrict__ C, int K, int N, int WV, int SK) {
     extern __shared__ float red[];                      // WV*SK*MT split-K scratch
@@ -99,8 +100,19 @@ __global__ __launch_bounds__(1024) void halo_gemm_bf16_nt_m16_kernel(
     }
 }
 
+/* halo_gemm_bf16_nt_m16_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int MT, int TEMPORAL, class CH = HaloUnchained>
+__global__ __launch_bounds__(1024)
+void halo_gemm_bf16_nt_m16_kernel(
+        const __hip_bfloat16* __restrict__ A, const __hip_bfloat16* __restrict__ W,
+        __hip_bfloat16* __restrict__ C, int K, int N, int WV, int SK) {
+    if (CH::on) halo_chain_wait();
+    halo_gemm_bf16_nt_m16_kernel_body<MT, TEMPORAL>(A, W, C, K, N, WV, SK);
+    if (CH::on) halo_chain_done();
+}
+
 static int gemm_bf16_m16_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
-                                int nt, long stream) {
+                                int nt, long stream, bool chain = false) {
     if (M < 1 || M > HALO_GEMM16_MAX_M) return -1;
     if (K % SK != 0 || (K / SK) % VEC != 0) return -2;
     if (WV * SK * WAVE > 1024) return -3;
@@ -110,8 +122,13 @@ static int gemm_bf16_m16_launch(long a, long w, long c, int M, int K, int N, int
     auto A = (const __hip_bfloat16*)a; auto Wp = (const __hip_bfloat16*)w;
     auto Cp = (__hip_bfloat16*)c; auto st = (hipStream_t)stream;
 #define LAUNCH(MT)                                                                    \
-    do { if (nt) hipLaunchKernelGGL((halo_gemm_bf16_nt_m16_kernel<MT, 0>), grid, block, smem, st, A, Wp, Cp, K, N, WV, SK); \
-         else    hipLaunchKernelGGL((halo_gemm_bf16_nt_m16_kernel<MT, 1>), grid, block, smem, st, A, Wp, Cp, K, N, WV, SK); } while (0)
+    do { if (chain) {                                                                              \
+             if (nt) hipLaunchKernelGGL((halo_gemm_bf16_nt_m16_kernel<MT, 0, r4dchain>), grid, block, smem, st, A, Wp, Cp, K, N, WV, SK); \
+             else    hipLaunchKernelGGL((halo_gemm_bf16_nt_m16_kernel<MT, 1, r4dchain>), grid, block, smem, st, A, Wp, Cp, K, N, WV, SK); \
+         } else {                                                                                   \
+             if (nt) hipLaunchKernelGGL((halo_gemm_bf16_nt_m16_kernel<MT, 0>), grid, block, smem, st, A, Wp, Cp, K, N, WV, SK); \
+             else    hipLaunchKernelGGL((halo_gemm_bf16_nt_m16_kernel<MT, 1>), grid, block, smem, st, A, Wp, Cp, K, N, WV, SK); \
+         } } while (0)
     switch (M) {
       case 1: LAUNCH(1); break;   case 2: LAUNCH(2); break;   case 3: LAUNCH(3); break;
       case 4: LAUNCH(4); break;   case 5: LAUNCH(5); break;   case 6: LAUNCH(6); break;
@@ -167,7 +184,7 @@ extern "C" int halo_rad_gemm_bf16_m16(const RadArgs* a, RadStream s) {
     }
     rc = gemm_bf16_m16_launch(halo_addr(g.a), halo_addr(g.b), halo_addr(g.y),
                               (int)g.M, (int)g.K, (int)g.N, wv, sk, cv.nt,
-                              (long)(uintptr_t)s);
+                              (long)(uintptr_t)s, halo_geti_or(a, "chain", 0) != 0);
     if (rc != 0) return halo_rad_gemm_bf16_m64(a, s);
     return RAD_OK;
 }

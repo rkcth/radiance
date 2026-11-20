@@ -127,6 +127,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
     o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
+    o.suffix_steps = m.suffix_steps;             o.suffix_rows = m.suffix_rows;
+    o.suffix_accepted = m.suffix_accepted;       o.suffix_held_ahead = m.suffix_held_ahead;
     o.linear_hit_rate = m.linear_hit_rate;
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
@@ -526,7 +528,6 @@ public:
      * derive it from the template. A declaration the parser cannot run is refused at startup. */
     int init(const Vocab& v, const RadChatFormat* declared = nullptr,
              const std::string& plugin = std::string()) {
-        eog_call_markers_.clear();
         const int st = t_.load_from_vocab(v);
         if (st < 0) return st;
 
@@ -565,36 +566,43 @@ public:
         if (t_.caps().tools && !tool_refusal_.empty())
             RAD_WARN("chat: tool calls are refused for this model: %s", tool_refusal_.c_str());
 
-        /* A container can name a token end-of-generation that this format writes as one of its
-         * own call delimiters (a converted checkpoint that lists its tool-call close). A turn
-         * ending there loses a second call and anything after it, and a reply that quotes the tag
-         * is cut mid-sentence; the engine drops these ids from the decoder's set
-         * (Vocab::drop_eog). */
-        eog_call_markers_.clear();
-        if (f.has_tools())
-            for (const std::string& m : chat_format_markers(f))
-                for (int32_t id : v.eog())
-                    if (v.text(id) == m &&
-                        std::find(eog_call_markers_.begin(), eog_call_markers_.end(), id) ==
-                            eog_call_markers_.end())
-                        eog_call_markers_.push_back(id);
-        /* The spellings, resolved once. See ReplyOptions::terminators. A call delimiter the
-         * container also declares terminal is left out here too: the parser must read it as the
-         * call boundary it is, not as the end of the reply. */
+        /* The spellings, resolved once. See ReplyOptions::terminators. */
         terminators_.clear();
         for (int32_t id : v.eog()) {
-            if (std::find(eog_call_markers_.begin(), eog_call_markers_.end(), id) !=
-                eog_call_markers_.end())
-                continue;
             const std::string s = v.text(id);
             if (!s.empty()) terminators_.push_back(s);
         }
         return RAD_OK;
     }
 
-    /* End-of-generation ids whose spelling is one of the format's call delimiters: a call
-     * boundary the container also declares a turn boundary. Empty for a model without tools. */
-    const std::vector<int32_t>& eog_call_markers() const { return eog_call_markers_; }
+    /* The end-of-generation ids of `v` whose spelling is a marker of the reply format `v` is
+     * served with: `declared` (the architecture plugin's) or the one its template yields. A
+     * checkpoint can list its tool-call close in generation_config.json's eos ids; a turn ending
+     * there cannot write a second call or the text after one, and a reply quoting the tag is cut
+     * at it. The format says what the model writes as a call boundary, so the engine takes these
+     * ids out of the vocabulary's set at bring-up (Vocab::drop_named_eog), before the scheduler,
+     * the cards' step state, the grammar index and this bridge's terminators are built from it.
+     * Empty for a model without tool calls or a format that cannot be read. Logs nothing. */
+    static std::vector<int32_t> eog_call_markers(const Vocab& v, const RadChatFormat* declared) {
+        ChatFormat f;
+        std::string why, refused;
+        if (declared) {
+            if (chat_format_from_abi(declared, &f, &why) < 0 || chat_format_check(f, &why) < 0)
+                return {};
+        } else {
+            const std::string bos = v.bos() >= 0 ? v.text(v.bos()) : std::string();
+            const std::string eos = v.eos() >= 0 ? v.text(v.eos()) : std::string();
+            if (chat_format_from_template(v.chat_template(), bos, eos, &f, &refused, &why) < 0)
+                return {};
+        }
+        std::vector<int32_t> out;
+        if (!f.has_tools()) return out;
+        for (const std::string& m : chat_format_markers(f))
+            for (int32_t id : v.eog())
+                if (v.text(id) == m && std::find(out.begin(), out.end(), id) == out.end())
+                    out.push_back(id);
+        return out;
+    }
 
     bool ready() const { return t_.ready() && fmt_ != nullptr; }
     bool supports_tools() const override { return t_.caps().tools; }
@@ -776,7 +784,6 @@ private:
 
     ChatTemplate t_;
     std::vector<std::string> terminators_;
-    std::vector<int32_t> eog_call_markers_;
     std::shared_ptr<const ReplyFormat> fmt_;
     bool declared_ = false;
     std::string tool_refusal_;

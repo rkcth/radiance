@@ -31,7 +31,8 @@
 #include <hip/hip_runtime.h>
 #include "halo.h"
 #include "halo_gdn_args.h"
-#include "halo_common.h"       // bf16_to_f32 / f32_to_bf16, halo_xor_lane
+#include "halo_common.h"
+#include "halo_chain.h"       // bf16_to_f32 / f32_to_bf16, halo_xor_lane
 #include "halo_gdn_conv_tap.h"
 #include "halo_q8.h"         // the 8-bit codes the folded quantiser writes: E4M3 or int8
 #include <cstdlib>
@@ -250,8 +251,7 @@ __device__ __forceinline__ void ru_sync() {
 
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
           int CV = 0>
-__global__ __launch_bounds__(RU_V / VS * 2)
-void halo_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
+__device__ __forceinline__ void halo_gdn_recurrent_update_kernel_body(const unsigned short* __restrict__ q,
                                      const unsigned short* __restrict__ k,
                                      const unsigned short* __restrict__ v,
                                      const void* __restrict__ av,
@@ -271,8 +271,7 @@ void halo_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
                                      long zg_pitch,
                                      const float* __restrict__ nw, float neps, int nact,
                                      int H, int Hg, float scale, float sp_thr,
-                                     const RuConv cv)
-{
+                                     const RuConv cv) {
   using ST = typename ru_state<SDT>::T;
   constexpr int NR = RU_V / VS;         // v rows this workgroup owns
   constexpr int THR = NR * 2;
@@ -787,6 +786,36 @@ void halo_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   }
 }
 
+/* halo_gdn_recurrent_update_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
+          int CV = 0, class CH = HaloUnchained>
+__global__ __launch_bounds__(RU_V / VS * 2)
+void halo_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
+                                     const unsigned short* __restrict__ k,
+                                     const unsigned short* __restrict__ v,
+                                     const void* __restrict__ av,
+                                     const void* __restrict__ bv, long ab_stride,
+                                     const float* __restrict__ A_log,
+                                     const float* __restrict__ dt_bias,
+                                     typename ru_state<SDT>::T* __restrict__ state,
+                                     long st_slot, long st_head,
+                                     unsigned short* __restrict__ o,
+                                     unsigned char* __restrict__ oq,
+                                     float* __restrict__ os, long oq_pitch,
+                                     long os_ld,
+                                     const int* __restrict__ cu,
+                                     const int* __restrict__ sidx, long sidx_stride,
+                                     const int* __restrict__ naccept,
+                                     const unsigned short* __restrict__ zg,
+                                     long zg_pitch,
+                                     const float* __restrict__ nw, float neps, int nact,
+                                     int H, int Hg, float scale, float sp_thr,
+                                     const RuConv cv) {
+    if (CH::on) halo_chain_wait();
+    halo_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
+    if (CH::on) halo_chain_done();
+}
+
 // Non-temporal hint on the state load and store (TH_LOAD_NT / TH_STORE_NT): no result changes;
 // chosen per launch because its cost and saving land in different kernels. In isolation it makes
 // this kernel 43.8% slower (DRAM-write bound), but no state survives the 64 MB last-level cache
@@ -966,7 +995,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                                     long sidx_stride, const void* nacc, const void* z,
                                     long z_pitch, const void* nw, float neps, int nact, int N,
                                     int H, int Hg, float scale, float thr, int state_fp16,
-                                    RadStream stream, int oq_i8, bool anc) {
+                                    RadStream stream, int oq_i8, bool anc, bool chain = false) {
   if (anc && sidx_stride < 6) return RAD_E_SHAPE;
   if (anc && sidx_stride * RU_FSTR > st_head) return RAD_E_SHAPE;
   const int sdt = state_fp16 ? 1 : 0;
@@ -977,8 +1006,12 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
 #define RC_LAUNCH(NTC, ANCC, SDTC)                                                            \
   do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC); else RC_LAUNCH_NM(1, NTC, ANCC, SDTC); }    \
   while (0)
+/* `chain`: the chained form (halo_chain.h), where the row resolved with `chain`. */
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC)                                                     \
-  hipLaunchKernelGGL((halo_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1>),       \
+  do { if (chain) RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, r4dchain);                                 \
+       else       RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, HaloUnchained); } while (0)
+#define RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CH)                                                 \
+  hipLaunchKernelGGL((halo_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1, CH>),   \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
@@ -995,6 +1028,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
 #undef RC_PICKNT
 #undef RC_LAUNCH
 #undef RC_LAUNCH_NM
+#undef RC_LAUNCH_CH
   return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1222,5 +1256,36 @@ extern "C" int halo_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
         os ? (long)halo_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
-        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0);
+        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, halo_geti_or(a, "chain", 0) != 0);
+}
+
+/* gdn_conv_recurrent_update_had: the update writing `o` alone, then had_quant_act_i8g over it --
+ * the pair the op is defined as (libr4d folds the quantiser into the update's epilogue, NORM 3,
+ * saving the launch). Group 128 only: IQ8R's 256 pairs two value heads' arrival counters, which
+ * this unit's update predates. */
+extern "C" int halo_rad_had_quant_act_i8g(const RadArgs* a, RadStream stream);
+extern "C" int halo_rad_gdn_conv_recurrent_update_had(const RadArgs* a, RadStream s) {
+    if (halo_geti_or(a, "group", 128) != 128) return HALO_NO(RAD_E_UNSUPPORTED);
+    const RadTensor* o  = halo_opt(a, OPD_CR_O);
+    const RadTensor* oq = halo_opt(a, OPD_CR_OQ);
+    const RadTensor* os = halo_opt(a, OPD_CR_OS);
+    if (!o || !oq || !os || oq->dtype != RAD_I8) return HALO_NO(RAD_E_INVAL);
+    RadTensor t[OPD_CR_OS + 1];
+    for (int i = 0; i <= OPD_CR_OS; ++i) t[i] = a->t[i];
+    RadArgs u = *a;
+    u.t = t;
+    u.n_t = OPD_CR_O + 1;   /* no codes: the update writes the bf16 `o` and nothing else */
+    const int rc = halo_rad_gdn_conv_recurrent_update(&u, s);
+    if (rc != RAD_OK) return rc;
+    const RadTensor qt[3] = { *o, *oq, *os };
+    RadArgs q{};
+    q.t = qt;
+    q.n_t = 3;
+    q.p = a->p;       /* `chain` among them, for the quantiser's chained form */
+    q.n_p = a->n_p;
+    q.rank = a->rank;
+    q.world_size = a->world_size;
+    q.kv_used_max_h = -1;
+    q.wgp_count = a->wgp_count;
+    return halo_rad_had_quant_act_i8g(&q, s);
 }

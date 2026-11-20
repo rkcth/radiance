@@ -1,10 +1,12 @@
 /* r4d_attn_paged_window.hip -- paged attention at head_dim 128, 256 and 512, 1/2/4/8 queries per
- * KV head (16 at 512), any sliding window, causal or not, bf16 or int8 cache, q at any row
+ * KV head (1, 4 or 16 at 128, 16 at 512), any sliding window, causal or not, bf16 or int8 cache, q at any row
  * pitch.
  *
  * head_dim 128 is Unlimited-OCR's decoder (10 query heads over 10 KV heads): the plain MHA case,
  * served here so its q slice of the fused q|k|v plane is read in place (attn_paged_qrow) instead
- * of being lifted into a dense buffer.
+ * of being lifted into a dense buffer. head_dim 128 at gqa 4 is LFM3's attention (16 query heads
+ * over 4 KV heads): full layers, and sliding layers with a 256-token window; its decode steps stay
+ * on r4d_attn_paged_h128_gqa4.hip and every longer q_len lands here.
  *
  * Gemma 4's text layers: sliding layers are 16 query heads over 8 KV heads at head_dim 256 with a
  * 1024-token window (gqa 2 at every TP); full layers are 16 over 2 at head_dim 512 (gqa 8 at
@@ -1129,7 +1131,7 @@ __global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
 }
 template <int HD, int GQA, int KV8, bool TREE = false>
 __global__ __launch_bounds__(kThreads) void r4dchain_attn_window(AttnArgs A) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     attn_body<HD, GQA, KV8, TREE>(A);
     r4d_chain_done();
 }
@@ -1137,7 +1139,7 @@ template <int HD, int GQA>
 __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) { merge_body<HD, GQA>(A); }
 template <int HD, int GQA>
 __global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     merge_body<HD, GQA>(A);
     r4d_chain_done();
 }
@@ -1372,7 +1374,7 @@ extern "C" {
     }
 /* h128 gqa16: Muse Glimmer's sliding layers, 32 query heads over 2 KV heads; the same
  * launch_attn the sink variant below already runs at this geometry. */
-R4D_WIN_DEF(128, 1) R4D_WIN_DEF(128, 16)
+R4D_WIN_DEF(128, 1) R4D_WIN_DEF(128, 4) R4D_WIN_DEF(128, 16)
 R4D_WIN_DEF(256, 1) R4D_WIN_DEF(256, 2) R4D_WIN_DEF(256, 4) R4D_WIN_DEF(256, 8)
 R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8) R4D_WIN_DEF(512, 16)
 #undef R4D_WIN_DEF

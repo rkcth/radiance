@@ -99,6 +99,8 @@ vendor/llama/common/jinja/                   <- llama.cpp common/jinja/
                    or `{% if %}{% if %}` stack-overflowed whoever parsed, the capability probe
                    or the first render, past every catch -- so both now share one 128-level cap
                    whose throw is the same exception class a malformed template already raises.
+                   An elif chain counts against the same cap: parse_if_statement calls itself
+                   once per elif without passing through parse_any.
                    And range() emitted one array element per step uncapped -- `range(4000000000)`
                    OOMed per render -- so it refuses above 65536 values, far past any template
                    that exists. String repetition is that cap's sibling -- `'x' * 4000000000`
@@ -205,7 +207,7 @@ vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp
     total max_timeout, and a close for a part-read body), and routes exceptions from the pre-routing
     handler and the WebSocket upgrade through the exception handler. What survived is the budget the
     library still ties to the connection's own timeout and cannot lower without capping uploads
-    too: see below. The v0.66.0 bump is the audit's upstream-currency finding: 0.66.0's ThreadPool
+    too: see below. The v0.66.0 bump is for its ThreadPool, which
     wraps the dynamic worker's creation in try/catch (std::system_error) and keeps the job queued
     when the thread budget runs out, where 0.64.0 let the exception escape the accept loop into
     std::terminate -- thread exhaustion was a process abort. radiance's socket gate and drain

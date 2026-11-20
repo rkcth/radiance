@@ -75,6 +75,11 @@ extern "C" int halo_rad_prefetch(const RadArgs* a, RadStream stream) {
     if ((uintptr_t)w->data % 16) return HALO_NO(RAD_E_ALIGN);
     int nb = halo_cfg_prefetch_nb(a);
     if (nb < 1) nb = 64;
+    /* The architecture's own count (`blocks`), as libr4d's prefetch takes it. */
+    {
+        const long long blocks = halo_geti_or(a, "blocks", 0);
+        if (blocks > 0 && blocks <= 1024) nb = (int)blocks;
+    }
     const bool ch = halo_geti_or(a, "chain", 0) != 0;
     return HALO_EMIT(stream, (ch ? halo_r4dchain_prefetch : prefetch_kernel), dim3((unsigned)nb), dim3(256), 0,
                     (const int4*)w->data, (size_t)(bytes / 16));

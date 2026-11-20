@@ -1,6 +1,6 @@
-/* gemma4 -- Gemma 4 text decoders (26B-A4B MoE, and the dense members of the family): a bf16
+/* gemma4 -- Gemma 4 decoders (26B-A4B MoE, and the dense members of the family): a bf16
  * trunk, routed experts bf16, block fp8 or rotated int8 (see FP8 EXPERTS), and the DFlash
- * block-diffusion drafter.
+ * block-diffusion drafter, with the shared Gemma 4 vision tower.
  *
  * ============================== THE SHAPE (gemma-4-26B-A4B-it) ==============================
  *
@@ -91,13 +91,11 @@
  *
  * ============================== NOT DECLARED ==============================
  *
- *   the vision tower (arch/embgemma2 declares Gemma 4's for an encoder): this plugin serves text;
- *   a container carrying a tower is served with --mm-max-patches 0 and media parts are refused by
- *   name;
  *   an fp8 attention or dense arm: under a tenth of the weight bytes, and the dense arm's 2112 is
  *   not whole 128-blocks.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_fp8.h>
 #include <arch/rad_gemma4_chat.h>
 #include <arch/rad_gemma4_dflash.h>
@@ -158,6 +156,7 @@ struct Layer {
     rad_op op_anorm = 0, op_qkv = 0, op_qknr = 0, op_lift = 0;
     rad_op op_q = 0, op_k = 0, op_vnorm = 0, op_qn = 0, op_kn = 0, op_qrope = 0, op_krope = 0;
     rad_op op_store = 0, op_attn = 0, op_o = 0, op_ar_o = 0, op_apost = 0, op_add_a = 0;
+    rad_op op_bidi = 0, op_ahead = 0;
     /* dense arm */
     rad_weight w_fnorm = 0, w_gu = 0, w_dn = 0, w_fpost1 = 0;
     rad_op op_fnorm = 0, op_gu = 0, op_act = 0, op_dn = 0;
@@ -241,6 +240,8 @@ struct Model {
 
     rad_weight w_tok = 0, w_onorm = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_onorm = 0, op_gather = 0, op_logits = 0, op_cap = 0;
+    rad_op op_mm = 0;
+    Gemma4Vision vis{};
 
     enum { MAX_TAPS = Dflash1::MAX_TAPS };
     int     n_taps = 0;
@@ -570,29 +571,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * layers' (512).
      *
      * The sliding layers' group is RAD_KV_WINDOW, sized to the attention window, which is what
-     * the kernel reads anyway: attn_paged takes `window` 1024 on those layers and never looks at
-     * a key older than it. As a window group the pool is capped at the window plus one block per
-     * sequence (core/mem/kv.cpp), so 25 sliding layers cost ~1k tokens of cache each instead of
-     * the whole context -- at 32k and fp8 KV, 0.4 GiB a sequence where FULL costs 3.5. The full
-     * layers' group stays RAD_KV_FULL: it is the only one whose keys outlive a window.
+     * the kernel reads: attn_paged takes `window` 1024 on those layers and never looks at a key
+     * older than it. As a window group the pool is capped at the window plus one block per
+     * sequence (core/mem/kv.cpp), so the sliding layers cost about 1k tokens of cache each
+     * instead of the whole context. The full layers' group stays RAD_KV_FULL: it is the only one
+     * whose keys outlive a window.
      *
-
      * A windowed group is not prefix-cached (core/mem/prefix.cpp): its rows below the window are
-     * recycled, and adopt() would overfill a table capped at window_blocks. What that costs on
-     * a prefix hit is only the windowed rows; the full layers' rows still come back from the
-     * store. The window itself resumes from the deepest retained checkpoint at or below the
-     * matched end — that checkpoint's slot carries the window behind it — and only the gap between
-     * that checkpoint and the match end is recomputed. Only where no retained checkpoint sits at
-     * or below the match do the windowed layers start their cache where the hit ended
-     * (the re-prefill case); that is the regime gemma3 runs with a DFlash drafter on the
-     * same core, and it declares its sliding group exactly this way.
+     * recycled, and adopt() would overfill a table capped at window_blocks. On a prefix hit the
+     * full layers' rows come back from the store, and the window resumes from the deepest
+     * retained checkpoint at or below the matched end: that checkpoint's slot carries the window
+     * behind it, and only the gap between it and the match end is recomputed. Where no retained
+     * checkpoint sits at or below the match, the windowed layers start their cache where the hit
+     * ended and the prompt is prefilled again. Gemma 3 declares its sliding group the same way.
      *
-
-     * The drafter does not read the trunk's cache. DFlash keeps its own windowed draft KV (2048),
-     * rebuilt each context pass from the trunk's residual taps; its rows live inside that window
-     * like every other draft query's, and it has no stake in the trunk's windowed rows outliving
-     * the window. A windowed trunk group therefore costs the drafter nothing. */
-
+     * The drafter does not read the trunk's cache. DFlash keeps its own windowed draft KV,
+     * rebuilt each context pass from the trunk's residual taps, so a windowed trunk group costs
+     * the drafter nothing. */
     {
         const uint32_t kvdt = rad_kv_cache_dtype(ctx, RAD_BF16);
         RadKVGroupDecl d{};
@@ -752,6 +747,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    RAD_INT("vocab_offset", g.vocab_off), RAD_F64("mult", m.escale)),
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
+    const bool vision = ctx->max_enc_patches > 0 && Gemma4Vision::present(meta);
+    const char* bidi = meta_text_gets(meta, "use_bidirectional_attention", "");
+    m.vis.bidirectional = vision && bidi && !std::strcmp(bidi, "vision");
+    if (vision)
+        m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
+                         RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_STR("dtype", "bf16")),
+                         RAD_NOWEIGHTS),
+                     {m.b_x}, {m.b_x});
     if (W > 1)
         m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
                                RAD_PARAMS(RAD_INT("world_size", W), RAD_RANGE("numel", E, T * E),
@@ -802,10 +805,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_NOWEIGHTS),
                   {buf}, {buf});
     };
-    auto attn = [&](const Kind& k, rad_buf q, rad_buf out, const char* op = "attn_paged") {
+    auto attn = [&](const Kind& k, rad_buf q, rad_buf out, const char* op = "attn_paged",
+                    int causal = 1) {
         return rw(b, RAD_OP(b, op,
                          RAD_PARAMS(RAD_RANGE("q_len", 1, T), RAD_INT("head_dim", k.hd),
-                                    RAD_INT("gqa", k.nh / k.nkv), RAD_INT("causal", 1),
+                                    RAD_INT("gqa", k.nh / k.nkv), RAD_INT("causal", causal),
                                     RAD_INT("window", k.window), RAD_INT("n_head", k.nh),
                                     RAD_INT("block_size", RAD_KV_BLOCK),
                                     RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
@@ -939,6 +943,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                     RAD_NOWEIGHTS),
                                 {m.b_qkv}, {m.b_qs});
                 y.op_attn = attn(k, m.b_qs, m.b_atts);
+            }
+            if (m.vis.bidirectional) {
+                const bool dense_q = y.op_lift != 0;
+                const rad_buf q = dense_q ? m.b_qs : m.b_qkv;
+                y.op_bidi = attn(k, q, m.b_atts, dense_q ? "attn_paged" : "attn_paged_qrow", 0);
+                if (!y.op_bidi) {
+                    fprintf(stderr, "radiance: gemma4: no sliding attention kernel for "
+                                    "bidirectional image spans\n");
+                    return RAD_E_UNSUPPORTED;
+                }
+                const char* ahead = dense_q ? "attn_paged_ahead" : "attn_paged_qrow_ahead";
+                if (T > k.window && rad_op_declared(b, ahead))
+                    y.op_ahead = attn(k, q, m.b_atts, ahead, 0);
             }
             y.op_store = kv_store(k, m.b_qkv, m.b_qkv);
             y.op_o     = gemm(T, E, k.q(), y.w_o, m.b_atts, m.b_o);
@@ -1367,9 +1384,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "output draws from a sharper distribution", m.softcap, m.softcap);
     }
 
-    /* The drafter last: declaration order is the buffer planner's liveness. */
+    /* The drafter follows the trunk: declaration order is the buffer planner's liveness. */
     if (m.n_taps > 0)
         RAD_ARCH_TRY(declare_dflash(b, meta, ctx, m, (int)m.n_layer));
+    if (vision) {
+        /* Reserve the draft groups even when speculation is disabled. */
+        const int64_t draft_layers = dflash_kind(meta) == 1
+            ? rad_meta_geti(meta, "draft.num_hidden_layers", 0) : 0;
+        RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, E, (int)(m.n_layer + draft_layers),
+                                  "model.", "gemma4"));
+        /* A declaration without a weight source is valid for graph tools and tests. When
+         * the trunk is backed by weights, check the tower's entry and exit before loading. */
+        RadEncoding enc{};
+        if (rad_weight_encoding(b, nm.f("token_embd.weight"), &enc, nullptr, nullptr) == RAD_OK) {
+            for (const char* name : { "v.patch.weight", "v.embed.weight" }) {
+                if (rad_weight_encoding(b, nm.f("%s", name), &enc, nullptr, nullptr) != RAD_E_NOTFOUND)
+                    continue;
+                fprintf(stderr, "radiance: gemma4: vision is enabled but the model is missing "
+                                "vision weight '%s'; use --mm-max-patches 0 for text-only serving\n",
+                        name);
+                return RAD_E_NOTFOUND;
+            }
+        }
+    }
 
     int nfull = 0;
     for (int f : full) nfull += f;
@@ -1539,7 +1576,8 @@ static void attend(RadCtx* c, const Model& m, const Layer& y, size_t li, const R
     const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
     const int32_t* table = kvb ? kvb->block_table  : nullptr;
     const int32_t* used  = kvb ? kvb->seqused      : nullptr;
-    const RadOperand bt  = praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0);
+    const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
+    const RadOperand bt  = praw2(table, RAD_I32, batch->n_seq, pitch);
     const RadOperand su  = praw(used, RAD_I32, batch->n_seq);
 
     if (!y.full) {
@@ -1551,6 +1589,24 @@ static void attend(RadCtx* c, const Model& m, const Layer& y, size_t li, const R
         RAD_ISSUE_N(c, y.op_attn, batch->max_q_len,
                     y.op_lift ? brows(m.b_qs, T) : bcol(m.b_qkv, 0, qd, T),
                     kv_cache(k.kv, (int)li), bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_atts, T));
+        /* Recompute only the image rows, with the cache ending at the span's last row.
+         * The window still limits lookback; for a long span it must not limit lookahead. */
+        for (int64_t i = 0; y.op_bidi && i < batch->n_bidi; ++i) {
+            const int64_t first = batch->bidi_row[i], n = batch->bidi_n[i], s = batch->bidi_seq[i];
+            const rad_op op = n > k.window ? y.op_ahead : y.op_bidi;
+            if (!op) {
+                rad_step_fail(c, "gemma4: an image span exceeds the sliding window and needs "
+                                 "a paged attention kernel with unrestricted lookahead");
+                return;
+            }
+            RAD_ISSUE_N(c, op, n,
+                        y.op_lift ? brow_slice(m.b_qs, first, n, qd)
+                                  : bcol_at(m.b_qkv, first, qd + 2 * kvd, 0, qd, n),
+                        kv_cache(k.kv, (int)li),
+                        praw2(table ? table + s * pitch : nullptr, RAD_I32, 1, pitch),
+                        praw(batch->bidi_used + i, RAD_I32, 1),
+                        RAD_NONE, RAD_NONE, RAD_NONE, brow_slice(m.b_atts, first, n, qd));
+        }
     } else {
         RAD_ISSUE_N(c, y.op_vnorm, T * k.nkv, brows(m.b_kf, T), RAD_NONE, brows(m.b_vf, T));
         RAD_ISSUE_N(c, y.op_qn, T * k.nh, brows(m.b_qf, T), RAD_W(y.w_qn), brows(m.b_qf, T));
@@ -1829,13 +1885,24 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
     if (batch->enc) {
-        rad_step_fail(c, "gemma4 declares no encoder; serve this container with --mm-max-patches 0");
+        if (batch->enc & ~(RAD_MM_IMAGE | RAD_MM_VIDEO))
+            rad_step_fail(c, "gemma4: unsupported encoder modality");
+        else if (!m.vis.on)
+            rad_step_fail(c, "gemma4: no vision tower was declared; image and video encoding "
+                             "require vision weights and --mm-max-patches greater than 0");
+        else
+            m.vis.step(c, batch);
         return;
     }
     const int64_t T = batch->n_tok, E = m.E;
     if (T <= 0) return;
 
     RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_x, T));
+    /* The batch supplies image rows on rank 0 and zeros on the other ranks. */
+    if (m.op_mm && batch->n_mm_rows > 0)
+        RAD_ISSUE_N(c, m.op_mm, batch->n_mm_rows,
+                    praw2(batch->mm_embd, RAD_BF16, batch->n_mm_rows, E),
+                    praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, T));
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, T * E, brows(m.b_x, T), RAD_NONE);
 
@@ -1863,6 +1930,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
     (void)dflash_probe(meta, out);
+    if (Gemma4Vision::present(meta)) {
+        const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
+        if (k > 0) out->enc_merge = k * k;
+    }
     return RAD_OK;
 }
 
@@ -1878,7 +1949,7 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_cha
 /* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(gemma4, "gemma4", "", "0.1.0",
-                "Gemma 4 text decoders (26B-A4B MoE, dense 31B), bf16: sliding and full attention "
+                "Gemma 4 decoders (26B-A4B MoE, dense 31B) with vision, bf16: sliding and full attention "
                 "with proportional rope and K = V, a dense and a routed feed-forward side by side, "
                 "and z-lab's DFlash block-diffusion drafter")
 RAD_ARCH_PROBE(gemma4)

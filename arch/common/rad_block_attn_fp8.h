@@ -156,8 +156,9 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
                      {w.qkv}, {});
 
     /* The out-projection's input quantiser; a plain `quant_act_fp8`, as there is no gate pass to
-     * fold it into. */
-    RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
+     * fold it into. Declared where the activation carries a code pair its producer writes: an int8
+     * trunk that leaves each linear to quantise its own input declares none (nemotronh). */
+    if (w.attn.cq()) RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x));
 

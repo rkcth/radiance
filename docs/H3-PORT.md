@@ -1,5 +1,7 @@
 # MiniMax H3 with a secondary video engine
 
+The hardware measurements below were taken with the earlier secondary-models release. Qualification on the native fleet is pending.
+
 MiniMax H3 generates short MP4 clips with synchronized sound. The FL2VA
 checkpoint supports text and first/last-frame workflows. The Ref2VA checkpoint
 uses subject references. Both Radiance packages include their text/vision

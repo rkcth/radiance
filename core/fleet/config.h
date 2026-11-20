@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,9 @@ struct ModelEntry {
     std::vector<std::string> aliases;
     int                      priority = 0;
     bool                     pin      = false;
+    /* The cards this model may be placed on, in the file's order; empty means any of the
+     * fleet's. Not part of `args`: it decides where the engine runs, not how it is configured. */
+    std::vector<int>         cards;
     int64_t                  ttl_ms   = 0;     /* idle time before parking; 0 = never */
     FlexSpec                 flex;
     ParkSpec                 park;
@@ -99,6 +103,9 @@ struct FleetConfig {
     /* memory: the per-card keys travel inside every model's flag list; these are the fleet's own. */
     int64_t     host_mib = 0;       /* 0 = not set */
     std::string disk_tier;
+    /* memory.card-headroom-mib: a card's own reserve, in MiB by card ordinal, in place of the
+     * gpu-headroom-mib every other card keeps (the card that drives a desktop). */
+    std::map<int, int64_t> card_headroom_mib;
 
     /* scheduler: */
     int64_t load_timeout_ms  = 120000;

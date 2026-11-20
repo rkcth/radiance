@@ -136,6 +136,27 @@ __device__ __forceinline__ void k6x8_to_f16x4w(uint32_t lo, uint32_t hb, int hal
     }
 }
 
+/* Eight int8 codes (two dwords, element order) as four f16 dwords, dims (2i, 2i+1) in dword i,
+ * each the code times the scale `s2` (the f16 in both halves): the int8 cache's K and V (a RAD_I8
+ * group) -- r4d_dt16.h's i8x8_to_f16x4w, unchanged (exact integer/scale arithmetic, no WMMA
+ * layout). ^ 0x80 makes a code offset binary u, 0x6400 | u is the f16 1024 + u, and
+ * (x - 1152) * s is the value times the scale, rounded once. A gfx1151 16-wide fragment calls it
+ * twice, for dims 0-7 and 8-15 of the run. */
+__device__ __forceinline__ void i8x8_to_f16x4w(uint2 raw, uint32_t s2, uint32_t* w4) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const uint32_t lo = raw.x ^ 0x80808080u, hi = raw.y ^ 0x80808080u;
+    const h2 s = __builtin_bit_cast(h2, s2);
+    const h2 bias = { (_Float16)1152.0f, (_Float16)1152.0f };
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        // Bytes 2b and 2b+1 of the eight, each into the low byte of a half; perm takes bytes 0-3
+        // from its second operand, 4-7 from its first, and 0x0c is a zero byte.
+        const uint32_t sel = (uint32_t)(2 * b) | 0x0c00u | ((uint32_t)(2 * b + 1) << 16) | 0x0c000000u;
+        const uint32_t x = __builtin_amdgcn_perm(hi, lo, sel) | 0x64006400u;
+        w4[b] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(h2, x) - bias) * s);
+    }
+}
+
 /* Build a 16-consecutive-key P fragment from the lane's eight softmax values.
  *
  * On gfx1151 a lane's accumulator element e is key 2*e + (lane>>4) of the tile, so a lane holds

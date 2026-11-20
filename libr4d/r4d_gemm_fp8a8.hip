@@ -865,7 +865,7 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
 template <uint32_t KW, uint32_t SB, uint32_t NT, class CH>
 __global__ __launch_bounds__(KW * kWave) R4D_WAVES(6)
 void gemm_i8_kpar_kernel(R4D_I8KPAR_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     gemm_i8_kpar_body<KW, SB, NT>(Ap, Sa, Bp, Sb, C, rows, cols, M, b_ld, sb_ld);
     if (CH::on) r4d_chain_done();
 }

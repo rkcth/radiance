@@ -50,6 +50,7 @@
 #include "halo.h"
 #include "halo_args.h"
 #include "halo_common.h"
+#include "halo_chain.h"
 #include "halo_emit.h"
 #include "halo_gemm_args.h"
 #include "halo_gdn_wmma.h"
@@ -226,7 +227,7 @@ struct RgGeom {
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
 template <uint32_t MAXOWN, uint32_t NW>
-__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
+__device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
@@ -318,6 +319,20 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
                                                 g.norm, lane, snk);
     lds_barrier();
     scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
+}
+
+/* router_gemm_topk_scatter_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <uint32_t MAXOWN, uint32_t NW, class CH = HaloUnchained>
+__global__ __launch_bounds__(NW * kWave)
+void router_gemm_topk_scatter_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot) {
+    if (CH::on) halo_chain_wait();
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
+    if (CH::on) halo_chain_done();
 }
 
 /* The arrival counter belongs to the op instance and is taken at init, not on the launch path.
@@ -559,9 +574,13 @@ extern "C" int halo_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s) 
     g.m16 = m16 ? 1u : 0u;           g.mt = mt;
     g.cpb = (uint32_t)cpb;
     const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
+    const bool chain = halo_geti_or(a, "chain", 0) != 0 && M <= 64;   /* decode heights */
 
+/* The chained form (halo_chain.h) where the row resolved with `chain`. */
 #define HALO_RG_L(OWN, NWV)                                                                     \
-    HALO_EMIT(s, (router_gemm_topk_scatter_kernel<OWN, NWV>), grid, dim3((NWV) * kWave),         \
+    (chain ? HALO_RG_C(OWN, NWV, r4dchain) : HALO_RG_C(OWN, NWV, HaloUnchained))
+#define HALO_RG_C(OWN, NWV, CH)                                                                 \
+    HALO_EMIT(s, (router_gemm_topk_scatter_kernel<OWN, NWV, CH>), grid, dim3((NWV) * kWave),     \
               (unsigned)lds, (const uint16_t*)x->data, (const uint16_t*)wr->data,               \
               wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr, (uint16_t*)lg->data,     \
               gate ? (uint16_t*)gate->data : (uint16_t*)nullptr, (int32_t*)ids->data,            \
@@ -577,6 +596,7 @@ extern "C" int halo_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s) 
         else               rc = HALO_RG_L(16, 32);
     }
 #undef HALO_RG_L
+#undef HALO_RG_C
     if (rc != RAD_OK) return rc;
     HALO_RG_CHK();
     return RAD_OK;

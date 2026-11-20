@@ -76,7 +76,6 @@ public:
     const std::vector<Readback>& readbacks() const override { return rb_; }
     int  done() override;
 
-    bool busy() const override;
     int64_t queued() const override;
     int64_t running() const override;
 

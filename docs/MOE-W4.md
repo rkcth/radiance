@@ -92,6 +92,7 @@ The encodings are **not interchangeable**:
 | `affine:codes=u4[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x16}/fwht128` | `w4nl64a8h` | the codebook with an E4M3 scale per row and group of **64**, under one fixed f32 (below); the same bytes |
 | `affine:codes=u4[1x1],scale=fp8_e4m3[1x32],scale.1=f32[*x*],table=f32{1x16}/fwht128` | `w4nl32a8h` | the same at a group of **32**, +0.125 bits per weight |
 | `affine:codes=u5[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x32}/fwht128` | `w5nl64a8h` | `w4nl64a8h` with **five-bit** codes into the 32-level `w5nl` codebook (below), +1 bit per weight |
+| `affine:codes=u6[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x64}/fwht128` | `w6nl64a8h` | `w4nl64a8h` with **six-bit** codes into the 64-level `w6nl` codebook ([MOE-W6.md](MOE-W6.md)), +2 bits per weight |
 
 The first two differ only in the transform. The plugin reads the first expert's encoding
 (`rad_weight_encoding`) and declares the matching kernels; a kernel that does not read an encoding
@@ -377,7 +378,9 @@ mistyped directory is a message, not a silent quality loss.
   codes and the table, and a container quantised against another sixteen-entry table refused at
   relayout; the same for `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`, with a second level other than
   2^-13 refused, a 32-entry table other than `w5nl` refused, and each refusing the others'
-  encodings. `r4d_selftest --case moe_gemm_w4a8` also checks `w5nl64a8h`'s arranged row bit for bit
+  encodings; and `w6nl64a8h`'s arranged row read back at every one of its 64 code values, with its
+  inverse, a 64-entry table other than `w6nl` refused and a second level other than 2^-13 refused.
+  `r4d_selftest --case moe_gemm_w4a8` also checks `w5nl64a8h`'s arranged row bit for bit
   against the statement in `r4d_layout.cpp`, and its inverse. `moe_gemm_q_mod4`'s four classes are
   held to `moe_gemm_q`'s stored bytes in every format, and for both ops what the op oracle reads
   through the inverse (codes as their levels, an E4M3 scale times its second level) is held to the

@@ -64,6 +64,7 @@
 #include "halo_emit.h"
 #include "halo_gdn_args.h"
 #include "halo_common.h"
+#include "halo_chain.h"
 #include "halo_gdn_wmma.h"
 #include "halo_fwht.h"
 #include "halo_hc_fp8.h"
@@ -275,8 +276,7 @@ void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __res
  *
  * h[c][i] += inj[c] * y[i], in place on the unnormed stream: the read's normalisation feeds the
  * block input and gates only, never the residual. */
-__global__ __launch_bounds__(kThreads)
-void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+__device__ __forceinline__ void hc_write_kernel_body(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
                      unsigned short* __restrict__ h,
                      long rows, long n, int hc, long yrow, long irow, long hrow) {
     const long r = blockIdx.y;
@@ -295,6 +295,17 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
             *p = f2bf(bf2f(*p) + s_g[c] * v);
         }
     }
+}
+
+/* hc_write_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(kThreads)
+void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                     unsigned short* __restrict__ h,
+                     long rows, long n, int hc, long yrow, long irow, long hrow) {
+    if (CH::on) halo_chain_wait();
+    hc_write_kernel_body(y, inj, h, rows, n, hc, yrow, irow, hrow);
+    if (CH::on) halo_chain_done();
 }
 
 /* ============================================================== hc_project
@@ -389,10 +400,16 @@ extern "C" int halo_rad_hc_write(const RadArgs* a, RadStream stream) {
     if (yrow < 0 || irow < 0 || yrows < rows || irows < rows) return HALO_NO(RAD_E_STRIDE);
 
     const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
-    return HALO_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
-                    (const unsigned short*)y->data,
-                    (const unsigned short*)inj->data, (unsigned short*)h->data,
-                    (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+    /* The chained form (halo_chain.h) where the row resolved with `chain`. */
+#define HALO_HCW(CH)                                                                              \
+    HALO_EMIT(stream, hc_write_kernel<CH>, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,       \
+              (const unsigned short*)y->data, (const unsigned short*)inj->data,                   \
+              (unsigned short*)h->data, (long)rows, (long)n, (int)hc, (long)yrow, (long)irow,      \
+              (long)hrow)
+    const int erc = halo_geti_or(a, "chain", 0) != 0 && rows <= 64 ? HALO_HCW(r4dchain)
+                                                                  : HALO_HCW(HaloUnchained);
+#undef HALO_HCW
+    return erc;
 }
 
 enum { HCP_H = 0, HCP_V, HCP_ON };

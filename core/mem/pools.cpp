@@ -162,7 +162,7 @@ std::string Pool::report() const {
 /* ------------------------------------------------------------------ Pools */
 
 int Pools::configure(const Config& cfg, int64_t vram_capacity,
-                     MemAllocator* device, MemAllocator* host, bool needs_kv) {
+                     MemAllocator* device, MemAllocator* host) {
     configured_ = false;
     fit_report_.clear();
 
@@ -180,7 +180,7 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
      * refuses there, with the budget. */
     std::string missing;
     if (cfg.vram_weights_mib <= 0) missing += "  vram_weights resolved to 0 MiB\n";
-    if (cfg.vram_kv_mib < 0 || (needs_kv && cfg.vram_kv_mib == 0)) missing += "  vram_kv resolved to 0 MiB\n";
+    if (cfg.vram_kv_mib      <= 0) missing += "  vram_kv resolved to 0 MiB\n";
     if (!missing.empty()) {
         fit_report_ = "VRAM pool budgets are empty: the budget resolver (core/mem/vram_budget.cpp) "
                       "did not run before the pools were configured:\n" + missing;

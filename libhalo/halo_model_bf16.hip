@@ -37,6 +37,10 @@
 #include <cstdlib>
 #include <cstring>
 
+/* The f32 reference encoder shares rope's schema but keeps its activations in f32 (halo_audio.hip,
+ * libr4d's encoder_rope). */
+extern "C" int halo_rad_encoder_rope(const RadArgs*, RadStream);
+
 namespace {
 
 constexpr uint32_t kWave    = 32;
@@ -346,7 +350,7 @@ __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
 // `b_step` 0 reads one element per row; with b_ld 0 too, a scalar for the whole op. `div` (add
 // only) divides the sum after its rounding and rounds again, the last step of a mean summed
 // pairwise; 1 is the plain sum.
-__global__ __launch_bounds__(kThreads) void binary_kernel(
+__device__ __forceinline__ void binary_kernel_body(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
     uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step,
     float div) {
@@ -360,6 +364,18 @@ __global__ __launch_bounds__(kThreads) void binary_kernel(
         if (div != 1.0f) r = bf16_to_f32(f32_to_bf16(r)) / div;
         yr[i] = f32_to_bf16(r);
     }
+}
+
+/* binary_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(kThreads)
+void binary_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
+    uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step,
+    float div) {
+    if (CH::on) halo_chain_wait();
+    binary_kernel_body(a, b, y, n, a_ld, b_ld, y_ld, mul, b_step, div);
+    if (CH::on) halo_chain_done();
 }
 
 // The f32 form (a video decoder's residual stream, a vocoder's branch mean), with the same
@@ -412,7 +428,7 @@ __global__ __launch_bounds__(kThreads) void mul_weight_f32_kernel(
 //
 // Row-wise with a pitch because the operand is a column slice: the gate is the second half of each
 // head of an interleaved [tokens, heads, 2*head_dim] projection, `n` wide inside a stride of 2n.
-__global__ __launch_bounds__(kThreads) void sigmoid_kernel(
+__device__ __forceinline__ void sigmoid_kernel_body(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint32_t n, uint32_t x_ld, uint32_t y_ld) {
     const uint32_t m = blockIdx.x;
@@ -420,6 +436,17 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
         yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf16_to_f32(xr[i]))));
+}
+
+/* sigmoid_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(kThreads)
+void sigmoid_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint32_t n, uint32_t x_ld, uint32_t y_ld) {
+    if (CH::on) halo_chain_wait();
+    sigmoid_kernel_body(x, y, n, x_ld, y_ld);
+    if (CH::on) halo_chain_done();
 }
 
 // ---------------------------------------------------------------------------- logit_softcap
@@ -843,6 +870,108 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
     }
 }
 
+// The int8 store (abi/rad_builder.h): a head's K and its V each as int8 codes against one f16
+// scale, the head's absmax / 127, written after the codes. One workgroup a (token, head) and one
+// dim a lane, so the absmax is a block reduction through LDS. The scale is rounded to f16 first
+// and the codes are taken against the rounded value, which is what a reader multiplies by; it is
+// clamped so 127 times it stays an f16. An all-zero head stores scale 0 and codes 0.
+//
+// kv_i8_quant is a lane's part of that: its K and V codes and the head's two scales. It holds the
+// block's barrier, so every lane of the block calls it, a padding row's included.
+struct KvI8 { uint8_t k, v; uint16_t ks, vs; };
+__device__ __forceinline__ KvI8 kv_i8_quant(const uint16_t* __restrict__ k,
+                                            const uint16_t* __restrict__ v, uint32_t head_dim,
+                                            uint32_t k_ld, uint32_t v_ld, float (*s_m)[32]) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const bool in = d < head_dim;
+    const float kf = in ? bf16_to_f32(k[(size_t)t * k_ld + (size_t)h * head_dim + d]) : 0.0f;
+    const float vf = in ? bf16_to_f32(v[(size_t)t * v_ld + (size_t)h * head_dim + d]) : 0.0f;
+    float km = halo_wave_max(fabsf(kf)), vm = halo_wave_max(fabsf(vf));
+    if ((d & 31u) == 0u) { s_m[0][d >> 5] = km; s_m[1][d >> 5] = vm; }
+    __syncthreads();
+    km = 0.0f; vm = 0.0f;
+    for (uint32_t w = 0; w < blockDim.x / 32u; ++w) {
+        km = fmaxf(km, s_m[0][w]);
+        vm = fmaxf(vm, s_m[1][w]);
+    }
+    const __fp16 k16 = (__fp16)fminf(km / 127.0f, 515.0f);
+    const __fp16 v16 = (__fp16)fminf(vm / 127.0f, 515.0f);
+    const float ksc = (float)k16, vsc = (float)v16;
+    const float kr = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
+    const float vr = vsc > 0.0f ? rintf(vf / vsc) : 0.0f;
+    KvI8 q;
+    q.k  = (uint8_t)(int8_t)(int)fminf(fmaxf(kr, -127.0f), 127.0f);
+    q.v  = (uint8_t)(int8_t)(int)fminf(fmaxf(vr, -127.0f), 127.0f);
+    q.ks = __builtin_bit_cast(uint16_t, k16);
+    q.vs = __builtin_bit_cast(uint16_t, v16);
+    return q;
+}
+// A lane's bytes into a token's row of a head.
+__device__ __forceinline__ void kv_i8_put(uint8_t* __restrict__ c, uint32_t head_dim, KvI8 q) {
+    const uint32_t d = threadIdx.x;
+    c[d]            = q.k;
+    c[head_dim + d] = q.v;
+    if (d == 0u) {
+        *(uint16_t*)(c + 2 * head_dim)     = q.ks;
+        *(uint16_t*)(c + 2 * head_dim + 2) = q.vs;
+    }
+}
+
+// The body takes the block's reduction table from the kernel that calls it; it is a function
+// because a padding row's block returns early and the chained form (halo_r4dchain_kv_store_i8,
+// halo_chain.h, taken at decode heights) must still add to its queue's counter.
+#define HALO_KVI_PARAMS                                                                           \
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,                              \
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv, uint32_t head_dim,               \
+    uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld
+#define HALO_KVI_ARGS k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld
+__device__ __forceinline__ void kv_store_i8_body(HALO_KVI_PARAMS, float (*s_m)[32]) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const KvI8 q = kv_i8_quant(k, v, head_dim, k_ld, v_ld, s_m);
+    const int32_t s = slot[t];
+    if (d >= head_dim || s < 0 || (uint32_t)s / block_size >= n_blocks) return;
+    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
+    const size_t row = 2 * (size_t)head_dim + 4;
+    kv_i8_put(kv + (((size_t)blk * kv_heads + h) * block_size + off) * row, head_dim, q);
+}
+__global__ __launch_bounds__(1024) void kv_store_i8_kernel(HALO_KVI_PARAMS) {
+    __shared__ float s_m[2][32];
+    kv_store_i8_body(HALO_KVI_ARGS, s_m);
+}
+__global__ __launch_bounds__(1024) void halo_r4dchain_kv_store_i8(HALO_KVI_PARAMS) {
+    __shared__ float s_m[2][32];
+    halo_chain_wait();
+    kv_store_i8_body(HALO_KVI_ARGS, s_m);
+    halo_chain_done();
+}
+#undef HALO_KVI_ARGS
+#undef HALO_KVI_PARAMS
+
+// The int8 store of a streamed group: kv_store_i8's bytes to the token's row of its block in the
+// host mirror always, and to the ring at `res[block]` when that block is resident. A slot past the
+// id space stores nothing and a map entry outside [-1, slots) reads as absent, as in
+// kv_store_streamed_kernel.
+__global__ __launch_bounds__(1024) void kv_store_streamed_i8_kernel(
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
+    const int32_t* __restrict__ res, uint8_t* __restrict__ host,
+    uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t blocks, uint32_t slots,
+    uint32_t k_ld, uint32_t v_ld) {
+    __shared__ float s_m[2][32];
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const KvI8 q = kv_i8_quant(k, v, head_dim, k_ld, v_ld, s_m);
+    const int32_t s = slot[t];
+    if (d >= head_dim || s < 0) return;
+    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
+    if (blk >= blocks) return;
+    const size_t row = 2 * (size_t)head_dim + 4;
+    const size_t brow = (size_t)kv_heads * block_size * row;      // one block of every head
+    const size_t o = ((size_t)h * block_size + off) * row;
+    kv_i8_put(host + (size_t)blk * brow + o, head_dim, q);
+    const int32_t sl = res[blk];
+    if (sl >= 0 && (uint32_t)sl < slots) kv_i8_put(kv + (size_t)sl * brow + o, head_dim, q);
+}
+
 }  // namespace
 
 // ================================================================================ entry points
@@ -1027,7 +1156,7 @@ extern "C" int halo_binary_bf16(long a, long b, long y, int M, int n, int op,
     if (!y_ld) y_ld = n;
     const uint32_t b_step = b_ld < 0 ? 0u : 1u;
     if (b_ld < 0) b_ld = 0;
-    hipLaunchKernelGGL(binary_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+    hipLaunchKernelGGL((halo_chain_flag() ? binary_kernel<r4dchain> : binary_kernel<HaloUnchained>), dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
                        (const uint16_t*)a, (const uint16_t*)b, (uint16_t*)y, (uint32_t)n,
                        (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, op, b_step, 1.0f);
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -1038,7 +1167,7 @@ extern "C" int halo_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_l
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(sigmoid_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+    hipLaunchKernelGGL((halo_chain_flag() ? sigmoid_kernel<r4dchain> : sigmoid_kernel<HaloUnchained>), dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
                        (const uint16_t*)x, (uint16_t*)y, (uint32_t)n,
                        (uint32_t)x_ld, (uint32_t)y_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -1835,6 +1964,7 @@ enum { BI_A = 0, BI_B, BI_Y };
 
 /* Both rows of each op share this: every operand bf16, or (add_f32) every operand f32. */
 static int binary(const RadArgs* a, int mul, RadStream s) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     const RadTensor* A = halo_opt(a, BI_A);
     const RadTensor* B = halo_opt(a, BI_B);
     const RadTensor* Y = halo_opt(a, BI_Y);
@@ -1878,7 +2008,7 @@ static int binary(const RadArgs* a, int mul, RadStream s) {
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
     if (div != 1.0) {
-        hipLaunchKernelGGL(binary_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)s,
+        hipLaunchKernelGGL((halo_chain_flag() ? binary_kernel<r4dchain> : binary_kernel<HaloUnchained>), dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)s,
                            (const uint16_t*)A->data, (const uint16_t*)B->data, (uint16_t*)Y->data,
                            (uint32_t)n, (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, mul, 1u,
                            (float)div);
@@ -1948,6 +2078,7 @@ extern "C" int halo_rad_mul_weight(const RadArgs* a, RadStream s) {
 /* ------------------------------------------------------------------ sigmoid */
 
 extern "C" int halo_rad_sigmoid(const RadArgs* a, RadStream s) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     const RadTensor* x = halo_opt(a, 0);
     const RadTensor* y = halo_opt(a, 1);
     if (!x || !y) return HALO_NO(RAD_E_INVAL);
@@ -2101,6 +2232,7 @@ extern "C" int halo_rad_rope(const RadArgs* a, RadStream s) {
     const RadTensor* qkv = halo_opt(a, RP_QKV);
     const RadTensor* pos = halo_opt(a, RP_POS);
     if (!qkv || !pos) return HALO_NO(RAD_E_INVAL);
+    if (qkv->dtype == RAD_F32) return halo_rad_encoder_rope(a, s);
     HALO_NEED(dt_bf16(qkv));
     HALO_NEED(dt_i32(pos));
     if (!halo_contig(pos)) return HALO_NO(RAD_E_STRIDE);
@@ -2199,7 +2331,10 @@ struct KvStoreGeom {
     long long head_dim, block_size, kv_heads, n_blocks, k_ld, v_ld, T;
 };
 
-static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd16 = 32) {
+/* A token's row in a (block, head) page is head_dim * row_per_hd16 / 16 + row_extra elements
+ * (row_extra 4: the int8 cache's two f16 scales). */
+static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd16 = 32,
+                         long long row_extra = 0) {
     g->k  = halo_opt(a, KS_K);
     g->v  = halo_opt(a, KS_V);
     g->sm = halo_opt(a, KS_SLOT);
@@ -2218,7 +2353,7 @@ static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd1
      * disagrees. */
     if (g->kv->rank != 4) return HALO_NO(RAD_E_SHAPE);
     if (g->kv->shape[1] != g->kv_heads || g->kv->shape[2] != g->block_size ||
-        g->kv->shape[3] != g->head_dim * row_per_hd16 / 16) return HALO_NO(RAD_E_SHAPE);
+        g->kv->shape[3] != g->head_dim * row_per_hd16 / 16 + row_extra) return HALO_NO(RAD_E_SHAPE);
     g->n_blocks = g->kv->shape[0];
 
     const long long lane = g->kv_heads * g->head_dim;
@@ -2295,11 +2430,36 @@ static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
 extern "C" int halo_rad_kv_store_fp8v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 0); }
 extern "C" int halo_rad_kv_store_k6v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 1); }
 
+/* The int8 store: the cache's last extent is a token's row, 2 * head_dim + 4 bytes. A workgroup is
+ * a head's dims rounded up to whole waves. */
+extern "C" int halo_rad_kv_store_i8(const RadArgs* a, RadStream stream) {
+    KvStoreGeom g{};
+    const int rc = kv_store_geom(a, &g, 32, 4);
+    if (rc != RAD_OK) return rc;
+    if (g.kv->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
+    if (g.head_dim % 4 || g.head_dim > 1024) return HALO_NO(RAD_E_SHAPE);
+    const long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
+    const long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
+    const uint32_t thr = (uint32_t)((g.head_dim + 31) / 32 * 32);
+    const bool chain = halo_geti_or(a, "chain", 0) != 0 && g.T <= 64;
+    return HALO_EMIT(stream, (chain ? halo_r4dchain_kv_store_i8 : kv_store_i8_kernel),
+                    dim3((uint32_t)g.T, (uint32_t)g.kv_heads), dim3(thr),
+                    0, (const uint16_t*)halo_addr(g.k), (const uint16_t*)halo_addr(g.v),
+                    (const int32_t*)halo_addr(g.sm), (uint8_t*)halo_addr(g.kv),
+                    (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
+                    (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld) == RAD_OK ? RAD_OK
+                                                                                    : RAD_E_DEVICE;
+}
+
+
 /* The store of a streamed group: kv_store's geometry and conversion (E4M3, or bf16 with no
  * descales), plus the residency map `res` (read, never written: residency is the resolve's) and the
  * host mirror `host`. Both are one block a row of the same byte pitch. State faults are guarded,
  * not refused (see kv_store_streamed_kernel). */
+static int kv_store_streamed_i8(const RadArgs* a, RadStream stream);
 extern "C" int halo_rad_kv_store_streamed(const RadArgs* a, RadStream stream) {
+    const RadTensor* kvt = halo_opt(a, 3);
+    if (kvt && kvt->dtype == RAD_I8) return kv_store_streamed_i8(a, stream);
     KvStoreGeom g{};
     const int rc = kv_store_geom(a, &g);
     if (rc != RAD_OK) return rc;
@@ -2348,6 +2508,36 @@ extern "C" int halo_rad_kv_store_streamed(const RadArgs* a, RadStream stream) {
                     (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
                     (uint32_t)blocks, (uint32_t)slots, (uint32_t)k_ld, (uint32_t)v_ld,
                     k_inv, v_inv) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* The same into the int8 cache: kv_store_i8's workgroup, a head's dims one a lane, and a row of
+ * 2 * head_dim + 4 bytes in both planes. */
+static int kv_store_streamed_i8(const RadArgs* a, RadStream stream) {
+    KvStoreGeom g{};
+    const int rc = kv_store_geom(a, &g, 32, 4);
+    if (rc != RAD_OK) return rc;
+    if (g.head_dim % 4 || g.head_dim > 1024) return HALO_NO(RAD_E_SHAPE);
+    const RadTensor* res  = halo_opt(a, 4);
+    const RadTensor* host = halo_opt(a, 5);
+    if (!res || !host) return HALO_NO(RAD_E_INVAL);
+    if (res->dtype != RAD_I32 || !halo_contig(res)) return HALO_NO(RAD_E_STRIDE);
+    if (host->dtype != RAD_U8 || !halo_contig(host) || host->rank != 2)
+        return HALO_NO(RAD_E_STRIDE);
+    const long long row    = g.kv_heads * g.block_size * (2 * g.head_dim + 4);
+    const long long blocks = host->shape[0], slots = g.kv->shape[0];
+    if (blocks <= 0 || slots <= 0 || row <= 0) return HALO_NO(RAD_E_SHAPE);
+    if (host->shape[1] != row || host->stride[0] != row) return HALO_NO(RAD_E_STRIDE);
+    if (halo_numel(res) < blocks) return HALO_NO(RAD_E_SHAPE);
+    const long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
+    const long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
+    return HALO_EMIT(stream, kv_store_streamed_i8_kernel, dim3((uint32_t)g.T, (uint32_t)g.kv_heads),
+                    dim3((uint32_t)((g.head_dim + 31) / 32 * 32)), 0,
+                    (const uint16_t*)halo_addr(g.k), (const uint16_t*)halo_addr(g.v),
+                    (const int32_t*)halo_addr(g.sm), (uint8_t*)halo_addr(g.kv),
+                    (const int32_t*)halo_addr(res), (uint8_t*)halo_addr(host),
+                    (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
+                    (uint32_t)blocks, (uint32_t)slots, (uint32_t)k_ld,
+                    (uint32_t)v_ld) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ logits_gemm
@@ -2414,3 +2604,11 @@ extern "C" int halo_rad_logits_gemm_cols(const RadArgs* a, RadStream s) {
                                      (int)n_vocab, (int)x_ld, (int)y_ld,
                                      (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
+
+/* `rmsnorm_rows` and `rope_rows`: libr4d's op names for the norm and the rotation whose launches
+ * may take a short-row form (a wave a row at n <= 256 and 1024 rows or more; one angle a (token,
+ * pair) turning every head at prefill row counts), each defined as the same bytes as the plain op.
+ * libhalo runs the plain launch for both: those forms are libr4d's measurements on gfx1201, not
+ * re-made here, and the schema promises only the plain op's bytes. */
+extern "C" int halo_rad_rmsnorm_rows(const RadArgs* a, RadStream s) { return halo_rad_rmsnorm(a, s); }
+extern "C" int halo_rad_rope_rows(const RadArgs* a, RadStream s) { return halo_rad_rope(a, s); }

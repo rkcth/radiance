@@ -62,6 +62,10 @@ struct StepEntry {
      * acceptance but not the adaptive window's estimate of the draft head (DraftController,
      * draft.h). */
     bool    ngram = false;
+    /* The drafts are a SuffixDecoding proposal (--draft-suffix, suffix.h): a chain of the
+     * sequence's own history, verified with no coupled row (Request::draft_suffix). Implies
+     * `ngram`. */
+    bool    suffix = false;
     /* Device row: the card overwrites its tokens, positions, rollback count and slots from the
      * StepSlot before the pass runs (advance.h); `ctx_len` is then only an upper bound for the
      * host-side ceilings. dev_tok/dev_out/dev_aux are advance.h's row descriptor: the verify
@@ -139,6 +143,9 @@ public:
      * it -- the build stage refuses an over-cap sequence, and a refused build restages forever,
      * so a request admitted past the cap stalls every queue behind it. */
     int64_t plugin_words_cap() const { return pw_cap_; }
+    /* Whether a checkpoint inside a lone prefill's chunk is handed to the plugin as
+     * RadBatch::ckpt_cut (Scheduler::set_ckpt_inside). Off: ckpt_cut is always 0. */
+    void set_ckpt_cut(bool on) { ckpt_cut_on_ = on; }
 
     /* The last build's slab and offsets on one rank, for the advance. The caller supplies mode,
      * round, slot state and inputs (advance.h). */
@@ -207,6 +214,7 @@ private:
         int32_t *h_tok = nullptr, *h_pos = nullptr, *h_cu = nullptr, *h_sid = nullptr;
         int32_t *h_q = nullptr, *h_ctx = nullptr, *h_acc = nullptr, *h_parent = nullptr;
         int32_t *h_cktok = nullptr, *h_ckslot = nullptr;
+        int32_t *h_ckcu = nullptr, *d_ckcu = nullptr;   /* [3] RadBatch::ckpt_cu */
         int32_t *h_out = nullptr;      /* [n_out] which of this step's tokens want logits */
         int32_t *h_dout = nullptr;     /* [n_draft_out] a history pass's round-1 rows */
         int32_t *d_tok = nullptr, *d_pos = nullptr, *d_cu = nullptr, *d_sid = nullptr;
@@ -259,6 +267,8 @@ private:
         int     ev = -1;               /* row of ev_ holding one event per rank */
     };
     static constexpr int kFlights = 64;
+    /* Worst-case builds the staging ring holds (see alloc_set). Must stay below kFlights. */
+    static constexpr int kRingBuilds = 16;
     struct Ring {
         char*   host = nullptr;
         int64_t bytes = 0;
@@ -357,8 +367,13 @@ private:
      * (`mm_ev_`). */
     bool                   mm_on_ = false;
     bool                   bidi_on_ = false;   /* RadEncoderDecl::bidirectional */
+    bool                   ckpt_cut_on_ = false;   /* set_ckpt_cut */
     /* The engine serves runtime LoRA adapters (Config::lora): the batch carries each row's slot. */
     bool                   lora_on_ = false;
+    /* The trunk's window group (RAD_KV_WINDOW, not a drafter's), -1 for none: a run read both ways
+     * is attended on sliding layers, over this group's block table, so RadBatch::bidi_used counts
+     * from that table's first position (build()). */
+    int32_t                bidi_grp_ = -1;
     /* Program::plugin_words: the words a sequence may carry, 0 for none. */
     int64_t                pw_cap_ = 0;
     int64_t                n_embd_ = 0;

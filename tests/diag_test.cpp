@@ -252,17 +252,6 @@ TEST(the_whole_pcie_path_is_read_root_port_first) {
     CHECK(diag::link_gts(b->chain[0].cur_speed) == 16.0);
 }
 
-TEST(the_device_inventory_reports_assignments_for_this_engine) {
-    diag::Facts f;
-    f.cards.resize(2);
-    f.cards[0].device = 0;
-    f.cards[0].rank = 0;
-    f.cards[1].device = 1;
-    const std::string text = diag::render({}, {}, f, diag::RunFacts{}, {});
-    CHECK(text.find("rank 0 (device 0)") != std::string::npos);
-    CHECK(text.find("device 1, outside this engine") != std::string::npos);
-}
-
 TEST(an_empty_root_is_all_unknown_and_does_not_fail) {
     Root r;
     const diag::Facts f = diag::collect(r.dir);

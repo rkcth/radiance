@@ -19,7 +19,7 @@ extern "C" {
  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
  * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 41u
+#define RAD_ABI_VERSION 44u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -544,7 +544,17 @@ typedef int  (*RadKernelConcurrentFn)(int i);
  * do, adds exactly once. The record is RAD_CHAIN_REC_BYTES at byte RAD_CHAIN_KARG_OFF of the
  * kernel's argument segment: { magic, target, ctr, check }, with check = magic ^ target ^ ctr ^
  * RAD_CHAIN_CHECK. A record whose magic or check does not match means: run without waiting and do
- * not add. Without the symbol, or with 0, the engine never asks. Symbol name: `rad_kernel_chain`. */
+ * not add. Without the symbol, or with 0, the engine never asks.
+ *
+ * 2 instead of 1 adds a second promise: the chained form's own acquire covers everything it reads
+ * behind the wait, scalar loads included. A compiler's agent-scope fence invalidates the vector
+ * caches only; a load every lane shares may be a scalar one, served from the scalar data cache,
+ * which still holds what was there before the launch in front wrote. A form that invalidates that
+ * cache behind its acquire (`s_dcache_inv`), or reads no operand through it, may say 2. Where
+ * every chainable row an engine loads says 2, the engine issues a chained launch that has lost
+ * its barrier bit without the packet processor's acquire as well: on an R9700 that acquire holds
+ * the processor ~0.9 us a launch, and it comes too early to serve a kernel that then waits for
+ * the launch in front. With 1 the packets keep it. Symbol name: `rad_kernel_chain`. */
 typedef int  (*RadKernelChainFn)(int i);
 #define RAD_CHAIN_KARG_OFF  992
 #define RAD_CHAIN_REC_BYTES 32

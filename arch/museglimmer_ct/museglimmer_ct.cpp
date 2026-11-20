@@ -11,14 +11,12 @@
  * adapter stay bf16 whatever the trunk does: the recipes never touch them, and a container that
  * quantised tower weights is refused naming the weight.
  *
- * An IQ8R trunk (data/recipes/museglimmer-30b-iq8r.recipe: int8 codes rotated 128 wide by the
- * unnormalised Hadamard, a u8 scale per [1 x 256] under a bf16 scale a row) is a whole-trunk form,
- * read from layer 0's q projection before any activation is declared. Its linears are rad_fp8.h's
- * LinearFP8 at gemm_nt_q i8a8h, group 256, against int8 activations quantised under the same
- * rotation: the two pre-norms write them (rmsnorm_had_quant_i8g), the gated product writes the
- * down projection's (gated_had_quant_i8g), and the out projection quantises the gated attention
- * output itself (had_quant_act_i8g). q, gate, k and v read one pair. Every trunk linear of such a
- * container must be IQ8R; anything else in it is refused naming the weight.
+ * Rotated i8a8h trunks are whole-trunk forms, detected from layer 0's q projection before any
+ * activation is declared. IQ8R uses a 256-column scale group; computed-trellis IQR (including
+ * IQ4R-V4) uses 128. Both reuse LinearFP8's encoding-aware IQR views and GEMMs. The two centered
+ * pre-norms produce rotated int8 pairs, the gated product produces the down-projection pair, and
+ * o_proj quantises its gated attention input. q, gate, k and v share one pair. Every trunk linear
+ * must use the same rotated family; mixed encodings fail at declaration with the offending name.
  *
  * The lm_head is declared at whatever the model holds (weight_codes_dtype): bf16, or a recipe-made
  * int8 head (`codes=i8 group=128 scale=bf16`), which `logits_gemm` then reads with the int8 head
@@ -30,6 +28,7 @@
 #include <arch/rad_block_muse_dflash.h>
 #include <arch/rad_calib_full.h>
 #include <arch/rad_museglimmer_chat.h>
+#include "../museglimmer/dflash2.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -305,11 +304,10 @@ inline int MlLinear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
 
     char en[256];
     rad_enc_format(&enc, en, sizeof en);
-    /* IQ8R is served only as a whole trunk, decided by layer 0's q projection (declare()). */
-    if (known && linear_is_iq8r(enc)) {
-        fprintf(stderr, "radiance: '%s' is IQ8R (%s) and layer 0's attn_q is not; an IQ8R "
-                        "container stores every trunk linear in it "
-                        "(data/recipes/museglimmer-30b-iq8r.recipe)\n", wn, en);
+    /* Rotated i8a8h encodings are served only as a whole trunk, decided by layer 0's q. */
+    if (known && linear_is_w8h(enc)) {
+        fprintf(stderr, "radiance: '%s' is a rotated i8a8h weight (%s), but layer 0's attn_q "
+                        "does not select a matching whole-trunk path\n", wn, en);
         return RAD_E_DTYPE;
     }
     fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, symmetric "
@@ -379,11 +377,10 @@ struct Layer {
     rad_weight w_fnorm = 0, w_fpost = 0;
     MlLinear lq, lgate, lk, lv, lo, lgu, ldown;
 
-    /* The same seven linears in an IQ8R trunk (Model::iq8r), at gemm_nt_q i8a8h. The pre-norms
-     * write their int8 pair as rmsnorm_had_quant_i8g where a loaded library declares it (nq_attn,
-     * nq_ffn; op_norm / op_fnorm stay 0 then), and the gated product writes the down projection's
-     * as gated_had_quant_i8g (gq_ffn; op_act stays 0). Where they are not declared, the plain norm
-     * and silu_mul run and the first linear reading each input quantises it (had_quant_act_i8g). */
+    /* The seven rotated linears in an IQ8R or IQR trunk, at gemm_nt_q i8a8h. The pre-norms
+     * write their int8 pair as rmsnorm_had_quant_i8g when available; the gated product writes the
+     * down-projection pair as gated_had_quant_i8g. Otherwise the first consumer quantises with
+     * had_quant_act_i8g. `rot_group` is 256 for IQ8R, 128 for computed-trellis IQR. */
     LinearFP8    rq, rgate, rk, rv, ro, rgu, rdown;
     NormQuantFP8 nq_attn, nq_ffn;
     GateQuantFP8 gq_ffn;
@@ -414,12 +411,10 @@ struct Model {
     rad_buf b_q = 0, b_gate = 0, b_k = 0, b_v = 0, b_attn = 0;
     rad_buf b_gu = 0, b_ffn = 0;
 
-    /* An IQ8R trunk: every trunk linear is IQ8R (layer 0's q projection decides), and the three
-     * linear inputs carry an int8 code pair at one f32 scale per (row, 256) under the 128-wide
-     * rotation beside their bf16 plane: `a_h` over `b_h` (both pre-norms' output; q, gate, k, v and
-     * gate/up read it), `a_attn` over `b_attn` (the gated attention output; o_proj), `a_ffn` over
-     * `b_ffn` (the gated product; down_proj). */
-    bool   iq8r = false;
+    /* A whole-trunk rotated-int8 mode selected from layer 0's q projection. `iq8r` keeps the
+     * legacy wide-group case explicit; IQR-V4 is computed trellis/MAD at group 128. */
+    bool   rotated_i8 = false, iq8r = false, iqr_v4 = false;
+    int64_t rot_group = RAD_FP8_BLOCK;
     ActFP8 a_h{}, a_attn{}, a_ffn{};
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
@@ -434,11 +429,12 @@ struct Model {
     rad_op    op_media_rows = 0;
     MuseTower vit{};
 
-    /* ---- the DFlash drafter (arch/common/rad_block_muse_dflash.h): same wiring as the bf16
-     * plugin declares, so a compressed-tensors container carries the drafter the same way. */
-    bool        have_df = false;
+    /* ---- Meta's DFlash or incoai's DFlash2, selected by draft.architectures. */
+    bool        have_df = false, have_df2 = false;
     MuseDflash  df{};
     MuseDflash::Wire dfw{};
+    Dflash2     df2{};
+    Dflash2::Wire df2w{};
     MuseTaps    taps{};
     rad_kvgroup kv_draft = 0;
 
@@ -593,21 +589,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     /* ---- the trunk's form, read from layer 0's q projection before any activation is declared:
-     * only an IQ8R trunk's activations carry an int8 code pair. The probe makes the weight's name
-     * map through that layer's own LinearFP8, so neither linear of layer 0 maps it again. */
+     * IQ8R and computed-trellis IQR activations carry an int8 code pair. The probe maps layer 0's
+     * q weight, so neither linear maps it again. */
     const char* const pre = "model.language_model.layers";
     m.layers.resize((size_t)g.n_layer);
     RAD_ARCH_TRY(m.layers[0].rq.probe(b, nm, g, nm.f("blk.0.attn_q"),
                                       { nm.ckpt("%s.0.self_attn.q_proj.weight", pre) }));
     {
         RadEncoding e0{};
-        m.iq8r = weight_enc(b, nm.f("blk.0.attn_q.weight"), &e0) && linear_is_iq8r(e0);
+        const bool known = weight_enc(b, nm.f("blk.0.attn_q.weight"), &e0);
+        const W8hForm form = known ? linear_w8h_form(e0) : W8hForm::None;
+        m.iq8r = known && linear_is_iq8r(e0);
+        m.iqr_v4 = known && !m.iq8r && form == W8hForm::Trellis && linear_w8h_mad(e0);
+        m.rotated_i8 = m.iq8r || m.iqr_v4;
+        if (m.rotated_i8) m.rot_group = linear_w8h_group(e0);
     }
-    if (m.iq8r && (g.n_embd % RAD_I8_GROUP_WIDE || q_dim % RAD_I8_GROUP_WIDE ||
-                   g.n_ff % RAD_I8_GROUP_WIDE)) {
-        fprintf(stderr, "radiance: museglimmer: the IQ8R trunk keeps one scale a %d of K, which "
+    if (m.rotated_i8 && (g.n_embd % m.rot_group || q_dim % m.rot_group ||
+                         g.n_ff % m.rot_group)) {
+        fprintf(stderr, "radiance: museglimmer: the rotated trunk's %lld-column activation group "
                         "does not divide this rank's widths (hidden %lld, attention %lld, "
-                        "feed-forward %lld)\n", RAD_I8_GROUP_WIDE, (long long)g.n_embd,
+                        "feed-forward %lld)\n", (long long)m.rot_group, (long long)g.n_embd,
                 (long long)q_dim, (long long)g.n_ff);
         return RAD_E_UNSUPPORTED;
     }
@@ -623,24 +624,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_attn = decl_b(b, nm.f("attn_out"), g.act_dtype, {g.max_tok, q_dim});
     m.b_gu   = decl_b(b, nm.f("gate_up"),  g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.b_ffn  = decl_b(b, nm.f("ffn"),      g.act_dtype, {g.max_tok, g.n_ff});
-    /* An IQ8R trunk's int8 pairs, one scale per (row, 256). `a_h` is fed by the pre-norms where
-     * rmsnorm_had_quant_i8g is declared; neither norm absorbs a collective (the all-reduce sits
-     * before the post norm, and the embedding's before the weightless embedding norm), so the
-     * all-reduce form is not needed at two ranks. `a_ffn` is fed by gated_had_quant_i8g where it
-     * is declared. `a_attn` is never fed: the attention output is a sigmoid gate and a multiply
-     * over separate buffers, and o_proj's own had_quant_act_i8g quantises the product (the gated
-     * quantiser's per-head rows are head_dim wide, narrower than the 256-column group). No E4M3
-     * pair: nothing here reads one. */
-    if (m.iq8r) {
+    /* Rotated int8 pairs, one scale per row and `rot_group` columns. The two centered pre-norms
+     * can fuse normalization and quantisation; the gated product can fuse its quantiser. The
+     * attention gate/multiply stays BF16, so o_proj quantises that product separately. */
+    if (m.rotated_i8) {
         m.a_h.x = m.b_h;
-        RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, true, false, RAD_I8_GROUP_WIDE));
+        RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, true, false, m.rot_group));
         m.a_h.q8_fed = m.a_h.q8_rot = rad_op_declared(b, "rmsnorm_had_quant_i8g") != 0;
         m.a_attn.x = m.b_attn;
         RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", q_dim, 0, true, false,
-                                         RAD_I8_GROUP_WIDE));
+                                         m.rot_group));
         m.a_ffn.x = m.b_ffn;
-        RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, true, false,
-                                        RAD_I8_GROUP_WIDE));
+        RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, true, false, m.rot_group));
         m.a_ffn.q8_fed = m.a_ffn.q8_rot = rad_op_declared(b, "gated_had_quant_i8g") != 0;
     }
     /* The lm_head runs over the sampled rows only (RadBatch::out_ids), not the whole step. */
@@ -721,10 +716,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                          * qk_scale_factor rides the q norm's `mult`. */
     (void)attn_scale_num;
 
-    /* One linear of an IQ8R trunk: its name map (layer 0's q has it from the probe), its encoding
-     * checked to be IQ8R, then LinearFP8's declaration (codes view i8 [N, K], one "scale,scale.1"
-     * u8 view at the logical [N, K], gemm_nt_q at i8a8h, group 256, over `a`'s int8 pair; and
-     * had_quant_act_i8g over `a.x` unless `a` is fed). */
+    /* One rotated linear: IQ8R must stay IQ8R; IQR-V4 must be a computed MAD trellis. LinearFP8
+     * selects the stored code/trellis/scale views and gemm_nt_q i8a8h at the proper scale group. */
     auto rot_linear = [&](int64_t l, LinearFP8& L, const char* base,
                           std::initializer_list<const char*> src, int64_t n_out, int64_t n_in,
                           int shard, const ActFP8& a, rad_buf y,
@@ -733,12 +726,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const char* wn = nm.f("%s.weight", base);
         RadEncoding e{};
         const bool known = weight_enc(b, wn, &e);
-        if (!known || !linear_is_iq8r(e)) {
+        const W8hForm form = known ? linear_w8h_form(e) : W8hForm::None;
+        const bool valid = known && (m.iq8r ? linear_is_iq8r(e)
+                                             : m.iqr_v4 && form == W8hForm::Trellis &&
+                                                   linear_w8h_mad(e));
+        if (!valid || linear_w8h_group(e) != m.rot_group) {
             char en[256] = "plain bf16";
             if (known) rad_enc_format(&e, en, sizeof en);
-            fprintf(stderr, "radiance: '%s' is %s, and this container's trunk is IQ8R (layer 0's "
-                            "attn_q): every trunk linear of an IQ8R container is IQ8R "
-                            "(data/recipes/museglimmer-30b-iq8r.recipe)\n", wn, en);
+            fprintf(stderr, "radiance: '%s' is %s, which does not match this container's whole "
+                            "rotated trunk (layer 0 attn_q selects %s)\n", wn, en,
+                    m.iq8r ? "IQ8R" : "computed-trellis IQR");
             return RAD_E_DTYPE;
         }
         return L.declare(b, nm, g, base, n_out, n_in, shard, grp_layer((int)l), src, a, y, 0,
@@ -781,10 +778,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         /* -- ops, in run order except attn_paged, declared before kv_store like every family: the
          * two touch disjoint buffers and the block size comes from the resolved kernel. */
-        /* The input norm: with an IQ8R trunk fed by its norms, rmsnorm_had_quant_i8g writes the
-         * bf16 output and its rotated int8 pair in one pass (no residual operand: the residual add
-         * is the post-normed branch's, not this norm's). */
-        if (m.iq8r && m.a_h.q8_fed)
+        /* A rotated trunk can fuse the centered norm and its int8 pair into one pass. */
+        if (m.rotated_i8 && m.a_h.q8_fed)
             RAD_ARCH_TRY(lay.nq_attn.declare(b, gn, lay.w_norm, m.b_x, m.a_h, g.n_embd));
         else
             lay.op_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -798,7 +793,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             nm.ckpt("%s.%lld.self_attn.gate_proj.weight", pre, (long long)l);
         const char* const src_k = nm.ckpt("%s.%lld.self_attn.k_proj.weight", pre, (long long)l);
         const char* const src_v = nm.ckpt("%s.%lld.self_attn.v_proj.weight", pre, (long long)l);
-        if (m.iq8r) {
+        if (m.rotated_i8) {
             /* q, gate, k and v read one int8 pair of the norm output: the norm's, or q's own
              * quantiser's where the norm writes none. The three after q read it as fed. */
             ActFP8 h_shared = m.a_h;
@@ -889,8 +884,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             RAD_NOWEIGHTS),
                         {m.b_attn, m.b_gate}, {m.b_attn});
         const char* const src_o = nm.ckpt("%s.%lld.self_attn.o_proj.weight", pre, (long long)l);
-        /* IQ8R: o_proj quantises the gated product itself (had_quant_act_i8g into `a_attn`). */
-        if (m.iq8r)
+        /* The rotated path quantises o_proj's gated product into its int8 pair. */
+        if (m.rotated_i8)
             RAD_ARCH_TRY(rot_linear(l, lay.ro, nm.f("blk.%d.attn_output", (int)l), {src_o},
                                     g.n_embd, q_dim, RAD_SHARD_COL, m.a_attn, m.b_h, {}));
         else
@@ -918,9 +913,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             RAD_NOWEIGHTS),
                         {m.b_x, m.b_h}, {m.b_x});
 
-        /* ---- the feed-forward, the same double norm. With an IQ8R trunk fed by its norms the
-         * pre-feed-forward norm writes the int8 pair too, as the input norm does. */
-        if (m.iq8r && m.a_h.q8_fed)
+        /* ---- the feed-forward, the same double norm. A rotated trunk can fuse the norm and pair. */
+        if (m.rotated_i8 && m.a_h.q8_fed)
             RAD_ARCH_TRY(lay.nq_ffn.declare(b, gn, lay.w_fnorm, m.b_x, m.a_h, g.n_embd));
         else
             lay.op_fnorm = rw(b, RAD_OP(b, "rmsnorm",
@@ -932,7 +926,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const char* const src_gate_ff = nm.ckpt("%s.%lld.mlp.gate_proj.weight", pre, (long long)l);
         const char* const src_up = nm.ckpt("%s.%lld.mlp.up_proj.weight", pre, (long long)l);
         const char* const src_down = nm.ckpt("%s.%lld.mlp.down_proj.weight", pre, (long long)l);
-        if (m.iq8r) {
+        if (m.rotated_i8) {
             /* gate|up in the checkpoint's row order, two row parts; then silu(gate) * up. Where
              * `a_ffn` is fed, gated_had_quant_i8g writes down_proj's int8 pair, and the bf16
              * product only when the calibration taps read it (down_proj reads codes alone).
@@ -1073,12 +1067,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer));
     }
 
-    /* ---- the DFlash drafter, declared last: its passes run after the whole trunk's, and the
-     * planner lays lifetimes out in declaration order. */
+    /* ---- the drafter is declared last so its buffers cannot overlap trunk temporaries. */
     if (m.taps.n > 0) {
-        RAD_ARCH_TRY(declare_muse_dflash(&m.df, &m.dfw, &m.kv_draft, b, nm, meta, ctx, g, m.taps,
-                                         (int)g.n_layer, m.w_tok, m.w_lm_head));
-        m.have_df = true;
+        if (muse_draft_is_dflash2(meta)) {
+            RAD_ARCH_TRY(declare_muse_dflash2(&m.df2, &m.df2w, &m.kv_draft, b, nm, meta, ctx, g,
+                                              m.taps, (int)g.n_layer, m.w_tok, m.w_lm_head));
+            m.have_df2 = true;
+        } else {
+            RAD_ARCH_TRY(declare_muse_dflash(&m.df, &m.dfw, &m.kv_draft, b, nm, meta, ctx, g,
+                                             m.taps, (int)g.n_layer, m.w_tok, m.w_lm_head));
+            m.have_df = true;
+        }
     }
 
     /* ---- notes for --debug-graph. */
@@ -1104,11 +1103,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.g_rope.theta != g.theta)
         rad_note(b, "rotary runs on the sliding layers only (theta %g); the full-attention layers "
                     "are NoPE", (double)m.g_rope.theta);
-    if (m.iq8r)
-        rad_note(b, "IQ8R trunk: every linear gemm_nt_q i8a8h over int8 codes rotated 128 wide, "
-                    "one scale a (row, %d) on both sides; the pre-norms %s, the gated product %s, "
-                    "o_proj quantises its own input; q, gate, k and v read one pair",
-                 RAD_I8_GROUP_WIDE,
+    if (m.rotated_i8)
+        rad_note(b, "%s trunk: gemm_nt_q i8a8h over 128-wide Hadamard codes, one activation scale "
+                    "per %lld K columns; the pre-norms %s, the gated product %s, o_proj quantises "
+                    "its own input; q, gate, k and v read one pair",
+                 m.iq8r ? "IQ8R" : "computed-trellis IQR", (long long)m.rot_group,
                  m.a_h.q8_fed ? "write the codes (rmsnorm_had_quant_i8g)"
                               : "are plain (q and gate/up quantise)",
                  m.a_ffn.q8_fed ? "writes down_proj's codes (gated_had_quant_i8g)"
@@ -1132,6 +1131,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     /* A draft pass runs only the drafter: >0 the query pass on the staged block, <0 the context
      * pass that projects and stores K/V for the tokens the trunk just committed. */
     if (batch->draft_pass != 0) {
+        if (m.have_df2) {
+            if (batch->draft_pass > 0) m.df2.step(c, batch);
+            else                       m.df2.context(c, batch);
+            return;
+        }
         if (!m.have_df) {
             rad_step_fail(c, "this serve stages a draft pass but the container carries no drafter");
             return;
@@ -1171,7 +1175,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
          * declared a quantiser (op_q) issues it first, over the pair's bf16 plane. */
         if (l.nq_attn.op) l.nq_attn.step(c, T);
         else RAD_ISSUE(c, l.op_norm, brows(m.b_x, T), RAD_W(l.w_norm), brows(m.b_h, T));
-        if (m.iq8r) {
+        if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, T);
+        if (m.rotated_i8) {
             l.rq.step(c, m.a_h, m.b_q, T);
             l.rgate.step(c, m.a_h, m.b_gate, T);
             l.rk.step(c, m.a_h, m.b_k, T);
@@ -1201,7 +1206,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     brows(m.b_attn, T));
         RAD_ISSUE_N(c, l.op_sig, T * m.g.n_head, brows(m.b_gate, T), brows(m.b_gate, T));
         RAD_ISSUE(c, l.op_mul, brows(m.b_attn, T), brows(m.b_gate, T), brows(m.b_attn, T));
-        if (m.iq8r) l.ro.step(c, m.a_attn, m.b_h, T);
+        if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
+        if (m.rotated_i8) l.ro.step(c, m.a_attn, m.b_h, T);
         else        l.lo.step(c, m.b_attn, m.b_h, T);
         if (l.op_ar) RAD_ISSUE_N(c, l.op_ar, T * m.g.n_embd, brows(m.b_h, T), RAD_NONE);
         RAD_ISSUE(c, l.op_post, brows(m.b_h, T), RAD_W(l.w_post), brows(m.b_h, T));
@@ -1210,7 +1216,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         /* -- feed-forward. */
         if (l.nq_ffn.op) l.nq_ffn.step(c, T);
         else RAD_ISSUE(c, l.op_fnorm, brows(m.b_x, T), RAD_W(l.w_fnorm), brows(m.b_h, T));
-        if (m.iq8r) {
+        if (l.cs_mlp >= 0) m.calib.tap(c, (size_t)l.cs_mlp, T);
+        if (m.rotated_i8) {
             l.rgu.step(c, m.a_h, m.b_gu, T);
             if (l.gq_ffn.op) l.gq_ffn.step(c, m.b_gu, T);
             else RAD_ISSUE(c, l.op_act, brows(m.b_gu, T), brows(m.b_ffn, T));
@@ -1220,6 +1227,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE(c, l.op_act,   brows(m.b_gu, T), brows(m.b_ffn, T));
             l.ldown.step(c, m.b_ffn, m.b_h, T);
         }
+        if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, T);
         if (l.op_far) RAD_ISSUE_N(c, l.op_far, T * m.g.n_embd, brows(m.b_h, T), RAD_NONE);
         RAD_ISSUE(c, l.op_fpost, brows(m.b_h, T), RAD_W(l.w_fpost), brows(m.b_h, T));
         RAD_ISSUE(c, l.op_fadd,  brows(m.b_x, T), brows(m.b_h, T), brows(m.b_x, T));
@@ -1230,6 +1238,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.b_h, batch->n_tok));
+    if (m.cs_head >= 0) m.calib.tap(c, (size_t)m.cs_head, T);
     m.calib.after_step(c, T);
 
     /* The lm_head runs only on the rows the sampler asked for; a mid-prompt prefill chunk has
@@ -1254,6 +1263,12 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     if (MuseTower::present(meta)) out->enc_merge = 4;
     /* The drafter denoises `block_size` positions, the anchor row proposes nothing. */
+    if (muse_draft_is_dflash2(meta)) {
+        const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 16);
+        out->draft_depth = bs > 1 ? (int)(bs - 1) : 15;
+        out->draft_depth_fixed = 1;
+        return RAD_OK;
+    }
     const long long bs = rad_meta_geti(meta, "draft.block_size", 0);
     if (bs > 1) {
         out->draft_depth = (int)(bs - 1);
@@ -1274,9 +1289,9 @@ RAD_ARCH_PROBE(museglimmer_ct)
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(museglimmer_ct, "museglimmer", "compressed-tensors", "0.1.0",
                 "Meta Muse Glimmer 30B dense under compressed-tensors: encoding-aware trunk "
-                "linears (plain bf16, asymmetric int4/int5 a 128, int8 a 128, or an IQ8R trunk: "
-                "rotated int8 a 256), gated attention "
-                "alternating sliding-window (rotary) and NoPE full-attention layers, Gemma-2 "
-                "style double norms, a bf16 vision tower")
+                "linears (bf16, asymmetric/symmetric integer, IQ8R, or fwht128 computed-MAD "
+                "IQR-V4 at i8a8h), gated attention alternating sliding-window (rotary) and NoPE "
+                "full-attention layers, Gemma-2 style double norms, bf16 vision tower, and DFlash "
+                "or DFlash2 drafter")
 RAD_ARCH_CHAT_FORMAT(museglimmer_ct)
 #endif

@@ -20,6 +20,7 @@
 //
 // Returns a RAD status rather than throwing, for the reason given in halo_gemm_fp8a8.hip.
 
+#include "halo_chain.h"
 #include "halo.h"
 #include "halo_args.h"
 #include "halo_emit.h"
@@ -34,7 +35,7 @@ constexpr int kThreads = 128;
  * row constraint on the declared seqs (rad-convert declares 256, which must still resolve). */
 constexpr int kMaxSeq  = 256;
 
-__global__ __launch_bounds__(kThreads) void qsa_work_kernel(
+__device__ __forceinline__ void qsa_work_kernel_body(
     const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const uint16_t* __restrict__ state,
     const int32_t* __restrict__ sidx, const int32_t* __restrict__ bt,
@@ -115,6 +116,23 @@ __global__ __launch_bounds__(kThreads) void qsa_work_kernel(
     }
 }
 
+/* qsa_work_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(kThreads)
+void qsa_work_kernel(
+    const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const uint16_t* __restrict__ state,
+    const int32_t* __restrict__ sidx, const int32_t* __restrict__ bt,
+    uint16_t* __restrict__ stage, int32_t* __restrict__ page, int32_t* __restrict__ bpos,
+    int32_t* __restrict__ nc,
+    int n, int ratio, int ring, int seqs, int max_work, int k_ld, int s_slot, int s_row,
+    int sidx_ld, int bt_ld, int g_ld, const int32_t* __restrict__ rope, int rplane,
+    int bstep) {
+    if (CH::on) halo_chain_wait();
+    qsa_work_kernel_body(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio, ring, seqs, max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope, rplane, bstep);
+    if (CH::on) halo_chain_done();
+}
+
 }  // namespace
 
 //   k      [T][n]                  bf16, this step's raw index keys
@@ -142,7 +160,7 @@ static int halo_qsa_work_bf16_emit(long k, long pos, long cu, long state, long s
     if (!s_row) s_row = n;
     if (!g_ld) g_ld = n;
     if (!sidx_ld) sidx_ld = 1;
-    return HALO_EMIT(stream, qsa_work_kernel, dim3((unsigned)max_work), dim3(kThreads), 0,
+    return HALO_EMIT(stream, (halo_chain_flag() ? qsa_work_kernel<r4dchain> : qsa_work_kernel<HaloUnchained>), dim3((unsigned)max_work), dim3(kThreads), 0,
                     (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu,
                     (const uint16_t*)state, (const int32_t*)sidx, (const int32_t*)bt,
                     (uint16_t*)stage, (int32_t*)page, (int32_t*)bpos, (int32_t*)nc, n, ratio,
@@ -156,6 +174,7 @@ enum { QW_K = 0, QW_POS, QW_CU, QW_STATE, QW_SIDX, QW_BT, QW_ROPE, QW_STAGE, QW_
        QW_NC };
 
 extern "C" int halo_rad_qsa_work(const RadArgs* a, RadStream stream) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     const RadTensor* k  = halo_opt(a, QW_K);
     const RadTensor* po = halo_opt(a, QW_POS);
     const RadTensor* cu = halo_opt(a, QW_CU);

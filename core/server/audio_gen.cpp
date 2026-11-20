@@ -93,10 +93,9 @@ std::string wav_header(int64_t bytes, int64_t rate, int64_t channels) {
 /* The request's description of the audio, `text` its input: the instructions, the tempo, the
  * length, the denoiser's steps, the guidance and the seed, and the prompt rendered from the
  * model's templates. */
-int Server::speech_request(const IAudioGen& audio, const ITokenizer& tokenizer,
-                           const json& body, const std::string& text,
+int Server::speech_request(const json& body, const std::string& text,
                            std::unique_ptr<gen::AudioRequest>* out, ApiError* err) {
-    const AudioGenInfo& info = audio.info();
+    const AudioGenInfo& info = deps_.audio->info();
     auto fail = [&](ApiError e) {
         *err = std::move(e);
         return -1;
@@ -247,7 +246,7 @@ int Server::speech_request(const IAudioGen& audio, const ITokenizer& tokenizer,
             r->ref_cu.push_back((int32_t)r->ref_audio.size());
             Ref ref;
             std::string why;
-            if (audio.prepare(RAD_TEXT_REFERENCE, e["text"].get<std::string>(), &ref.text,
+            if (deps_.audio->prepare(RAD_TEXT_REFERENCE, e["text"].get<std::string>(), &ref.text,
                                      &why) < 0)
                 return fail(err_bad(at + ".text", why));
             ref.frames = padded / hop;
@@ -268,13 +267,13 @@ int Server::speech_request(const IAudioGen& audio, const ITokenizer& tokenizer,
 
     /* ---- the prompt */
     std::string i2, t2, why;
-    if (!inst.empty() && audio.prepare(RAD_TEXT_INSTRUCTIONS, inst, &i2, &why) < 0)
+    if (!inst.empty() && deps_.audio->prepare(RAD_TEXT_INSTRUCTIONS, inst, &i2, &why) < 0)
         return fail(err_bad("instructions", why));
-    if (audio.prepare(RAD_TEXT_INPUT, text, &t2, &why) < 0)
+    if (deps_.audio->prepare(RAD_TEXT_INPUT, text, &t2, &why) < 0)
         return fail(err_bad("input", why));
     auto encode = [&](const std::string& t, bool special, std::vector<int32_t>* ids_out) {
         if (t.empty()) return;
-        const auto ids = tokenizer.encode(t, false, /*parse_special=*/special);
+        const auto ids = deps_.tok->encode(t, false, /*parse_special=*/special);
         ids_out->insert(ids_out->end(), ids.begin(), ids.end());
     };
     auto subst = [](std::string t, const std::string& key, const std::string& v) {
@@ -342,12 +341,13 @@ int Server::speech_request(const IAudioGen& audio, const ITokenizer& tokenizer,
 }
 
 HttpResponse Server::handle_speech(const HttpRequest& req) {
-    if (!deps_.audio && !opt_.queue_audio)
+    if (!deps_.audio || !deps_.tok)
         return error_response(err_not_implemented(
             opt_.image_model ? "/v1/audio/speech requires an audio generation model; this one "
                                "makes images"
                              : "/v1/audio/speech requires an audio generation model; this one "
                                "generates text"), req.peer);
+    const AudioGenInfo& info = deps_.audio->info();
 
     json body = json::object();
     {
@@ -405,65 +405,14 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     if (sse && fmt != "pcm")
         return error_response(err_unsupported("response_format", "an event carries raw PCM; set "
                                                                  "response_format pcm"), req.peer);
-    auto release_admission = [this](Server*) { release(1); };
-    std::unique_ptr<Server, decltype(release_admission)> admission(nullptr, release_admission);
-    std::shared_ptr<void> dispatch_hold;
-    Deps::AudioEndpoint audio = deps_.audio;
-    if (opt_.queue_audio) {
-        std::string model;
-        if (str("model", &model) <= 0 || model.empty())
-            return error_response(err_bad("model", "expected a nonempty audio model ID"), req.peer);
-        if (auto no = admit(1, req.peer)) return *no;
-        admission.reset(this);
-        std::string why;
-        const auto cancelled = [&] { return stopping_.load() || req.peer_gone(); };
-        const int status = opt_.queue_audio(model, req.body.size(), size_t(queue_depth_),
-                                            2 * opt_.max_body_bytes, cancelled, &audio,
-                                            &dispatch_hold, &why);
-        if (status == RAD_E_CANCELLED && !stopping_.load()) {
-            metrics_.observe_http(499);
-            return HttpResponse::text(499, "client closed request\n");
-        }
-        if (status == RAD_E_FULL) {
-            metrics_.observe_rejected();
-            return error_response(err_overloaded(why), req.peer);
-        }
-        if (status < 0 || !audio || !dispatch_hold) {
-            ApiError err = err_bad("model", why.empty() ? "could not select the audio model" : why);
-            if (status == RAD_E_NOTFOUND) { err.status = 404; err.type = "not_found_error"; }
-            if (status == RAD_E_CANCELLED || status == RAD_E_STATE || status == RAD_E_NOMEM ||
-                status == RAD_E_IO || status == RAD_E_DEVICE || status >= 0) {
-                err.status = 503;
-                err.type = "service_unavailable";
-            }
-            return error_response(err, req.peer);
-        }
-    }
-    const auto& info = audio.gen->info();
-    const int64_t rate = info.sample_rate, channels = info.channels;
     std::unique_ptr<gen::AudioRequest> r;
     {
         ApiError err;
-        if (speech_request(*audio.gen, *audio.tok, body, text, &r, &err) < 0)
-            return error_response(err, req.peer);
-    }
-
-    /* Preparation can decode references. Check for a disconnect before submitting. */
-    if (opt_.queue_audio) {
-        if (stopping_.load())
-            return error_response(err_overloaded("the server is shutting down"), req.peer);
-        if (req.peer_gone()) {
-            metrics_.observe_http(499);
-            return HttpResponse::text(499, "client closed request\n");
-        }
+        if (speech_request(body, text, &r, &err) < 0) return error_response(err, req.peer);
     }
 
     /* ---- admitted and queued */
-    if (!admission) {
-        if (auto no = admit(1, req.peer)) return *no;
-        admission.reset(this);
-    }
-    r->dispatch_hold = std::move(dispatch_hold);
+    if (auto no = admit(1, req.peer)) return *no;
     r->ticket = std::make_shared<gen::AudioTicket>();
     std::shared_ptr<gen::AudioTicket> ticket = r->ticket;
     const int64_t frames_max = r->max_frames;
@@ -471,8 +420,9 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     const int64_t n_tok = (int64_t)r->tokens.size();
     {
         std::string w;
-        const int s = audio.gen->submit(std::move(r), &w);
+        const int s = deps_.audio->submit(std::move(r), &w);
         if (s < 0) {
+            release(1);
             ApiError e = err_bad("", w.empty() ? std::string(rad_strerror(s)) : w);
             if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
             return error_response(e, req.peer);
@@ -481,12 +431,7 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     RAD_INFO("audio: %lld prompt tokens, up to %lld frames, seed=%llu", (long long)n_tok,
              (long long)frames_max, (unsigned long long)seed);
 
-    audio = {};
-    if (sse || raw) {
-        auto response = stream_speech(ticket, rate, channels, n_tok, seed, sse, fmt == "wav");
-        admission.release(); /* the response closes the admission place */
-        return response;
-    }
+    if (sse || raw) return stream_speech(ticket, info, n_tok, seed, sse, fmt == "wav");
 
     /* ---- the windows as they are played, in order */
     std::vector<gen::AudioChunk> chunks;
@@ -500,15 +445,17 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
         if (!to) break;
         if (req.peer_gone()) {
             ticket->cancel.store(true);
+            release(1);
             metrics_.observe_http(499);
             return HttpResponse::text(499, "client closed request\n");
         }
         if (stopping_.load()) {
             ticket->cancel.store(true);
+            release(1);
             return error_response(err_overloaded("the server is shutting down"), req.peer);
         }
     }
-    admission.reset();
+    release(1);
     if (ticket->status() < 0 || chunks.empty()) {
         /* RAD_E_INVAL is the driver's refusal of this request (or the model ending the piece
          * before it began), so a 400; anything else failed while running. */
@@ -524,7 +471,7 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     });
     std::string pcm;
     for (const gen::AudioChunk& c : chunks) append_pcm16(c.samples, &pcm);
-    const double secs = (double)pcm.size() / 2.0 / (double)(channels * rate);
+    const double secs = (double)pcm.size() / 2.0 / (double)(info.channels * info.sample_rate);
     auto sec = [](int64_t a, int64_t b) { return a > 0 && b >= a ? (double)(b - a) * 1e-9 : 0.0; };
     RAD_INFO("audio: %.1f s from %lld frames in %lld windows, %.1f s: queue and prompt %.1f s, "
              "first audio %.1f s, frames %.1f s%s", secs, (long long)ticket->frames,
@@ -537,13 +484,13 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     res.status = 200;
     if (fmt == "wav") {
         res.content_type = "audio/wav";
-        res.body = wav_header((int64_t)pcm.size(), rate, channels) + pcm;
+        res.body = wav_header((int64_t)pcm.size(), info.sample_rate, info.channels) + pcm;
     } else {
         res.content_type = "audio/pcm";
         res.body = std::move(pcm);
     }
-    res.set_header("X-Audio-Sample-Rate", std::to_string(rate));
-    res.set_header("X-Audio-Channels", std::to_string(channels));
+    res.set_header("X-Audio-Sample-Rate", std::to_string(info.sample_rate));
+    res.set_header("X-Audio-Channels", std::to_string(info.channels));
     res.set_header("X-Seed", std::to_string(seed));
     metrics_.observe_http(200);
     return res;
@@ -552,14 +499,14 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
 /* The piece as it is played: each window's samples once every earlier window has gone (the driver
  * may finish them out of order), as bytes or as `speech.audio.delta` events. */
 HttpResponse Server::stream_speech(std::shared_ptr<gen::AudioTicket> ticket,
-                                   int64_t rate, int64_t channels, int64_t n_tok,
-                                   uint64_t seed, bool sse, bool wav) {
+                                   const AudioGenInfo& info, int64_t n_tok, uint64_t seed,
+                                   bool sse, bool wav) {
     HttpResponse res;
     res.status = 200;
     res.content_type = sse ? "text/event-stream" : wav ? "audio/wav" : "audio/pcm";
     if (sse) res.set_header("Cache-Control", "no-cache");
-    res.set_header("X-Audio-Sample-Rate", std::to_string(rate));
-    res.set_header("X-Audio-Channels", std::to_string(channels));
+    res.set_header("X-Audio-Sample-Rate", std::to_string(info.sample_rate));
+    res.set_header("X-Audio-Channels", std::to_string(info.channels));
     res.set_header("X-Seed", std::to_string(seed));
     struct State {
         std::map<int32_t, std::vector<float>> held;   /* windows ahead of the next one */
@@ -568,6 +515,7 @@ HttpResponse Server::stream_speech(std::shared_ptr<gen::AudioTicket> ticket,
     };
     auto st = std::make_shared<State>();
     st->header = !wav || sse;
+    const int64_t rate = info.sample_rate, channels = info.channels;
     res.next = [this, ticket, st, sse, rate, channels, n_tok](std::string& chunk) -> bool {
         if (st->finished) return false;
         chunk.clear();

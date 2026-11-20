@@ -38,10 +38,6 @@ struct IPassDriver {
     /* Fail every request queued or in flight, and refuse new ones. */
     virtual void shutdown(const char* why, int status) = 0;
 
-    /* Includes queued jobs and admitted jobs through driver retirement. Shutdown
-     * can finish tickets before the driver has retired or destroyed its jobs. */
-    virtual bool busy() const = 0;
-
     /* For /health, /stats and the dashboard. */
     virtual int64_t queued() const = 0;
     virtual int64_t running() const = 0;

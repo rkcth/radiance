@@ -398,6 +398,89 @@ inline bool write_lfm2(const std::string& dir, const Lfm2& s) {
     return write_checkpoint(dir, c, ts);
 }
 
+/* ------------------------------------------------------------------ lfm3: conv + full + sliding */
+
+/* LFM3 (`lfm3`, served by lfm3_bf16): LFM2's convolutions and attention with sandwich norms, a
+ * gate per query head, a partial rotary on the full layers and sliding-window layers at their own
+ * theta. Layers go conv, full, conv, sliding; the window is shorter than every test document and
+ * the convolution as wide as the release's. */
+struct Lfm3 {
+    int64_t layers = 4, hidden = 64, heads = 4, kv_heads = 2, ffn = 128, vocab = 320, ctx = 4096;
+    int64_t conv = 7;                           /* conv_L_cache */
+    int64_t window = 8;                         /* sliding_window */
+    float    branch = 0.2f, head = 0.5f;        /* see Gains; head is the tied table's amplitude */
+    /* With this seed the greedy continuation of the speculation test's prompt repeats itself in
+     * part, so prompt lookup drafts and the model rejects some of what it drafts. */
+    uint64_t seed = 59;
+};
+
+inline bool write_lfm3(const std::string& dir, const Lfm3& s) {
+    Rng r(s.seed);
+    const int64_t H = s.hidden, hd = s.hidden / s.heads, kv = s.kv_heads * hd;
+    auto kind = [](int64_t l) { return l % 2 == 0 ? 0 : l % 4 == 1 ? 1 : 2; };
+    Json types = Json::array();
+    for (int64_t l = 0; l < s.layers; ++l)
+        types.push_back(kind(l) == 0 ? "conv" : kind(l) == 1 ? "full_attention" : "sliding_attention");
+    Json c;
+    c["architectures"] = { "Lfm3ForCausalLM" };
+    c["model_type"] = "lfm3";
+    c["vocab_size"] = s.vocab;
+    c["hidden_size"] = H;
+    c["intermediate_size"] = s.ffn;
+    c["num_hidden_layers"] = s.layers;
+    c["num_attention_heads"] = s.heads;
+    c["num_key_value_heads"] = s.kv_heads;
+    c["head_dim"] = hd;
+    c["max_position_embeddings"] = s.ctx;
+    c["norm_eps"] = 1e-5;
+    c["rope_parameters"] = {
+        /* A low theta: over a test document the release's 1e6 turns the unrotated half's would-be
+         * frequencies by a hundredth of a radian, and a full rotary would pass for the partial one. */
+        { "full_attention", { { "rope_type", "default" }, { "rope_theta", 100.0 },
+                              { "partial_rotary_factor", 0.5 } } },
+        { "sliding_attention", { { "rope_type", "default" }, { "rope_theta", 10000.0 } } } };
+    c["sliding_window"] = s.window;
+    c["use_sandwich_norm"] = true;
+    c["conv_bias"] = false;
+    c["conv_L_cache"] = s.conv;
+    c["layer_types"] = types;
+    c["tie_word_embeddings"] = true;
+    c["eos_token_id"] = (int)kEndOfText;
+
+    const std::string m = "model.";
+    std::vector<Tensor> ts;
+    ts.push_back(noise(m + "embed_tokens.weight", { s.vocab, H }, r, s.head));
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string p = m + "layers." + std::to_string(l) + ".";
+        ts.push_back(noise(p + "operator_norm.weight", { H }, r, 0.1f, 1.0f));
+        if (kind(l) != 0) {
+            ts.push_back(linear(p + "self_attn.q_proj.weight", H, H, r));
+            ts.push_back(linear(p + "self_attn.k_proj.weight", kv, H, r));
+            ts.push_back(linear(p + "self_attn.v_proj.weight", kv, H, r));
+            ts.push_back(linear(p + "self_attn.o_proj.weight", H, H, r));
+            ts.push_back(noise(p + "self_attn.q_norm.weight", { hd }, r, 0.1f, 1.0f));
+            ts.push_back(noise(p + "self_attn.k_norm.weight", { hd }, r, 0.1f, 1.0f));
+            /* gates spread over (0, 1), a head apart from its neighbours */
+            ts.push_back(linear(p + "self_attn.gate_proj.weight", s.heads, H, r, 2.0f));
+        } else {
+            ts.push_back(linear(p + "conv.in_proj.weight", 3 * H, H, r));
+            ts.push_back(noise(p + "conv.conv.weight", { H, 1, s.conv }, r, 0.5f));
+            ts.push_back(linear(p + "conv.out_proj.weight", H, H, r));
+        }
+        /* The post norms' gains set each branch's size in the stream, as the out projections'
+         * do in a pre-norm model. */
+        ts.push_back(noise(p + "post_operator_norm.weight", { H }, r, 0.02f, s.branch));
+        ts.push_back(noise(p + "ffn_norm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(linear(p + "feed_forward.w1.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "feed_forward.w3.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "feed_forward.w2.weight", H, s.ffn, r));
+        ts.push_back(noise(p + "post_ffn_norm.weight", { H }, r, 0.02f, s.branch));
+    }
+    /* Signed gains around 0, as LFM2's: a tied head would otherwise score a token's own row. */
+    ts.push_back(noise(m + "embedding_norm.weight", { H }, r, 1.0f));
+    return write_checkpoint(dir, c, ts);
+}
+
 /* ------------------------------------------------------------------ gemma4: sliding + global */
 
 /* Gemma 4 dense (`gemma4`, served by the gemma4 plugin as written), shaped like the 31B: sliding
@@ -898,7 +981,7 @@ inline const char* kLlamaI8Recipe =
 /* ------------------------------------------------------------------ Qwen-Image 2.1 */
 
 /* Qwen-Image 2.1 (`QwenImage21Pipeline`, served by qwenimage21) as a diffusers pipeline directory:
- * model_index.json, a Qwen3-VL text encoder with an optional vision tower, the single-stream DiT, the
+ * model_index.json, a Qwen3-VL text encoder with no vision tower, the single-stream DiT, the
  * residual 2-D VAE, the scheduler's config and the tokenizer. The latent keeps the model's 64
  * channels (the plugin requires them); every other width is cut. The DiT's 64-wide heads take the
  * bf16 attention path of a host library that has one. */
@@ -909,7 +992,6 @@ struct QwenImage {
     int64_t vae_dim = 8, vae_res = 1;
     float    branch = 0.5f;                     /* see Gains */
     uint64_t seed = 5;
-    bool vision = false;
 };
 
 inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
@@ -963,48 +1045,6 @@ inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
         tt.push_back(linear(p + "mlp.down_proj.weight", H, s.te_ffn, r, s.branch));
     }
     tt.push_back(noise(m + "norm.weight", { H }, r, 0.1f, 1.0f));
-    if (s.vision) {
-        constexpr int64_t width = 32, inner = 64, patch = 16, temporal = 2, merge = 2;
-        constexpr int64_t positions = 16, merged_width = merge * merge * width;
-        te["vision_config"] = {{"depth", 1}, {"hidden_size", width}, {"num_heads", 2},
-                              {"intermediate_size", inner}, {"patch_size", patch},
-                              {"temporal_patch_size", temporal}, {"spatial_merge_size", merge},
-                              {"out_hidden_size", H}, {"num_position_embeddings", positions}};
-        te["image_token_id"] = kTokenizerSize;
-        te["video_token_id"] = kTokenizerSize + 1;
-        te["vision_start_token_id"] = kTokenizerSize + 2;
-        te["vision_end_token_id"] = kTokenizerSize + 3;
-        Rng vision_rng(s.seed + 1);
-        const std::string visual = "model.visual.";
-        auto vector = [&](const std::string& key, int64_t size, float mean = 0.0f) {
-            tt.push_back(noise(visual + key, {size}, vision_rng, 0.03f, mean));
-        };
-        auto matrix = [&](const std::string& key, int64_t rows, int64_t cols) {
-            tt.push_back(linear(visual + key, rows, cols, vision_rng));
-        };
-        tt.push_back(noise(visual + "patch_embed.proj.weight",
-                           {width, 3, temporal, patch, patch}, vision_rng, 0.02f));
-        vector("patch_embed.proj.bias", width);
-        matrix("pos_embed.weight", positions, width);
-        vector("blocks.0.norm1.weight", width, 1);
-        vector("blocks.0.norm1.bias", width);
-        matrix("blocks.0.attn.qkv.weight", 3 * width, width);
-        vector("blocks.0.attn.qkv.bias", 3 * width);
-        matrix("blocks.0.attn.proj.weight", width, width);
-        vector("blocks.0.attn.proj.bias", width);
-        vector("blocks.0.norm2.weight", width, 1);
-        vector("blocks.0.norm2.bias", width);
-        matrix("blocks.0.mlp.linear_fc1.weight", inner, width);
-        vector("blocks.0.mlp.linear_fc1.bias", inner);
-        matrix("blocks.0.mlp.linear_fc2.weight", width, inner);
-        vector("blocks.0.mlp.linear_fc2.bias", width);
-        vector("merger.norm.weight", width, 1);
-        vector("merger.norm.bias", width);
-        matrix("merger.linear_fc1.weight", merged_width, merged_width);
-        vector("merger.linear_fc1.bias", merged_width);
-        matrix("merger.linear_fc2.weight", H, merged_width);
-        vector("merger.linear_fc2.bias", H);
-    }
     if (!write_text(dir + "/text_encoder/config.json", te.dump(2)) ||
         !write_safetensors(dir + "/text_encoder/model.safetensors", tt))
         return false;
@@ -1126,10 +1166,7 @@ inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
     sch["shift"] = 1.0;
     sch["use_dynamic_shifting"] = false;
     return write_text(dir + "/scheduler/scheduler_config.json", sch.dump(2)) &&
-           write_text(dir + "/tokenizer/tokenizer.json", tokenizer_json(s.vision
-               ? std::vector<std::string>{"<|image_pad|>", "<|video_pad|>",
-                                          "<|vision_start|>", "<|vision_end|>"}
-               : std::vector<std::string>{}));
+           write_text(dir + "/tokenizer/tokenizer.json", tokenizer_json());
 }
 
 /* The rad-convert recipe that makes the DiT's linears rotated int8 with a bf16 scale per row and

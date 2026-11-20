@@ -2132,11 +2132,11 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 /* The weight scale grid `dtype` names, as weight rows and K elements per scale. Block-fp8 experts
  * (fp8a8) carry the checkpoint's one scale per 128x128 tile (`group` = 128). The 4-bit formats
  * (docs/MOE-W4.md) carry one per row per K group: all of `group` for w4a8, w4a8h and w4nla8h, half
- * for w4nl64a8h and w5nl64a8h, a quarter for w4nl32a8h. The `a8i8` names are the four-bit formats
- * against an int8 activation and `i8a8` / `i8a8h` int8 experts against one, a scale per row per
- * `group`. These are the served format names (arch/common/rad_block_moe_fp8.h, kServed and
- * kServed8). Any other dtype returns { 0, 0 } and the description
- * declines rather than guess a grid.
+ * for w4nl64a8h, w5nl64a8h and w6nl64a8h, a quarter for w4nl32a8h. The `a8i8` names are the
+ * four-bit formats against an int8 activation and `i8a8` / `i8a8h` int8 experts against one, a
+ * scale per row per `group`. These are the served format names (arch/common/rad_block_moe_fp8.h,
+ * kServed and kServed8). Any other dtype returns { 0, 0 } and the description declines rather than
+ * guess a grid.
  *
  * The grid matters beyond extents: re-laid weights are inverted into the tensor described here
  * before the oracle reads them (core/runtime/oracle.cpp), so the wrong grid leaves the scales
@@ -2148,7 +2148,7 @@ static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
     if (is("fp8a8") || is("fp8a8f32")) return { g, g };
     if (is("mxfp4a8")) return { 1, 32 };
     if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
-    if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
+    if (is("w4nl64a8h") || is("w5nl64a8h") || is("w6nl64a8h")) return { 1, g / 2 };
     if (is("w4nl32a8h")) return { 1, g / 4 };
     if (is("i8a8") || is("i8a8h") || is("w4a8i8") || is("w4a8i8h")) return { 1, g };
     if (is("w4nl64a8i8h")) return { 1, g / 2 };
@@ -2214,6 +2214,7 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     if (mx) o.t_idx_dt(RAD_U8, { ne1, N1, (K1 + 31) / 32 }, 0, 127, 0);    /* w_odd_scale */
     else    o.t(SD, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });
     o.t(D, { M * k, N });                             /* y -- in sorted order */
+    o.skip();                                         /* split -- optional */
     return o.finish("moe_gemm_q", operand, out);
 }
 
@@ -2259,6 +2260,7 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     cls(2);
     cls(3);
     o.t(D, { M * k, N });                             /* y -- in sorted order */
+    o.skip();                                         /* split -- optional */
     return o.finish("moe_gemm_q_mod4", operand, out);
 }
 
@@ -2287,6 +2289,7 @@ int ref_moe_gemm_w4a8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_I4, { ne1, N1, K1 });              /* w_odd -- odd experts */
     o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / 128 });      /* w_odd_scale */
     o.t((uint32_t)RAD_BF16, { M * k, N });               /* y -- in sorted order */
+    o.skip();                                         /* split -- optional */
     return o.finish("moe_gemm_q", operand, out);
 }
 
@@ -2314,6 +2317,7 @@ int ref_moe_gemm_w4a4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_I4, { ne1, N1, K1 });              /* w_odd -- odd experts */
     o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / 128 });      /* w_odd_scale */
     o.t((uint32_t)RAD_BF16, { M * k, N });               /* y -- in sorted order */
+    o.skip();                                         /* split -- optional */
     return o.finish("moe_gemm_q", operand, out);
 }
 

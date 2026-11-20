@@ -1,5 +1,7 @@
 # Wan 2.2 TI2V-5B port
 
+The hardware measurements below were taken with the earlier secondary-models release. Qualification on the native fleet is pending.
+
 The first target is the single-transformer TI2V-5B model. Both text and
 first-frame conditioning go through `POST /v1/videos`. The result is an
 MP4 with a video track. Soundtrack generation is optional in the existing

@@ -30,6 +30,7 @@ __device__ __forceinline__ float act_of(float g) {
     if (ACT == 0) return g / (1.0f + expf(-g));
     if (ACT == 1) return 0.5f * g * (1.0f + erff(g * 0.70710678118654752f));
     if (ACT == 3) return 1.0f / (1.0f + expf(-g));
+    if (ACT == 5) return fmaxf(g, 0.0f);
     if (ACT == 4)   // quick_gelu: sigmoid of the bf16-rounded 1.702*g, as the unfused mul stores it
         return 1.0f / (1.0f + expf(-bf2f(f32_to_bf16(g * bf2f(f32_to_bf16(1.702f))))));
     return 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
@@ -791,11 +792,11 @@ __global__ __launch_bounds__(kLrThreads) void attn_local_rel_kernel(
 
 // ============================================================== launchers
 
-// act: 0 silu, 1 gelu (erf), 2 gelu_tanh, 3 sigmoid, 4 quick_gelu (sigmoid(bf16(1.702*a))).
+// act: 0 silu, 1 gelu (erf), 2 gelu_tanh, 3 sigmoid, 4 quick_gelu (sigmoid(bf16(1.702*a))), 5 relu.
 extern "C" int halo_act_mul_bf16(long a, long b, long y, int M, int n, int act, int a_ld, int b_ld,
                                 int y_ld, long stream) {
     if (!a || !b || !y) return -1;
-    if (M <= 0 || n <= 0 || act < 0 || act > 4) return -2;
+    if (M <= 0 || n <= 0 || act < 0 || act > 5) return -2;
     const dim3 grid((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M));
 #define HALO_AM(A)                                                                               \
     hipLaunchKernelGGL(act_mul_kernel<A>, grid, dim3(kThreads), 0, (hipStream_t)stream,         \
@@ -805,7 +806,8 @@ extern "C" int halo_act_mul_bf16(long a, long b, long y, int M, int n, int act, 
     else if (act == 1) HALO_AM(1);
     else if (act == 2) HALO_AM(2);
     else if (act == 3) HALO_AM(3);
-    else               HALO_AM(4);
+    else if (act == 4) HALO_AM(4);
+    else               HALO_AM(5);
 #undef HALO_AM
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -817,6 +819,41 @@ extern "C" int halo_seg_mean_bf16(long x, long cu, long y, int S, int n, int x_l
     hipLaunchKernelGGL(seg_mean_kernel, dim3((uint32_t)((n + 31) / 32), (uint32_t)S),
                        dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x,
                        (const int*)cu, (uint16_t*)y, (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+// ---------------------------------------------------------------------------- seg_softmax_pool
+// ref_seg_softmax_pool: row s of y is v's rows [cu[s], cu[s+1]) summed with the softmax of their
+// scores as weights, the softmax in f32 with the maximum subtracted, the sum in f32, one rounding.
+// A workgroup is 256 columns of one segment, and every thread forms the segment's softmax itself:
+// a segment is one question's few options (clef's routing), so the repeat is cheaper than a
+// reduction. An empty segment writes zeros.
+__global__ __launch_bounds__(kThreads) void seg_softmax_pool_kernel(
+    const uint16_t* __restrict__ sc, const uint16_t* __restrict__ v, const int* __restrict__ cu,
+    uint16_t* __restrict__ y, uint32_t n, uint32_t v_ld, uint32_t y_ld) {
+    const uint32_t s = blockIdx.y;
+    const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= n) return;
+    const int b0 = cu[s], b1 = cu[s + 1];
+    float m = -INFINITY;
+    for (int r = b0; r < b1; ++r) m = fmaxf(m, bf2f(sc[r]));
+    float z = 0.0f;
+    for (int r = b0; r < b1; ++r) z += expf(bf2f(sc[r]) - m);
+    float acc = 0.0f;
+    for (int r = b0; r < b1; ++r)
+        acc += expf(bf2f(sc[r]) - m) / z * bf2f(v[(size_t)r * v_ld + i]);
+    y[(size_t)s * y_ld + i] = f32_to_bf16(b1 > b0 ? acc : 0.0f);
+}
+
+extern "C" int halo_seg_softmax_pool_bf16(long sc, long v, long cu, long y, int S, int n, int v_ld,
+                                         int y_ld, long stream) {
+    if (!sc || !v || !cu || !y) return -1;
+    if (S <= 0 || n <= 0) return -2;
+    hipLaunchKernelGGL(seg_softmax_pool_kernel,
+                       dim3((uint32_t)((n + kThreads - 1) / kThreads), (uint32_t)S),
+                       dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)sc,
+                       (const uint16_t*)v, (const int*)cu, (uint16_t*)y, (uint32_t)n,
+                       (uint32_t)v_ld, (uint32_t)y_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1113,6 +1150,7 @@ extern "C" int halo_rad_act_mul(const RadArgs* a, RadStream s) {
     else if (act && !std::strcmp(act, "gelu_tanh")) ai = 2;
     else if (act && !std::strcmp(act, "sigmoid")) ai = 3;
     else if (act && !std::strcmp(act, "quick_gelu")) ai = 4;
+    else if (act && !std::strcmp(act, "relu")) ai = 5;
     if (ai < 0) return HALO_NO(RAD_E_INVAL);
     const long long n = halo_geti_or(a, "n", halo_dim(Y, (int)Y->rank - 1));
     if (n <= 0) return HALO_NO(RAD_E_SHAPE);
@@ -1145,6 +1183,30 @@ extern "C" int halo_rad_seg_mean(const RadArgs* a, RadStream s) {
     if (My < S) return HALO_NO(RAD_E_SHAPE);
     return enc_status(halo_seg_mean_bf16(halo_addr(X), halo_addr(cu), halo_addr(Y), (int)S, (int)n,
                                         (int)x_ld, (int)y_ld, (long)(uintptr_t)s));
+}
+
+extern "C" int halo_rad_seg_softmax_pool(const RadArgs* a, RadStream s) {
+    const RadTensor* Sc = halo_opt(a, 0);
+    const RadTensor* V  = halo_opt(a, 1);
+    const RadTensor* cu = halo_opt(a, 2);
+    const RadTensor* Y  = halo_opt(a, 3);
+    if (!Sc || !V || !cu || !Y) return HALO_NO(RAD_E_INVAL);
+    HALO_NEED(dt_bf16(Sc));
+    HALO_NEED(dt_bf16(V));
+    HALO_NEED(dt_bf16(Y));
+    if (!halo_contig(Sc)) return HALO_NO(RAD_E_STRIDE);
+    if (cu->dtype != RAD_I32 || !halo_contig(cu) || halo_numel(cu) < 2) return HALO_NO(RAD_E_SHAPE);
+    const long long n = halo_geti_or(a, "n", halo_dim(Y, (int)Y->rank - 1));
+    if (n <= 0) return HALO_NO(RAD_E_SHAPE);
+    const long long S = halo_numel(cu) - 1;
+    long long Mv = 0, My = 0;
+    const long long v_ld = halo_rows_pitch(V, n, &Mv);
+    const long long y_ld = halo_rows_pitch(Y, n, &My);
+    if (v_ld < 0 || y_ld < 0) return HALO_NO(RAD_E_STRIDE);
+    if (My < S || halo_numel(Sc) < Mv) return HALO_NO(RAD_E_SHAPE);
+    return enc_status(halo_seg_softmax_pool_bf16(halo_addr(Sc), halo_addr(V), halo_addr(cu),
+                                                halo_addr(Y), (int)S, (int)n, (int)v_ld,
+                                                (int)y_ld, (long)(uintptr_t)s));
 }
 
 /* ------------------------------------------------------------------ qk_norm_rope */

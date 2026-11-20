@@ -21,6 +21,7 @@
 //
 // Returns a RAD status rather than throwing, for the reason given in halo_gemm_fp8a8.hip.
 
+#include "halo_chain.h"
 #include "halo.h"
 #include "halo_args.h"
 #include "halo_emit.h"
@@ -32,7 +33,7 @@ namespace {
 
 constexpr int kThreads = 256;
 
-__global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
+__device__ __forceinline__ void qsa_tail_store_kernel_body(
     const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
     uint16_t* __restrict__ state,
@@ -61,6 +62,19 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     for (int d = (int)threadIdx.x; d < n; d += kThreads) state[dst + d] = k[src + d];
 }
 
+/* qsa_tail_store_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(kThreads)
+void qsa_tail_store_kernel(
+    const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
+    uint16_t* __restrict__ state,
+    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    if (CH::on) halo_chain_wait();
+    qsa_tail_store_kernel_body(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld);
+    if (CH::on) halo_chain_done();
+}
+
 }  // namespace
 
 //   k      [T][n]                bf16, `k_ld` elements a row (0 = n)
@@ -77,7 +91,7 @@ static int halo_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, l
     if (!k_ld) k_ld = n;
     if (!s_row) s_row = n;
     if (!sidx_ld) sidx_ld = 1;
-    return HALO_EMIT(stream, qsa_tail_store_kernel, dim3((unsigned)T), dim3(kThreads), 0,
+    return HALO_EMIT(stream, (halo_chain_flag() ? qsa_tail_store_kernel<r4dchain> : qsa_tail_store_kernel<HaloUnchained>), dim3((unsigned)T), dim3(kThreads), 0,
                     (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu,
                     (const int32_t*)sidx, (uint16_t*)state, T, n, ring, seqs, slots, k_ld, s_slot,
                     s_row, sidx_ld);
@@ -88,6 +102,7 @@ static int halo_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, l
 enum { QT_K = 0, QT_POS = 1, QT_CU = 2, QT_STATE = 3, QT_SIDX = 4 };
 
 extern "C" int halo_rad_qsa_tail_store(const RadArgs* a, RadStream stream) {
+    HaloChainScope halo_chs_(halo_chain_small(a, 64));   /* halo_chain.h */
     const RadTensor* k  = halo_opt(a, QT_K);
     const RadTensor* po = halo_opt(a, QT_POS);
     const RadTensor* cu = halo_opt(a, QT_CU);

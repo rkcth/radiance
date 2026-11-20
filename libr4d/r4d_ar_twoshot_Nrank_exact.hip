@@ -41,6 +41,7 @@
 #include "r4d.h"
 #include "r4d_ar_wide.h"
 #include "r4d_ar_shards.h"
+#include "r4d_ar_arc.h"     // the chunk codec (r4d_arc_enc / r4d_arc_dec), shared with the two-rank fused writes
 #include "r4d_chain.h"
 #include <stdexcept>
 #include <string>
@@ -237,60 +238,6 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
 // two-shot of a 1024-row slice beside the w4a8 prefill GEMM): byte-identical; the reduction 1383
 // us at the plain lane launch (2 x 256) against 996 us coded at 4 x 1024, with the GEMM beside it
 // 746 -> 724 us. Below 1024 threads a launch codes too slowly (2 x 256: 2492 us).
-__device__ __forceinline__ unsigned r4d_arc_shfl(unsigned v, int src) {
-  return (unsigned)__builtin_amdgcn_ds_bpermute(src << 2, (int)v);
-}
-struct R4dArcEnc { unsigned w[3]; unsigned base; };
-// Code this lane's chunk; every lane of the wave calls (a lane past the end with valid false).
-__device__ __forceinline__ R4dArcEnc r4d_arc_enc(int4 v, bool valid) {
-  const unsigned d[4] = {(unsigned)v.x, (unsigned)v.y, (unsigned)v.z, (unsigned)v.w};
-  unsigned emin = 255u, emax = 0u, bad = 0u;
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu;
-    if (e) { emin = e < emin ? e : emin; emax = e > emax ? e : emax; }
-    bad |= (unsigned)(e == 0u && m != 0u) | (unsigned)(e == 255u);
-  }
-  if (!valid) { emin = 255u; emax = 0u; bad = 0u; }
-  const int lane = (int)(threadIdx.x & 31u);
-#pragma unroll
-  for (int s = 1; s < 8; s <<= 1) {
-    const unsigned a = r4d_arc_shfl(emin, lane ^ s), b = r4d_arc_shfl(emax, lane ^ s);
-    const unsigned c = r4d_arc_shfl(bad, lane ^ s);
-    emin = a < emin ? a : emin; emax = b > emax ? b : emax; bad |= c;
-  }
-  R4dArcEnc r;
-  const unsigned base = emin == 255u ? 1u : emin;
-  r.base = (bad || emax > base + 14u) ? 0xFFu : base;
-  unsigned c[8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu, sg = u >> 15;
-    c[i] = (sg << 11) | (m << 4) | (e ? (e - base + 1u) & 15u : 0u);
-  }
-  r.w[0] = c[0] | (c[1] << 12) | (c[2] << 24);
-  r.w[1] = (c[2] >> 8) | (c[3] << 4) | (c[4] << 16) | (c[5] << 28);
-  r.w[2] = (c[5] >> 4) | (c[6] << 8) | (c[7] << 20);
-  return r;
-}
-__device__ __forceinline__ int4 r4d_arc_dec(const unsigned (&w)[3], unsigned base) {
-  unsigned c[8];
-  c[0] = w[0] & 0xfffu; c[1] = (w[0] >> 12) & 0xfffu; c[2] = (w[0] >> 24) | ((w[1] & 0xfu) << 8);
-  c[3] = (w[1] >> 4) & 0xfffu; c[4] = (w[1] >> 16) & 0xfffu; c[5] = (w[1] >> 28) | ((w[2] & 0xffu) << 4);
-  c[6] = (w[2] >> 8) & 0xfffu; c[7] = w[2] >> 20;
-  unsigned u[8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const unsigned off = c[i] & 15u;
-    u[i] = ((c[i] >> 11) << 15) | ((off ? base + off - 1u : 0u) << 7) | ((c[i] >> 4) & 0x7fu);
-  }
-  int4 v;
-  v.x = (int)(u[0] | (u[1] << 16)); v.y = (int)(u[2] | (u[3] << 16));
-  v.z = (int)(u[4] | (u[5] << 16)); v.w = (int)(u[6] | (u[7] << 16));
-  return v;
-}
 struct R4dArcRegion { unsigned* packed; unsigned* bases; int4* shadow; };
 __host__ __device__ constexpr size_t r4d_arc_shadow_off(long SL) {
   return ((size_t)12 * SL + (size_t)SL / 8 + 15) & ~(size_t)15;
@@ -357,7 +304,7 @@ __device__ __forceinline__ void r4d_ar_twoshot_coded_body(
     int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, int n16,
     int slot_stride16, int rank, int drain, int acq, int pub,
     long long* gate, unsigned int* gate_ctr) {
-  if (CHAIN) r4d_chain_wait();
+  if (CHAIN) r4d_chain_wait_vec();
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;

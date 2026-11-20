@@ -15,8 +15,7 @@
 #     conv1d weights, the router, the embedding and the lm_head.
 #
 # Serves at --tp 1 or 2: at 4 the dense layer's 1152-column slice cuts a 256-column scale group.
-# Ling-3.0-flash clamps its SwiGLU in its last layers, which the int8 gated products have no form
-# for, so this recipe's forms do not serve it.
+# Ling-3.0-flash has its own recipe, data/recipes/ling-3.0-flash-iq8r-w4nl64.recipe.
 
 blk.*.attn_qkv.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
 blk.*.attn_forget.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search

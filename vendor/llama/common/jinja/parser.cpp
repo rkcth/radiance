@@ -279,6 +279,10 @@ private:
             size_t pos0 = current;
             ++current; // consume {%
             ++current; // consume 'elif'
+            // RADIANCE: an elif is an if nested in the alternate, parsed by this function calling
+            // itself and executed and destroyed the same way, so a chain counts against the
+            // nesting cap like any other descent.
+            nest_guard nest{ nesting };
             alternate.push_back(parse_if_statement(pos0)); // nested If
         } else if (is_statement({"else"})) {
             ++current; // consume {%

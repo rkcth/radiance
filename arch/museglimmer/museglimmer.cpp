@@ -57,6 +57,7 @@
 #include <arch/rad_block_muse_dflash.h>
 #include <arch/rad_calib_full.h>
 #include <arch/rad_museglimmer_chat.h>
+#include "dflash2.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -120,13 +121,12 @@ struct Model {
     rad_op    op_media_rows = 0;
     MuseTower vit{};
 
-    /* ---- the DFlash drafter (arch/common/rad_block_muse_dflash.h): declared last, only when the
-     * container carries one and the serve asks for drafts. It reads the trunk's residual stream at
-     * `draft.target_layer_ids`, keeps its own KV group, and proposes `block_size - 1` tokens a
-     * pass for the trunk to verify. */
-    bool        have_df = false;
+    /* ---- Meta's DFlash or incoai's DFlash2, selected by draft.architectures. */
+    bool        have_df = false, have_df2 = false;
     MuseDflash  df{};
     MuseDflash::Wire dfw{};
+    Dflash2     df2{};
+    Dflash2::Wire df2w{};
     MuseTaps    taps{};
     rad_kvgroup kv_draft = 0;
 
@@ -653,12 +653,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.media)
         RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer));
 
-    /* ---- the DFlash drafter, declared last: its passes run after the whole trunk's, and the
-     * planner lays lifetimes out in declaration order. */
+    /* ---- the drafter is declared last so its buffers cannot overlap trunk temporaries. */
     if (m.taps.n > 0) {
-        RAD_ARCH_TRY(declare_muse_dflash(&m.df, &m.dfw, &m.kv_draft, b, nm, meta, ctx, g, m.taps,
-                                         (int)g.n_layer, m.w_tok, m.w_lm_head));
-        m.have_df = true;
+        if (muse_draft_is_dflash2(meta)) {
+            RAD_ARCH_TRY(declare_muse_dflash2(&m.df2, &m.df2w, &m.kv_draft, b, nm, meta, ctx, g,
+                                              m.taps, (int)g.n_layer, m.w_tok, m.w_lm_head));
+            m.have_df2 = true;
+        } else {
+            RAD_ARCH_TRY(declare_muse_dflash(&m.df, &m.dfw, &m.kv_draft, b, nm, meta, ctx, g,
+                                             m.taps, (int)g.n_layer, m.w_tok, m.w_lm_head));
+            m.have_df = true;
+        }
     }
 
     /* ---- notes for --debug-graph. */
@@ -703,6 +708,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     /* A draft pass runs only the drafter: >0 the query pass on the staged block, <0 the context
      * pass that projects and stores K/V for the tokens the trunk just committed. */
     if (batch->draft_pass != 0) {
+        if (m.have_df2) {
+            if (batch->draft_pass > 0) m.df2.step(c, batch);
+            else                       m.df2.context(c, batch);
+            return;
+        }
         if (!m.have_df) {
             rad_step_fail(c, "this serve stages a draft pass but the container carries no drafter");
             return;
@@ -738,8 +748,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const int32_t* table = kvb ? kvb->block_table  : nullptr;
         const int32_t* used  = kvb ? kvb->seqused      : nullptr;
 
-        /* -- attention. */
+        /* -- attention. The first Hessian sees the normalized input consumed by q/gate/k/v. */
         RAD_ISSUE(c, l.op_norm, brows(m.b_x, T), RAD_W(l.w_norm), brows(m.b_h, T));
+        if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, T);
         RAD_ISSUE(c, l.op_q,    brows(m.b_h, T), RAD_W(l.w_q),    brows(m.b_q, T));
         RAD_ISSUE(c, l.op_gate, brows(m.b_h, T), RAD_W(l.w_gate), brows(m.b_gate, T));
         RAD_ISSUE(c, l.op_k,    brows(m.b_h, T), RAD_W(l.w_k),    brows(m.b_k, T));
@@ -763,6 +774,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     brows(m.b_attn, T));
         RAD_ISSUE_N(c, l.op_sig, T * m.g.n_head, brows(m.b_gate, T), brows(m.b_gate, T));
         RAD_ISSUE(c, l.op_mul, brows(m.b_attn, T), brows(m.b_gate, T), brows(m.b_attn, T));
+        if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
         RAD_ISSUE(c, l.op_o,   brows(m.b_attn, T), RAD_W(l.w_o),    brows(m.b_h, T));
         if (l.op_ar) RAD_ISSUE_N(c, l.op_ar, T * m.g.n_embd, brows(m.b_h, T), RAD_NONE);
         RAD_ISSUE(c, l.op_post, brows(m.b_h, T), RAD_W(l.w_post), brows(m.b_h, T));
@@ -770,8 +782,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
         /* -- feed-forward. */
         RAD_ISSUE(c, l.op_fnorm, brows(m.b_x, T), RAD_W(l.w_fnorm), brows(m.b_h, T));
+        if (l.cs_mlp >= 0) m.calib.tap(c, (size_t)l.cs_mlp, T);
         RAD_ISSUE(c, l.op_gu,    brows(m.b_h, T), RAD_W(l.w_gate_up), brows(m.b_gu, T));
         RAD_ISSUE(c, l.op_act,   brows(m.b_gu, T), brows(m.b_ffn, T));
+        if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, T);
         RAD_ISSUE(c, l.op_down,  brows(m.b_ffn, T), RAD_W(l.w_down), brows(m.b_h, T));
         if (l.op_far) RAD_ISSUE_N(c, l.op_far, T * m.g.n_embd, brows(m.b_h, T), RAD_NONE);
         RAD_ISSUE(c, l.op_fpost, brows(m.b_h, T), RAD_W(l.w_fpost), brows(m.b_h, T));
@@ -783,6 +797,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.b_h, batch->n_tok));
+    if (m.cs_head >= 0) m.calib.tap(c, (size_t)m.cs_head, T);
     m.calib.after_step(c, T);
 
     /* The lm_head runs only on the rows the sampler asked for; a mid-prompt prefill chunk has
@@ -806,8 +821,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     if (MuseTower::present(meta)) out->enc_merge = 4;
-    /* The drafter denoises `block_size` positions and the anchor row proposes nothing, so the
-     * draft width is block_size - 1. It is trained for that one block, hence fixed. */
+    /* DFlash2 reads block_size from dflash_config; its anchor row proposes nothing. */
+    if (muse_draft_is_dflash2(meta)) {
+        const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 16);
+        out->draft_depth = bs > 1 ? (int)(bs - 1) : 15;
+        out->draft_depth_fixed = 1;
+        return RAD_OK;
+    }
+    /* Meta DFlash denoises `block_size` positions; the anchor proposes nothing. */
     const long long bs = rad_meta_geti(meta, "draft.block_size", 0);
     if (bs > 1) {
         out->draft_depth = (int)(bs - 1);

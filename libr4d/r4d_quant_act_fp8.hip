@@ -56,7 +56,7 @@ __device__ __forceinline__ void quant_act_fp8_body(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
     uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld) {
     static_assert(SUB == 1 || (SUB == 2 && I8), "a 256 group is the int8 quantiser's");
-    if (CHAIN) r4d_chain_wait();
+    if (CHAIN) r4d_chain_wait_vec();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const size_t xrow = (size_t)row * x_ld;

@@ -1133,12 +1133,12 @@ TEST(mc_a_reply_with_no_call_is_just_content) {
  *   report tool support for a template without it.
  */
 
-/* The template is container data and the engine parses and runs it. Both sides of that had no
- * budget: the parser recursed once per nesting paren/block -- tens of KB of brackets in a
- * container's tokenizer.chat_template was an uncatchable stack overflow of the probe or the
- * first render -- and range() materialised one value per step, so {{ range(4000000000) }} was
- * an OOM per render. The budgets refuse; the refusals cross this seam as the error values the
- * block above promises, and templates past any real nesting still render. */
+/* The template is container data and the engine parses and runs it, both under budgets. The
+ * parser recurses once per nested paren or block, so tens of KB of brackets would overflow the
+ * stack of the probe or the first render past every catch, and range() materialises one value
+ * per step, so {{ range(4000000000) }} would exhaust memory on every render. The budgets
+ * refuse; the refusals cross this seam as the error values the block above promises, and
+ * templates far past any real nesting still render. */
 TEST(template_budgets_refuse_as_values_never_as_crashes) {
     json msgs = json::array();
     msgs.push_back({{"role", "user"}, {"content", "x"}});
@@ -1157,24 +1157,32 @@ TEST(template_budgets_refuse_as_values_never_as_crashes) {
     for (int i = 0; i < 5000; ++i) nested += "{% endif %}";
     CHECK(ifs.load(nested, "", "") < 0 || ifs.apply(msgs, json(), opt, &p) < 0);
 
+    /* An elif chain descends once per elif without opening a block of its own. */
+    ChatTemplate elifs;
+    std::string chain = "{% if 0 %}a";
+    for (int i = 0; i < 50000; ++i) chain += "{% elif 0 %}a";
+    chain += "{% endif %}";
+    CHECK(elifs.load(chain, "", "") < 0 || elifs.apply(msgs, json(), opt, &p) < 0);
+
     /* The engine constant-folds at load, so the huge range is refused at load already; the
      * seam's promise is that SOME step refuses with an error value -- same shape as above. */
     ChatTemplate big;
     CHECK(big.load("{{ range(4000000000)|length }}", "", "") < 0 ||
           big.apply(msgs, json(), opt, &p) < 0);
 
-    /* Repetition is range()'s sibling: "x" * 4e9 materialised a byte per step. The cap
-     * refuses at load or at render -- the seam still answers with a value, never memory. */
+    /* Repetition is range()'s sibling: "x" * 4e9 materialises a byte per step. The cap
+     * refuses at load or at render; the seam answers with an error value either way. */
     ChatTemplate rep;
     CHECK(rep.load("{{ 'x' * 4000000000 }}", "", "") < 0 ||
           rep.apply(msgs, json(), opt, &p) < 0);
 
     /* The shape no real template reaches is refused; what real ones do still renders. */
     ChatTemplate sane;
-    CHECK_OK(sane.load("A{{ (((1))) }}{% if 1 %}{% if 1 %}B{% endif %}{% endif %}{{ range(10)|length }}",
+    CHECK_OK(sane.load("A{{ (((1))) }}{% if 1 %}{% if 1 %}B{% endif %}{% endif %}{{ range(10)|length }}"
+                       "{% if 0 %}x{% elif 0 %}y{% elif 1 %}C{% else %}z{% endif %}",
                        "", ""));
     CHECK_OK(sane.apply(msgs, json(), opt, &p));
-    CHECK(p.prompt.find("A1B10") != std::string::npos);
+    CHECK(p.prompt.find("A1B10C") != std::string::npos);
 }
 
 TEST(an_empty_template_is_the_chatml_fallback_and_says_which_one_it_is) {

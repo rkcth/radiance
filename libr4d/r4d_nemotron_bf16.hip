@@ -221,9 +221,10 @@ __global__ __launch_bounds__(32) void attention(const uint16_t* q, const uint16_
       out[(int64_t)(begin + qi) * ol + head * D + t * 16 + h * 8 + e] = f32_to_bf16(acc[t][e]);
 }
 
-// Pixtral's RGB 14x14 patch projection has K=588, outside the existing K%16 GEMMs.
-// Keep the oracle's ordered f32 dot for this small stem: a WMMA reduction can cross a BF16
-// rounding midpoint. No existing GEMM row accepts this geometry, so no old row is replaced.
+// Pixtral's RGB 14x14 patch projection has K=588; Muse Glimmer's temporal-2 stem is 1176.
+// Both sit outside the existing K%16 GEMMs. Keep the oracle's ordered f32 dot for this small
+// stem: a WMMA reduction can cross a BF16 rounding midpoint.
+template <int K>
 __global__ __launch_bounds__(NT) void patch_projection(const uint16_t* a, const uint16_t* w,
                                                        uint16_t* y, int M, int N, int64_t al,
                                                        int64_t wl, int64_t yl) {
@@ -231,7 +232,7 @@ __global__ __launch_bounds__(NT) void patch_projection(const uint16_t* a, const 
   if (n >= N) return;
   for (int64_t r = blockIdx.y; r < M; r += gridDim.y) {
     float sum = 0;
-    for (int d = 0; d < 588; ++d)
+    for (int d = 0; d < K; ++d)
       sum += bf2f(a[r * al + d]) * bf2f(w[(int64_t)n * wl + d]);
     y[r * yl + n] = f32_to_bf16(sum);
   }
@@ -420,13 +421,19 @@ extern "C" int r4d_rad_pixtral_patch(const RadArgs* a, RadStream stream) {
   if (!rad_args_have(a, 3)) return RAD_E_INVAL;
   const auto &x = a->t[0], &w = a->t[1], &y = a->t[2];
   const int64_t M = x.rank == 2 ? x.shape[0] : 0, N = r4d_geti_or(a, "N", 0);
+  const int64_t K = r4d_geti_or(a, "K", 0);
   if (M <= 0 || M > INT_MAX || M > r4d_geti_or(a, "M", 0) || N <= 0 || N > INT_MAX ||
-      r4d_geti_or(a, "K", 0) != 588 || !matrix(x, M, 588) || !matrix(w, N, 588) ||
-      !matrix(y, M, N) || x.stride[1] != 1 || w.stride[1] != 1 || y.stride[1] != 1)
+      (K != 588 && K != 1176) || !matrix(x, M, K) || !matrix(w, N, K) || !matrix(y, M, N) ||
+      x.stride[1] != 1 || w.stride[1] != 1 || y.stride[1] != 1)
     return RAD_E_SHAPE;
-  hipLaunchKernelGGL(patch_projection, dim3((N + NT - 1) / NT, std::min<int64_t>(M, 65535)),
-                     dim3(NT), 0, (hipStream_t)stream, (const uint16_t*)x.data,
-                     (const uint16_t*)w.data, (uint16_t*)y.data, (int)M, (int)N, x.stride[0],
-                     w.stride[0], y.stride[0]);
+  const dim3 grid((unsigned)((N + NT - 1) / NT), (unsigned)std::min<int64_t>(M, 65535));
+  if (K == 588)
+    hipLaunchKernelGGL((patch_projection<588>), grid, dim3(NT), 0, (hipStream_t)stream,
+                       (const uint16_t*)x.data, (const uint16_t*)w.data, (uint16_t*)y.data,
+                       (int)M, (int)N, x.stride[0], w.stride[0], y.stride[0]);
+  else
+    hipLaunchKernelGGL((patch_projection<1176>), grid, dim3(NT), 0, (hipStream_t)stream,
+                       (const uint16_t*)x.data, (const uint16_t*)w.data, (uint16_t*)y.data,
+                       (int)M, (int)N, x.stride[0], w.stride[0], y.stride[0]);
   return finish();
 }

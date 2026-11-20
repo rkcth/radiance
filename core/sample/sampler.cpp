@@ -164,6 +164,7 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
     cfg_ = cfg;
     couple_ = cfg.draft_coupling;
+    trav_ = cfg.draft_coupling && cfg.draft_verify_traversal;
     if (cfg_.n_vocab_local <= 0) cfg_.n_vocab_local = cfg_.n_vocab / cfg_.world_size;
 
     /* The staged mask covers this rank's shard; the grammar's covers the whole vocabulary.
@@ -223,6 +224,10 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         buf_couple_ = decl("sampler.mtp_couple", RAD_U32, rows, RAD_MTP_COUPLE_STATE_WORDS,
                            RAD_BUF_PERSIST);
         if (!buf_couple_) return RAD_E_NOMEM;
+        if (trav_) {
+            buf_trav_ = decl("sampler.mtp_trav", RAD_I32, rows, 2, RAD_BUF_PERSIST);
+            if (!buf_trav_) return RAD_E_NOMEM;
+        }
     }
     buf_cand_i_ = decl("sampler.cand_idx", RAD_I32, rows, ncand, RAD_BUF_TRANSIENT);
     buf_cand_v_ = decl("sampler.cand_val", RAD_F32, rows, ncand, RAD_BUF_TRANSIENT);
@@ -304,8 +309,13 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
             RadParam{ "n_cand", RAD_P_INT, (long long)ncand, 0, nullptr },
             RadParam{ "n_vocab", RAD_P_INT, (long long)cfg_.n_vocab, 0, nullptr },
         };
-        op_couple_ = rad_decl_op(b, "mtp_couple_verify", pc, 3, nullptr, 0);
-        if (!op_couple_) return RAD_E_NOKERNEL;
+        if (trav_) {
+            op_trav_ = rad_decl_op(b, "mtp_trav_verify", pc, 3, nullptr, 0);
+            if (!op_trav_) return RAD_E_NOKERNEL;
+        } else {
+            op_couple_ = rad_decl_op(b, "mtp_couple_verify", pc, 3, nullptr, 0);
+            if (!op_couple_) return RAD_E_NOKERNEL;
+        }
         /* No rad_op_reads: the other sampler ops declare no lists, and a list on this op alone
          * would narrow the candidate planes' lifetime to it and refuse the first sample_topk. */
     }
@@ -391,6 +401,8 @@ int Sampler::stage_alloc() {
     if (couple_)
         couple_stage_ = (RadMtpCoupleState*)rad_dev_alloc(
             rows * (int64_t)sizeof(RadMtpCoupleState), RAD_MEM_HOST_PINNED);
+    if (trav_)
+        trav_stage_ = (int32_t*)rad_dev_alloc(rows * 2 * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED);
 
     /* Logprobs readback; only rank 0 reads it. */
     if (cfg_.rank == 0) {
@@ -407,7 +419,8 @@ int Sampler::stage_alloc() {
     }
 
     if (!params_stage_ || !greedy_stage_ || !late_stage_ || !hist_stage_ || !brk_stage_ ||
-        !ngram_stage_ || !ngram_wl_stage_ || !mask_stage_ || (couple_ && !couple_stage_)) {
+        !ngram_stage_ || !ngram_wl_stage_ || !mask_stage_ || (couple_ && !couple_stage_) ||
+        (trav_ && !trav_stage_)) {
         RAD_ERR("sampler: could not pin %s of staging",
                 humanb(rows * (3 * (int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 5 +
                                mask_words_ * 8 + 8)).c_str());
@@ -428,6 +441,8 @@ void Sampler::stage_free() {
     if (mask_stage_)   rad_dev_free(mask_stage_,   RAD_MEM_HOST_PINNED);
     if (couple_stage_) rad_dev_free(couple_stage_, RAD_MEM_HOST_PINNED);
     couple_stage_ = nullptr;
+    if (trav_stage_) rad_dev_free(trav_stage_, RAD_MEM_HOST_PINNED);
+    trav_stage_ = nullptr;
     if (lp_host_)      rad_dev_free(lp_host_,      RAD_MEM_HOST_PINNED);
     if (lp_ci_host_)   rad_dev_free(lp_ci_host_,   RAD_MEM_HOST_PINNED);
     if (lp_cv_host_)   rad_dev_free(lp_cv_host_,   RAD_MEM_HOST_PINNED);
@@ -790,6 +805,11 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
             think = st->think;
         }
         const ReasoningCount think0 = think;
+        /* --draft-verify block: the chain rows bound from round 1 on, consecutively, are one block
+         * (abi/rad_mtp_block.h); each carries the block's length in `blk` so the verify's round-1
+         * row decides them together. */
+        int64_t blk_row0 = -1;
+        int     blk_len = 0;
 
         for (int k = 0; k < n_pos; ++k) {
             /* Row k's drafts before it: 0..k-1 on a chain, its ancestors (root first) on a tree. */
@@ -822,20 +842,40 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                 think.push(sp.reasoning, r->draft[k - 1]);
             }
             const int64_t row = n_seq_++;
+            /* The traversal verify's tree: this row's parent row in the step (-1 for the
+             * request's first row) and its own draft token. A chain's row k hangs off row k - 1. */
+            if (trav_) {
+                int32_t pk = -1;
+                if (k > 0) {
+                    pk = k - 1;
+                    if (tpar) { const int32_t pj = tpar[k - 1]; if (pj >= 0 && pj < k) pk = pj; }
+                }
+                trav_stage_[2 * row]     = pk < 0 ? -1 : (int32_t)(row - k + pk);
+                trav_stage_[2 * row + 1] = k > 0 && r->draft ? r->draft[k - 1] : 0;
+            }
             /* Row k verifies draft k against the state its round left. A row with no bound state
              * (the bonus row, a greedy row, an uncoupled step) gets a zeroed one, and the verify
              * leaves the pick's token alone. */
             if (couple_) {
                 couple_stage_[row] = RadMtpCoupleState{};
                 const auto sit = seqs_.find(r->id);
-                if (sit != seqs_.end() && !sp.greedy() && r->draft && k + 1 < n_pos &&
-                    k < sit->second.couple_n) {
+                /* A suffix chain (Request::draft_suffix) was not drawn from the head's law: no row of
+                 * it binds a state, so each is the target's plain draw. */
+                if (sit != seqs_.end() && !sp.greedy() && r->draft && !r->draft_suffix &&
+                    k + 1 < n_pos && k < sit->second.couple_n) {
                     const RadMtpCoupleState& c = sit->second.couple[k];
                     /* Same request and seed, this row's round, position and proposed token
                      * (rad_mtp_couple_binds); anything else is a stale state from another step. */
                     if (rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, k, r->draft[k],
                                              cfg_.n_vocab)) {
                         couple_stage_[row] = c;
+                        if (cfg_.draft_verify_block && !tpar) {
+                            if (k == 0) { blk_row0 = row; blk_len = 0; }
+                            if (blk_row0 >= 0 && k == blk_len) {
+                                ++blk_len;
+                                for (int64_t j = blk_row0; j <= row; ++j) couple_stage_[j].blk = blk_len;
+                            }
+                        }
                         any_couple_ = true;
                         ++couple_build_.rows;
                         auto& q = couple_build_.seqs;
@@ -1219,6 +1259,9 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (any_couple_)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_couple_), couple_stage_,
                                  n_seq_ * (int64_t)sizeof(RadMtpCoupleState), s));
+    if (any_couple_ && trav_)
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_trav_), trav_stage_,
+                                 n_seq_ * 2 * (int64_t)sizeof(int32_t), s));
 
     const RadOperand o_logits = opd_rows(logits, n_seq_);
     const RadOperand o_params = opd_rows(buf_params_, n_seq_);
@@ -1317,7 +1360,11 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     /* After the pick, over the same plane: a coupled row replaces the pick's token and an unbound
      * row keeps it. The issued step is recorded for the evidence line. */
     if (any_couple_) {
-        RAD_TRY(issue(op_couple_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok }));
+        if (trav_)
+            RAD_TRY(issue(op_trav_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok,
+                                      opd_rows(buf_trav_, n_seq_) }));
+        else
+            RAD_TRY(issue(op_couple_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok }));
         couple_issued_step_ = couple_build_.step;
     }
 

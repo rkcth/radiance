@@ -164,6 +164,13 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
+    /* --draft-suffix (suffix.h): verifies that carried a suffix chain, the rows they carried and the
+     * drafts accepted; decode steps not issued ahead because the sequence was in a recurring
+     * pattern (where the lookup could run after the commit instead). */
+    int64_t suffix_steps = 0;
+    int64_t suffix_rows = 0;
+    int64_t suffix_accepted = 0;
+    int64_t suffix_held_ahead = 0;
 };
 
 

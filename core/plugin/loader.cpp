@@ -538,7 +538,9 @@ int Registry::commit_(Staged& s, int order) {
         row.collective   = coll != 0;
         row.releases_link = coll == 2;
         row.reference    = kern_ref ? kern_ref(sr.second) != 0 : p.reference;
-        row.chain        = chainable && chainable(sr.second) != 0;
+        const int chains = chainable ? chainable(sr.second) : 0;
+        row.chain        = chains != 0;
+        row.chain_fenced = chains == 2;
         set_->rows.push_back(row);
     }
 

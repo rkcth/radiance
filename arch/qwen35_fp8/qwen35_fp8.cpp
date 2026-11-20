@@ -581,6 +581,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * `model.language_model.layers.N` and its MTP block separately under `mtp.`; subtracting it
      * would drop full-attention layer 63 and silently run a trunk one layer short. */
     m.n_main = g.n_layer;
+    const bool calib_requested = ctx->calib_dir && *ctx->calib_dir;
+    const bool calib_mtp_layer = QWEN35_W8A8 && !QWEN35_MOE && calib_requested && nextn > 0 &&
+        ctx->calib_layer_lo == m.n_main && ctx->calib_layer_hi == m.n_main + 1;
+#if !QWEN35_MOE
+    const bool calib_trunk_layers = calib_requested &&
+        (!ctx->calib_layer_hi || ctx->calib_layer_lo < m.n_main);
+#endif
+    if (calib_requested && !calib_mtp_layer && ctx->calib_layer_hi > m.n_main) {
+        if (nextn > 0)
+            fprintf(stderr, "radiance: qwen35: select only the virtual MTP layer for draft-head "
+                            "calibration on dense qwen35_w8a8\n");
+        else
+            fprintf(stderr, "radiance: qwen35: --calib-layers extends past the trunk, with no MTP "
+                            "layer to calibrate\n");
+        return RAD_E_INVAL;
+    }
 
     /* Qwen3.5's norms are GemmaRMSNorm, `x_hat * (1 + w)` (vLLM imports GemmaRMSNorm as
      * Qwen3_5RMSNorm). This covers input_layernorm, post_attention_layernorm, the final norm and
@@ -1110,12 +1126,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.layers.resize((size_t)m.n_main);
 #if !QWEN35_MOE
     /* GPTQ calibration over the trunk's own int8 codes (rad_calib_full.h, site_i8): one rank, the
-     * serial step. The scratch is the widest input's square, the feed-forward's. */
-    if (ctx->calib_dir && *ctx->calib_dir && g.world > 1) {
-        fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk at --tp 1 only\n");
+     * serial step. MTP-only calibration selects virtual layer n_main and does not touch this tap. */
+    if (calib_trunk_layers && g.world > 1) {
+        fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk at --tp 1 only; "
+                        "select only the MTP layer for replicated-head calibration\n");
         return RAD_E_INVAL;
     }
-    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, 0, std::max<int64_t>(g.n_ff, g.n_embd)));
+    if (calib_trunk_layers)
+        RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, 0,
+                                   std::max<int64_t>(g.n_ff, g.n_embd)));
 #endif
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
@@ -1280,8 +1299,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      *
      * Also only when there is no DFlash2 drafter (`n_taps` == 0): a deployment drafts with one,
      * and DFlash2 (one forward per block rather than one per token) is the better one here. */
-    /* (A vocabulary-weighted head has no output.weight for the draft head to read.) */
-    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0 && !m.n_vcls) {
+    if (calib_mtp_layer && m.n_taps > 0) {
+        fprintf(stderr, "radiance: qwen35: MTP draft-head calibration cannot use a DFlash2 drafter\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    const bool want_mtp = nextn > 0 && (g.max_spec > 0 || calib_mtp_layer) && !m.n_taps;
+    const bool draft_q2 = want_mtp &&
+        mtp_draft_head_q2(b, nm.f("mtp.draft_head.weight"), nm.ckpt("lm_head.weight"));
+    if (calib_mtp_layer && !draft_q2) {
+        fprintf(stderr, "radiance: qwen35: MTP draft-head calibration requires a U2 "
+                        "mtp.draft_head.weight\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    /* A split target has no single output.weight. It can still verify the proposals of an
+     * independent U2 head. Older split-head containers carry neither that head nor the MTP
+     * block, even if the checkpoint metadata advertises NextN. Leave them trunk-only. */
+    if (want_mtp && (m.w_lm_head || draft_q2 || ctx->draft_coupling)) {
+        const int pitch = MtpHead::proposal_pitch(ctx->draft_coupling != 0);
         /* Sized at max_tok, not max_logit_rows: a draft round is one row per sequence, but the
          * history pass that fills the head's own K and V is one row per token over a whole prefill
          * chunk (26 MiB at a 512-token chunk, beside 477 MiB of head weights). */
@@ -1290,19 +1324,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_mtp_c = decl_b(b, nm.f("mtp_c"), g.act_dtype, {g.max_tok, 2 * g.n_embd});
         m.b_mtp_x = decl_b(b, nm.f("mtp_x"), g.act_dtype, {g.max_tok, g.n_embd});
 
-        /* The 2-bit draft head's working set, at max_logit_rows, since only a draft round (one row
-         * per sequence) uses it. `mtp_dsum` is quant_act_i8's group-major
-         * [n_embd/128][ceil(M/16)*16] plane, first dimension the K group, not the token. */
-        if (mtp_draft_head_q2(b, nm.f("mtp.draft_head.weight"), nm.ckpt("lm_head.weight"))) {
-            const int64_t dmpad = ((g.max_logit_rows + 15) / 16) * 16;
-            m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_logit_rows, g.n_embd});
-            m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_logit_rows, 1});
+        /* One row per drafting sequence, even if verification or KLD needs many more target
+         * logits rows. mtp_dsum is quant_act_i8's group-major [n_embd/128][ceil(M/16)*16]. */
+        if (draft_q2 && !calib_mtp_layer) {
+            const int64_t dmpad = ((g.max_seqs + 15) / 16) * 16;
+            m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_seqs, g.n_embd});
+            m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_seqs, 1});
             m.b_mtp_dsum = decl_b(b, nm.f("mtp_dsum"), RAD_F32,  {g.n_embd / 128, dmpad});
-            m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype, {g.max_logit_rows, g.n_vocab_all});
+            m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype, {g.max_seqs, g.n_vocab_all});
             /* A draft round's proposal comes out of row_topk here, never through the sampler's
              * token buffer. */
-            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32,  {g.max_logit_rows, 1});
-            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32,  {g.max_logit_rows, 1});
+            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32, {g.max_seqs, pitch});
+            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32, {g.max_seqs, pitch});
         }
 
         /* The head reuses the trunk's working buffers (`attn_qg`, `attn_k`, the ffn planes, `h`),
@@ -1318,6 +1351,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dq = m.b_mtp_dq; tw.ds = m.b_mtp_ds;  tw.dsum = m.b_mtp_dsum;
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.attn = tw_attn;  tw.mlp = tw_mlp;
+        tw.coupled = !calib_mtp_layer && ctx->draft_coupling != 0;
+        if (calib_mtp_layer) {
+            tw.calib_dir = ctx->calib_dir;
+            tw.calib_tokens = ctx->calib_tokens;
+        }
 
         MtpHead::Src ts{};
         ts.fc                 = nm.ckpt("mtp.fc.weight");
@@ -1349,10 +1387,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ts.mlp.up      = nm.ckpt("mtp.layers.0.mlp.up_proj.weight");
         ts.mlp.down    = nm.ckpt("mtp.layers.0.mlp.down_proj.weight");
 #endif
-        /* The trunk maps this same tensor as `output.weight`; the draft head maps it again under a
-         * name of its own, which the recipe quantises to two bits (mtp_draft_head_q2). */
-        ts.lm          = nm.ckpt("lm_head.weight");
-
         /* Bound as one more layer of the trunk's full-attention group, at absolute index n_main,
          * so a draft round writes its K and V at the slot of the trunk's token for that position.
          * A rejected draft is then overwritten rather than rolled back (rad_block_mtp_fp8.h). */
@@ -1362,15 +1396,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    m.w_lm_head, final_wadd, tw, ts));
         m.have_mtp = true;
 
-        /* Serial drafter: `max_spec` dependent passes, each embedding the last one's proposal.
-         * The 2-bit head writes its own argmax into `mtp_didx`; without it `mtp_didx` is 0 and the
-         * bf16 head goes through the ordinary sampler chain. */
+        /* A U2 drafter writes a greedy or coupled proposal to column zero. The BF16 fallback
+         * uses the ordinary sampler. Calibration carries no projection, proposal or draft depth. */
         RadDrafterDecl dd{};
         dd.name           = "mtp";
-        dd.kind           = RAD_DRAFT_SERIAL;
+        dd.kind           = calib_mtp_layer ? RAD_DRAFT_HISTORY : RAD_DRAFT_SERIAL;
         dd.depth          = ctx->max_spec;
         dd.proposal       = m.b_mtp_didx;
-        dd.proposal_pitch = 1;
+        dd.proposal_pitch = calib_mtp_layer ? 0 : pitch;
         dd.mask_token     = -1;
         RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
     }
@@ -1418,7 +1451,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         rad_note(b, "MTP head: the first of %lld NextN layer(s) under `mtp.`, as absolute layer "
                     "%lld of the full-attention KV group",
                  (long long)nextn, (long long)m.n_main);
-    else if (nextn > 0)
+    else if (want_mtp && m.n_vcls)
+        rad_note(b, "no native MTP: this split-head container has no independent U2 draft head");
+    else if (nextn > 0 && !m.have_df)
         rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not loaded: this deployment "
                     "does not speculate", (long long)nextn);
 

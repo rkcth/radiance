@@ -279,6 +279,8 @@ public:
     int run();
 
 private:
+    friend struct FleetHostFillTestAccess;
+    friend struct FleetMemoryTestAccess;
     struct Model;
 
     /* The broker one load hands its engine: the fleet's grant, for that model. */
@@ -287,10 +289,7 @@ private:
         Model* m = nullptr;
         int grant(const VramAsk& ask, int64_t* g, std::string* why) override { return f->grant(*m, ask, g, why); }
         bool host_room(int64_t bytes) override {
-            if (!f->load_host_room(*m, bytes)) return false;
-            m->pools_held.fetch_add(bytes);
-            f->host_reserve_.fetch_add(bytes);
-            return true;
+            return f->load_host_room(*m, bytes, 0, /*reserve=*/true);
         }
         bool host_pools_room() override {
             const int64_t own = m->pools_held.load();
@@ -432,7 +431,7 @@ private:
      * coming back costs it, within [5 s, 30 s]. */
     bool   in_quantum(const Model& m, const server::Front::Activity& a, uint64_t now) const;
     bool   take_from(Model& victim, const std::map<int, int64_t>& want, const std::string& why);
-    void   unload(Model& m, int64_t drain_ms, const std::string& why);
+    bool   unload(Model& m, int64_t drain_ms, const std::string& why);
     /* 1 when `want` left, 0 when less could leave (nothing more to page out), -1 when the model
      * should unload instead (a park would cost more than its reload) or the park failed. */
     int    park(Model& m, const std::map<int, int64_t>& want, const std::string& why);
@@ -445,7 +444,7 @@ private:
                           bool take_busy = false, int64_t own = 0, bool evict = true);
     /* Parked models give back their snapshot stores, in `parked` order, until `need` is free. */
     bool   release_spares(const std::vector<Model*>& parked, int64_t need);
-    bool   load_host_room(Model& m, int64_t need, int64_t own = 0);
+    bool   load_host_room(Model& m, int64_t need, int64_t own = 0, bool reserve = false);
     bool   loading_beside(const Model& m);
     bool   alone_on_host(const Model& m);
     int64_t host_held();
@@ -463,9 +462,14 @@ private:
 
     void   fail(Model& m, const std::string& why);
     bool   choose_cards(Model& m, const Config& cfg, std::vector<int>* out, std::string* why);
+    /* The cards `m` may be placed on: its own list (models.NAME.cards), else the fleet's. */
+    const std::vector<int>& cards_of(const Model& m) const {
+        return m.entry.cards.empty() ? cards_ : m.entry.cards;
+    }
     std::vector<CardRoom> rooms();
     /* The bytes a model may still claim on `card`: free past the headroom and what is pending. */
     int64_t room_on(int card);
+    int64_t headroom_on(int card) const;
     int64_t pending_on(int card);
     /* rooms() covers `need` on every card in it, without anything leaving. */
     bool   fits_free(const std::map<int, int64_t>& need);
@@ -485,6 +489,8 @@ private:
     void   history_loop();
     json   placement(const std::string& name);
     std::string describe(const std::string& name);
+    /* Adapters a resident model serves from memory: the names /v1/models lists as its cards. */
+    std::vector<std::string> adapters_of(const std::string& name);
     std::string metrics();
     std::vector<std::string> group_partners(const std::string& name, Group::Kind kind) const;
     void   keep_partners(const Model& m, std::vector<Resident>* res) const;
@@ -587,8 +593,15 @@ int64_t Fleet::pending_on(int card) {
     return n;
 }
 
+/* What a card keeps free: its own reserve where memory.card-headroom-mib names it, else the
+ * headroom every card keeps. */
+int64_t Fleet::headroom_on(int card) const {
+    const auto it = fc_.card_headroom_mib.find(card);
+    return it == fc_.card_headroom_mib.end() ? headroom_ : it->second * kMiB;
+}
+
 int64_t Fleet::room_on(int card) {
-    return std::max<int64_t>(free_on(card) - headroom_ - pending_on(card), 0);
+    return std::max<int64_t>(free_on(card) - headroom_on(card) - pending_on(card), 0);
 }
 
 std::vector<CardRoom> Fleet::rooms() {
@@ -712,27 +725,33 @@ std::vector<size_t> Fleet::exclusive_victims(const Model& m) {
 
 bool Fleet::choose_cards(Model& m, const Config& cfg, std::vector<int>* out, std::string* why) {
     const int tp = std::max(cfg.tp, 1);
-    if (tp > (int)cards_.size()) {
+    const std::vector<int>& may = cards_of(m);
+    if (tp > (int)may.size()) {
         *why = "tp " + std::to_string(tp) + " needs " + std::to_string(tp) + " cards; " +
-               std::to_string(cards_.size()) + " are available";
+               std::to_string(may.size()) + " are available";
         return false;
     }
     if (!use_broker()) {
-        out->assign(cards_.begin(), cards_.begin() + tp);
+        out->assign(may.begin(), may.begin() + tp);
         return true;
     }
+    /* The room plan and the fallback below see only the cards this model may use, so a model
+     * with its own list is never planned onto another card, whatever room that card has. */
+    std::vector<CardRoom> open;
+    for (const CardRoom& c : rooms())
+        if (std::find(may.begin(), may.end(), c.card) != may.end()) open.push_back(c);
     const int64_t guess = first_guess(m.claim, cfg);
     std::vector<Resident> res = residents(&m);
     keep_partners(m, &res);
     RoomPlan plan;
     std::string w;
-    if (plan_room(rooms(), res, tp, guess, m.entry.priority, exclusive_victims(m), m.last_cards,
+    if (plan_room(open, res, tp, guess, m.entry.priority, exclusive_victims(m), m.last_cards,
                   nullptr, &plan, &w)) {
         *out = plan.cards;
         return true;
     }
     std::vector<std::pair<int64_t, int>> by;
-    for (const CardRoom& c : rooms()) {
+    for (const CardRoom& c : open) {
         int64_t room = c.free;
         for (const Resident& r : res)
             if (!r.pin && !r.keep && r.priority <= m.entry.priority) room += r.gives(c.card);
@@ -755,9 +774,9 @@ int64_t Fleet::flex_room(const std::vector<int>& cards) {
         for (auto& m : models_)
             if (m->waiting.load(std::memory_order_acquire)) return 0;
     }
-    const int64_t margin = headroom_ + 512 * kMiB;
     int64_t room = INT64_MAX;
-    for (int c : cards) room = std::min(room, free_on(c) - margin - pending_on(c));
+    for (int c : cards)
+        room = std::min(room, free_on(c) - (headroom_on(c) + 512 * kMiB) - pending_on(c));
     return room == INT64_MAX ? 0 : std::max<int64_t>(room, 0);
 }
 
@@ -907,6 +926,11 @@ void Fleet::reclaim_flex(const Model& m, const std::map<int, int64_t>& need) {
             if (sh <= 0) break;
             const bool preempt = !experts && o->entry.priority < m.entry.priority;
             const int64_t got = o->engine->flex_release(sh, preempt, 10000, /*kv=*/!experts);
+            if (got < 0) {
+                RAD_WARN("model %s: flex recall failed; no released memory is credited: %s",
+                         o->entry.name.c_str(), rad_strerror((int)got));
+                continue;
+            }
             if (got > 0)
                 RAD_INFO("model %s: gave back %s of its %s flex for %s", o->entry.name.c_str(),
                          humanb(got).c_str(), experts ? "experts'" : "cache's", m.entry.name.c_str());
@@ -1142,8 +1166,7 @@ bool Fleet::take_from(Model& victim, const std::map<int, int64_t>& want, const s
     /* Short: what is left of it on the card is not pageable; make_room unloads a parked model
      * only as the last resort, so it keeps its copy. */
     if (r == 0) return false;
-    unload(victim, fc_.drain_timeout_ms, why);
-    return true;
+    return unload(victim, fc_.drain_timeout_ms, why);
 }
 
 int Fleet::park(Model& m, const std::map<int, int64_t>& want, const std::string& why) {
@@ -1240,10 +1263,16 @@ int Fleet::park(Model& m, const std::map<int, int64_t>& want, const std::string&
     return short_of ? 0 : 1;
 }
 
-void Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
+bool Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
     std::lock_guard<std::recursive_mutex> room(room_mu_);
     join_spill(m);
-    if (!m.engine) return;
+    if (!m.engine) return true;
+    if (m.engine->memory_fence_status() < 0 && !m.engine->stopping() &&
+        m.engine->retry_memory_fence() < 0) {
+        RAD_ERR("model %s: unload refused: a failed device fence still protects its memory",
+                m.entry.name.c_str());
+        return false;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     RAD_INFO("model %s: unloading: %s", m.entry.name.c_str(), why.c_str());
     std::map<int, int64_t> before;
@@ -1260,6 +1289,13 @@ void Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
     }
     m.engine->request_stop(drain_ms);
     if (m.serve.joinable()) m.serve.join();
+    if (m.engine->prepare_unload() < 0) {
+        /* All producers are joined, but the device can still read the allocations. Keeping
+         * this process serving other engines would conceal a terminal device failure. */
+        front_.fail(m.entry.name, "device streams did not drain during unload", 15000);
+        fatal("model %s: refusing unsafe unload after producer shutdown; exiting for restart",
+              m.entry.name.c_str());
+    }
     std::shared_ptr<Engine> gone;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1283,6 +1319,7 @@ void Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
     for (int c : was_on)
         if (card_quiet(c, &m)) (void)dev_stream_trim(c, kReserveQueues);
     RAD_INFO("model %s: unloaded in %.2f s", m.entry.name.c_str(), secs_since(t0));
+    return true;
 }
 
 void Fleet::join_spill(Model& m) {
@@ -1424,11 +1461,21 @@ bool Fleet::alone_on_host(const Model& m) {
 
 /* Room to pin `need` during a load. As in the load's first wait, beside another load in flight
  * parked and idle models go only after ten seconds, once a load counted twice has passed. */
-bool Fleet::load_host_room(Model& m, int64_t need, int64_t own) {
+bool Fleet::load_host_room(Model& m, int64_t need, int64_t own, bool reserve) {
+    // A new pool must reserve the room in the same critical section that found it. A check
+    // of already reserved pools (own) does not count them a second time.
+    auto commit_reservation = [&] {
+        if (!reserve) return;
+        m.pools_held.fetch_add(need);
+        host_reserve_.fetch_add(need);
+    };
     {
         /* There already: a warm-up needs no budget for a pin that leaves the host its floor. */
         std::lock_guard<std::recursive_mutex> room(room_mu_);
-        if (host_available() - host_reserve_.load() + own - kHostFloor >= need) return true;
+        if (host_available() - host_reserve_.load() + own - kHostFloor >= need) {
+            commit_reservation();
+            return true;
+        }
     }
     /* Before its grant a load holds a guess of VRAM, which what pins this memory may be waiting
      * for (a parked model coming back): they would wait for each other. The guess goes while it
@@ -1450,8 +1497,12 @@ bool Fleet::load_host_room(Model& m, int64_t need, int64_t own) {
         /* As in load_op: without a load in flight beside this one the figure is exact, and parked
          * and idle models give their host memory at once. */
         const bool exact = !warm && !loading_beside(m);
-        ok = make_host_room(need, &m, !warm, !warm && (exact || i >= 50),
-                            !warm && (i >= 150 || (exact && i >= 10)), own);
+        {
+            std::lock_guard<std::recursive_mutex> room(room_mu_);
+            ok = make_host_room(need, &m, !warm, !warm && (exact || i >= 50),
+                                !warm && (i >= 150 || (exact && i >= 10)), own);
+            if (ok) commit_reservation();
+        }
         if (ok || i + 1 >= tries) break;
         if (i == 0)
             RAD_INFO("model %s: waiting for %s of host memory to pin (%s available, %s of it kept "
@@ -1688,6 +1739,9 @@ void Fleet::park_op(Model& m, const std::string& why) {
  * copies of copies: make_host_room lets them go first. */
 void Fleet::fill_op(Model& m) {
     if (!m.engine || !m.parked) return;
+    // Size and reserve the fill together with parks and load reservations. The transfer itself
+    // runs without room_mu_: a slow drive must not hold up another model's room decision.
+    std::unique_lock<std::recursive_mutex> room_lock(room_mu_);
     /* A GiB at a time: a restore asked for meanwhile waits for one batch at most. */
     constexpr int64_t kBatch = (int64_t)1 << 30;
     if (host_room() - kFillSlack - Engine::kRefillHost < kBatch) {
@@ -1705,8 +1759,20 @@ void Fleet::fill_op(Model& m) {
         fill_wait_ns_.store(rad_mono_ns() + 5000000000ull);
         return;
     }
+    const int64_t budget = std::min(room, kBatch);
+    const int64_t reserved = budget + Engine::kRefillHost;
+    host_reserve_.fetch_add(reserved);
+    room_lock.unlock();
     const auto t0 = std::chrono::steady_clock::now();
-    const int64_t n = m.engine->fill_host(std::min(room, kBatch));
+    int64_t n;
+    {
+        struct FillReservation {
+            std::atomic<int64_t>& total;
+            int64_t bytes;
+            ~FillReservation() { total.fetch_sub(bytes); }
+        } hold{ host_reserve_, reserved };
+        n = m.engine->fill_host(budget);
+    }
     if (n < 0) {
         RAD_WARN("model %s: reading its parked copy into host memory failed: %s", m.entry.name.c_str(),
                  rad_dev_last_error());
@@ -1749,7 +1815,7 @@ void Fleet::restore_op(Model& m) {
     std::string why;
     /* A parked model comes back on its own cards. A fresh load could pick others, but needs as
      * much room; it is worth it only where other cards exist, and only after a while. */
-    const bool elsewhere = (int)cards_.size() > (int)m.cards.size();
+    const bool elsewhere = (int)cards_of(m).size() > (int)m.cards.size();
     std::unique_lock<std::recursive_mutex> room(room_mu_, std::defer_lock);
     int rrc = RAD_OK;
     bool yielded = false;
@@ -1782,7 +1848,10 @@ void Fleet::restore_op(Model& m) {
     if (rrc < 0) {
         RAD_INFO("model %s: no room to come back on card(s) %s (%s); it loads fresh",
                  m.entry.name.c_str(), cards_str(m.cards).c_str(), why.c_str());
-        unload(m, 0, "it could not come back on its cards");
+        if (!unload(m, 0, "it could not come back on its cards")) {
+            front_.fail(m.entry.name, "device fence prevents restore reload", 15000);
+            return;
+        }
         room.unlock();
         load_op(m);
         return;
@@ -1804,7 +1873,10 @@ void Fleet::restore_op(Model& m) {
     host_reserve_.fetch_sub(Engine::kRefillHost);
     if (urc < 0) {
         RAD_ERR("model %s: could not come back: %s", m.entry.name.c_str(), w.c_str());
-        unload(m, 0, "it could not come back");
+        if (!unload(m, 0, "it could not come back")) {
+            front_.fail(m.entry.name, "device fence prevents restore reload", 15000);
+            return;
+        }
         room.unlock();
         load_op(m);
         return;
@@ -2139,7 +2211,15 @@ void Fleet::fill_tick() {
             best_used = used;
         }
     }
-    if (best) (void)start_op(*best, kFill);
+    if (best) {
+        /* Optional warming commits host mappings and submits copies. Do not start another batch
+         * while a response holds any engine: "quiet" above excludes pending lifecycle work,
+         * not active serving. A request arriving after this check may overlap the current batch;
+         * the next batch waits for it. Demand-driven restore is unaffected. */
+        for (const auto& model : models_)
+            if (front_.activity(model->entry.name).leases > 0) return;
+        (void)start_op(*best, kFill);
+    }
 }
 
 /* A live restore's rest that found no device memory (an allocation of another model's took it
@@ -2278,6 +2358,15 @@ std::string Fleet::reload() {
     if (a.host != b.host || a.port != b.port || a.api_key != b.api_key ||
         a.http_threads != b.http_threads || a.cors != b.cors || nf.cards != fc_.cards)
         return "server: and cards: changes need a restart";
+    for (const ModelEntry& e : nf.models)
+        for (int c : e.cards)
+            if (std::find(cards_.begin(), cards_.end(), c) == cards_.end())
+                return "models." + e.name + ": cards lists " + std::to_string(c) +
+                       ", which is not a usable card here";
+    for (const auto& [c, mib] : nf.card_headroom_mib)
+        if (std::find(cards_.begin(), cards_.end(), c) == cards_.end())
+            return "memory.card-headroom-mib names card " + std::to_string(c) +
+                   ", which is not a card this fleet uses";
     if (nf.log_set) log_set_level(nf.log);
     /* Work in flight finishes first. */
     for (auto& m : models_) {
@@ -2289,7 +2378,8 @@ std::string Fleet::reload() {
     for (size_t i = 0; i < models_.size();) {
         Model& m = *models_[i];
         if (std::find(keep.begin(), keep.end(), m.entry.name) != keep.end()) { ++i; continue; }
-        unload(m, fc_.drain_timeout_ms, "removed from the file");
+        if (!unload(m, fc_.drain_timeout_ms, "removed from the file"))
+            return "model " + m.entry.name + ": device fence prevents removal";
         front_.remove(m.entry.name);
         history_.forget(m.entry.name);
         RAD_INFO("model %s: removed", m.entry.name.c_str());
@@ -2310,8 +2400,9 @@ std::string Fleet::reload() {
             RAD_INFO("model %s: added", e.name.c_str());
             continue;
         }
-        if (m->entry.args != e.args) {
-            unload(*m, fc_.drain_timeout_ms, "its configuration changed");
+        if (m->entry.args != e.args || m->entry.cards != e.cards) {
+            if (!unload(*m, fc_.drain_timeout_ms, "its configuration changed"))
+                return "model " + m->entry.name + ": device fence prevents reconfiguration";
             RAD_INFO("model %s: reconfigured", e.name.c_str());
             std::lock_guard<std::mutex> lk(mu_);
             m->claim = 0;
@@ -2386,6 +2477,15 @@ std::string Fleet::describe(const std::string& name) {
         return j.dump();
     }
     return "{}";
+}
+
+/* The adapter names a resident model serves from memory. A parked or loading engine serves none
+ * through this name: nothing answers a request to a child while the parent is not open. */
+std::vector<std::string> Fleet::adapters_of(const std::string& name) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& mp : models_)
+        if (mp->entry.name == name && mp->resident && mp->engine) return mp->engine->lora_names();
+    return {};
 }
 
 /* What /admin/fleet says beyond describe(), which also feeds every /v1/models card: where the
@@ -2487,6 +2587,9 @@ void Fleet::history_loop() {
     using clock = std::chrono::steady_clock;
     auto next_row = clock::now();
     std::set<std::string> open;   /* the models that had a row since they last opened */
+    /* The adapter children sampled under each model's name, so that their series close with the
+     * model and a child no longer served is dropped. */
+    std::map<std::string, std::set<std::string>> kids;
     while (!g_stop.load() && !front_.stopping()) {
         const double t = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
         const bool watched = history_.watched(3.0);
@@ -2499,7 +2602,10 @@ void Fleet::history_loop() {
         for (const std::string& n : front_.names()) {
             const bool is_open = front_.activity(n).state == server::Front::State::Open;
             if (!is_open) {
-                if (open.erase(n) || row) history_.model_closed(n);
+                if (open.erase(n) || row) {
+                    history_.model_closed(n);
+                    for (const std::string& c : kids[n]) history_.model_closed(c);
+                }
                 continue;
             }
             const bool first = !open.count(n);
@@ -2508,6 +2614,16 @@ void Fleet::history_loop() {
             if (body.empty()) continue;
             const json s = json::parse(body, nullptr, false);
             if (!s.is_object()) continue;
+            /* status() lists each adapter of this model as a child; a child owns no engine, and
+             * the parent's stats are exactly what a request to the child runs on -- the same
+             * tokens, the same queue, the same seconds. Sample the child under its own name with
+             * the parent's body so the child's charts draw what its name actually drives. */
+            std::set<std::string> now;
+            for (const std::string& a : adapters_of(n)) now.insert(n + ":" + a);
+            for (const std::string& c : kids[n])
+                if (!now.count(c)) history_.forget(c);
+            for (const std::string& c : now) history_.model_sample(c, s, t, body);
+            kids[n] = std::move(now);
             history_.model_sample(n, s, t, std::move(body));
             open.insert(n);
         }
@@ -2540,6 +2656,21 @@ json Fleet::status() {
         if (j.contains("waiting_for") && a.state != server::Front::State::Open) j["state"] = "waiting";
         if (const std::string caps = front_.capabilities(n); !caps.empty()) j["capabilities"] = json::parse(caps, nullptr, false);
         models.push_back(j);
+        /* Runtime LoRA: an adapter is a model as far as choosing one goes, and /v1/models lists
+         * each as a child under `base:adapter` (server.cpp). The fleet view must say the same,
+         * or a view built on it is blind to what this machine answers to. A child owns nothing:
+         * no cards, no bytes, no policy of its own; its state and counters are the parent's,
+         * because the parent is what serves it. */
+        for (const std::string& a : adapters_of(n)) {
+            json ad;
+            ad["id"]        = n + ":" + a;
+            ad["parent"]    = n;
+            ad["adapter"]   = true;
+            ad["state"]     = j["state"];
+            ad["in_flight"] = j["in_flight"];
+            ad["waiting"]   = j["waiting"];
+            models.push_back(std::move(ad));
+        }
     }
     json cards = json::array();
     for (int c : cards_) {
@@ -2614,15 +2745,15 @@ void Fleet::add_routes() {
      * its finished requests and, as `live`, its latest /stats object; without it the fleet's, with
      * /admin/fleet's object as `live`. `since` (unix seconds) asks for what came after. Every byte
      * comes from the sampler's last read, so a page that polls this reads nothing of the engine:
-     * it neither brings a model back nor costs a running one anything. Both shapes are dashboard
-     * telemetry -- per-model figures name their model and its activity -- so the guard runs
-     * before EITHER answer, exactly like the routes below. */
+     * it neither brings a model back nor costs a running one anything. A model's history is as
+     * open as its /stats, whose figures it repeats, and the fleet's as guarded as /admin/fleet:
+     * a browser the fleet view is refused to still draws the server's own model from it. */
     front_.route("GET", "/history", [this, guard, ok](const server::HttpRequest& q) {
-        if (auto g = guard(q)) return *g;
         double since = 0;
         if (auto it = q.query.find("since"); it != q.query.end()) since = std::strtod(it->second.c_str(), nullptr);
         if (auto it = q.query.find("model"); it != q.query.end() && !it->second.empty())
             return server::HttpResponse::json_body(200, history_.model_body(it->second, since));
+        if (auto g = guard(q)) return *g;
         return server::HttpResponse::json_body(200, history_.fleet_body(since));
     });
     /* A command run by the scheduler thread, its answer awaited. */
@@ -2671,7 +2802,10 @@ void Fleet::add_routes() {
                 int expect = kIdle;
                 if (!m->op.compare_exchange_strong(expect, unl ? kUnload : kEvict)) return std::string("busy");
                 std::string res;
-                if (unl) unload(*m, fc_.drain_timeout_ms, "asked by the admin route");
+                if (unl) {
+                    if (!unload(*m, fc_.drain_timeout_ms, "asked by the admin route"))
+                        res = "device fence prevents unload; memory remains owned";
+                }
                 else if (!m->parked && park(*m, {}, "asked by the admin route") < 0) res = "could not park (see the log)";
                 m->op.store(kIdle);
                 return res;
@@ -2788,12 +2922,28 @@ int Fleet::run() {
             cards_.push_back(c);
         }
     }
-    for (const ModelEntry& e : fc_.models)
-        if (std::max(e.cfg.tp, 1) > (int)cards_.size()) {
-            RAD_ERR("models.%s: tp %d needs %d cards; %zu are available", e.name.c_str(), e.cfg.tp,
-                    e.cfg.tp, cards_.size());
+    for (const auto& [c, mib] : fc_.card_headroom_mib) {
+        if (std::find(cards_.begin(), cards_.end(), c) == cards_.end()) {
+            RAD_ERR("%s: memory.card-headroom-mib names card %d, which is not a card this fleet "
+                    "uses", fc_.path.c_str(), c);
             return 2;
         }
+        RAD_INFO("fleet: card %d keeps %lld MiB free (memory.card-headroom-mib)", c, (long long)mib);
+    }
+    for (const ModelEntry& e : fc_.models) {
+        for (int c : e.cards)
+            if (std::find(cards_.begin(), cards_.end(), c) == cards_.end()) {
+                RAD_ERR("models.%s: cards lists %d, which is not a usable card here",
+                        e.name.c_str(), c);
+                return 2;
+            }
+        const size_t have = e.cards.empty() ? cards_.size() : e.cards.size();
+        if (std::max(e.cfg.tp, 1) > (int)have) {
+            RAD_ERR("models.%s: tp %d needs %d cards; %zu are available", e.name.c_str(), e.cfg.tp,
+                    e.cfg.tp, have);
+            return 2;
+        }
+    }
 
     /* Park files a process that died left in the disk tier: radiance-park-PID-N.bin (pageable
      * chunks) and radiance-vmem-PID-N.bin (elastic ranges) of a PID that no longer runs. */

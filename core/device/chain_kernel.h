@@ -37,6 +37,11 @@ __device__ __forceinline__ void rad_chain_wait() {
             __builtin_amdgcn_s_sleep(1);
     __syncthreads();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    /* The fence empties the vector caches. A load every lane shares may be a scalar one, and the
+     * scalar data cache still holds what a launch read from the address before the launch in front
+     * of this one wrote it: only the packet processor's acquire empties that cache, and it runs
+     * when the kernel is launched, before the launch in front has written. */
+    asm volatile("s_dcache_inv" ::: "memory");
 }
 
 __device__ __forceinline__ void rad_chain_done() {

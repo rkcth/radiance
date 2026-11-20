@@ -97,12 +97,7 @@ TEST(a_chunked_request_vocodes_each_chunk_as_its_frames_are_made) {
     std::string why;
     auto r = f.req(3.0f);
     auto t = r->ticket;
-    CHECK(!f.drv.busy());
-    r->dispatch_hold = std::make_shared<int>(0);
-    const std::weak_ptr<void> dispatch_hold = r->dispatch_hold;
     CHECK_OK(f.drv.submit(std::move(r), &why));
-    CHECK(f.drv.busy());
-    CHECK(!dispatch_hold.expired());
     std::string kinds;
     std::vector<std::vector<int32_t>> voc;   /* frame0, frames, left per VOCODE */
     float next_sample = 0.0f;
@@ -110,7 +105,6 @@ TEST(a_chunked_request_vocodes_each_chunk_as_its_frames_are_made) {
     for (int i = 0; i < 20; ++i) {
         const RadBatch* b = f.drv.next(i);
         if (!b) break;
-        CHECK(f.drv.busy());
         const RadAudioGenBatch* A = b->agen_b;
         REQUIRE(A != nullptr);
         switch (b->gen) {
@@ -136,11 +130,7 @@ TEST(a_chunked_request_vocodes_each_chunk_as_its_frames_are_made) {
         if (b->gen == RAD_GEN_PASS_VOCODE)
             next_sample += (float)((A->voc_latents - A->voc_left) * 4);
         CHECK_OK(f.drv.done());
-        CHECK(f.drv.busy());
-        CHECK(!dispatch_hold.expired());
     }
-    CHECK(!f.drv.busy());
-    CHECK(dispatch_hold.expired());
     CHECK_EQ(kinds, std::string("PFFVFFVFV"));
     REQUIRE_EQ(voc.size(), (size_t)3);
     CHECK(voc[0] == std::vector<int32_t>({ 0, 2, 0 }));   /* frames 0, 1 */

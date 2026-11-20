@@ -51,8 +51,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.arena      = std::max(b.arena, f.arena);
         b.staging    = std::max(b.staging, f.staging);
         b.prefetch   = std::max(b.prefetch, f.prefetch);
-        if ((int64_t)f.n_queues * f.queue_bytes > b.queues) {
-            b.queues      = (int64_t)f.n_queues * f.queue_bytes;
+        if ((int64_t)f.n_queues * f.queue_bytes + f.queue_scratch > b.queues) {
+            b.queues      = (int64_t)f.n_queues * f.queue_bytes + f.queue_scratch;
             b.n_queues    = f.n_queues;
             b.queue_bytes = f.queue_bytes;
         }
@@ -168,7 +168,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  --gpu-headroom-mib %10s\n"
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
             "  step staging       %10s   (block tables, media and KV tier staging)\n"
-            "  hardware queues    %10s   (%d at %s each, measured)\n"
+            "  hardware queues    %10s   (%d at %s each, measured, + resident queue scratch)\n"
             "  expert prefetch    %10s   (its ring of expert units and buffers)\n"
             "  ------------------------------\n"
             "  short by           %10s\n"
@@ -461,7 +461,7 @@ void vram_budget_need(const std::vector<VramFacts>& per_rank, int64_t* need, int
         arena = std::max(arena, f.arena);
         staging = std::max(staging, f.staging);
         prefetch = std::max(prefetch, f.prefetch);
-        queues = std::max(queues, (int64_t)f.n_queues * f.queue_bytes);
+        queues = std::max(queues, (int64_t)f.n_queues * f.queue_bytes + f.queue_scratch);
         statics = std::max(statics, f.statics);
         floor = std::max(floor, f.expert_floor);
         kv_one = std::max(kv_one, f.kv_one);

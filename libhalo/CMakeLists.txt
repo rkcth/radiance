@@ -43,12 +43,15 @@ set(HALO_UNITS
   "halo_ar_twoshot_Nrank_exact|"
   "halo_ar_twoshot_Nrank_ti8|"
   "halo_attn_dense_bf16|"
+  "halo_attn_dense_f32|"
   "halo_attn_gen|"
   "halo_attn_paged_gqa8|"
   "halo_attn_paged_h128_gqa1|"
+  "halo_attn_paged_h128_gqa16|"
   "halo_attn_paged_h128_gqa2|"
   "halo_attn_paged_h128_gqa2w|"
   "halo_attn_paged_h128_gqa4|"
+  "halo_attn_paged_h128_gqa7|"
   "halo_attn_paged_h256_gqa12|"
   "halo_attn_paged_h256_gqa2|"
   "halo_attn_paged_h256_gqa4|"
@@ -61,7 +64,9 @@ set(HALO_UNITS
   "halo_conv_t1d|"
   "halo_dequant_w4_bf16|"
   "halo_dflash_conv_t2_g16_bf16|"
+  "halo_dflash_markov_bf16|"
   "halo_dflash_select_bf16|"
+  "halo_dflash_tree_bf16|"
   "halo_dsa|"
   "halo_encoder_bf16|"
   "halo_expert_scale_bf16|"
@@ -81,6 +86,7 @@ set(HALO_UNITS
   "halo_gemm_fp8_f32scale|"
   "halo_gemm_fp8a16_m1|"
   "halo_gemm_fp8a8|"
+  "halo_gemm_iqr|"
   "halo_gemm_mxfp4a8_decode|"
   "halo_gemm_mxfp4a8_gated|"
   "halo_gemm_mxfp4a8_gemv|"
@@ -105,10 +111,13 @@ set(HALO_UNITS
   "halo_had_quant_act_i8|"
   "halo_hc_bf16|"
   "halo_hc_read|"
+  "halo_iqr_embed|"
   "halo_kda|"
   "halo_kv_len_trim|"
   "halo_kv_resolve|"
+  "halo_lili|"
   "halo_logits_gemm|"
+  "halo_logits_vocab|"
   "halo_lora_bf16|"
   "halo_ltx|"
   "halo_mhc|"
@@ -117,8 +126,10 @@ set(HALO_UNITS
   "halo_moe|"
   "halo_moe_gemm_bf16|"
   "halo_moe_gemm_q|"
+  "halo_moe_iqr|"
   "halo_moe_mxfp4|"
   "halo_mtp_enter|"
+  "halo_nemotron_bf16|"
   "halo_ngram_ids|"
   "halo_norm_join_bf16|"
   "halo_p2p_copy2d|"
@@ -147,8 +158,10 @@ set(HALO_UNITS
   "halo_sample_ngram_f32|"
   "halo_sample_stages_f32|"
   "halo_scale_rows_bf16|"
+  "halo_ssd|"
   "halo_upscaler|"
   "halo_video|"
+  "halo_vit_muse|"
   "halo_vit_norm_embed|"
   "halo_vsa|"
 )
@@ -176,8 +189,8 @@ endforeach()
 # descriptions and fusion claims, plus the generated stubs for units not yet ported. They are pure
 # host C++ that includes neither halo.h nor hip_runtime.h, so these tables compile and can be
 # inspected without ROCm.
-set(HALO_DECLARATION halo_rows.cpp halo_layout.cpp halo_fp8_layout.cpp halo_shapes.cpp halo_fuse.cpp
-                     halo_stubs.cpp)
+set(HALO_DECLARATION halo_rows.cpp halo_layout.cpp halo_fp8_layout.cpp halo_iqr_layout.cpp
+                     halo_shapes.cpp halo_fuse.cpp halo_stubs.cpp)
 
 rad_add_plugin(libhalo kernels
   SOURCES     ${HALO_DECLARATION}

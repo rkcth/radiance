@@ -387,10 +387,10 @@ TEST(json_parse_errors_and_bounds) {
     const Json ok = Json::parse_bounded("[[[1]]]", 100, 3, &over, &deep);
     CHECK(!over && !deep && ok.is_array());
     CHECK(Json::parse_bounded("{bad", 100, 3, &over, &deep).is_discarded());
-    /* A refused body must be refused WITHOUT first collecting it: this swarm carries no scalar
-     * at all, and the bounded read used to trip its budget in a second pass that ran only after
-     * every frame of the document sat in a scratch vector -- the refusal grew memory with the
-     * body, which is exactly what the bound promises against. Containers are values too. */
+    /* A refused body is refused without first being collected: this swarm carries no scalar at
+     * all, and a budget counted in a second pass, after every frame of the document sits in a
+     * scratch vector, would let the refusal grow memory with the body. Containers are values
+     * too. */
     std::string swarm = "[";
     for (int i = 0; i < 200000; ++i) swarm += "[],";
     swarm.back() = ']';

@@ -269,13 +269,14 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
 
 /* ------------------------------------------------------------------ the codebook experts
  *
- * Qwen3.8-Flash-Next's experts (docs/MOE-W4.md) are u4 or u5 codes indexing a table of 16 or 32
- * f32 levels, with a scale per (row, group of K): bf16 per 128 (`w4nla8h`), or E4M3 per 64 or 32
- * times one fixed f32 (`w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`). Element (n, k) of an expert is
- * table[code(n, k)] * scale(n, k / group), times `scale.1` where there is one. The codes view takes
- * the planes `codes,table` and the two-level forms' scale view `scale,scale.1`; such a weight is
- * stored in the joined form of abi/rad_planes.h, which these rows' layout hooks ask for. A view of
- * one plane (w4nla8h's bf16 scale, every view of the other dtypes) is stored as it is.
+ * Qwen3.8-Flash-Next's experts (docs/MOE-W4.md) are u4, u5 or u6 codes indexing a table of 16, 32
+ * or 64 f32 levels, with a scale per (row, group of K): bf16 per 128 (`w4nla8h`), or E4M3 per 64
+ * or 32 times one fixed f32 (`w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`, `w6nl64a8h`). Element (n, k)
+ * of an expert is table[code(n, k)] * scale(n, k / group), times `scale.1` where there is one. The
+ * codes view takes the planes `codes,table` and the two-level forms' scale view `scale,scale.1`;
+ * such a weight is stored in the joined form of abi/rad_planes.h, which these rows' layout hooks
+ * ask for. A view of one plane (w4nla8h's bf16 scale, every view of the other dtypes) is stored as
+ * it is.
  *
  * The arithmetic is quant_dot's: per weight group, the sub-sum of table values times activation
  * codes, then `(sub * sa) * sb` with sb the scale times its level in f32. The logical form the
@@ -295,6 +296,7 @@ static CbForm cb_form(const RadParam* p, int n_p) {
     if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w6nl64a8h")) return CbForm{ 6, 64, RAD_F8E4M3, true };
     /* The same stored experts under their names against an int8 activation. */
     if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
@@ -318,7 +320,7 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const RadEncPlane& b = enc->plane[sel[1]];
     if (codes)
         return !std::strcmp(a.role, "codes") && a.kind == RAD_PLANE_TILED &&
-               a.dtype == (f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
+               a.dtype == (f.bits == 6 ? (uint32_t)RAD_U6 : f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
                a.block[0] == 1 && a.block[1] == 1 && !std::strcmp(b.role, "table") &&
                b.kind == RAD_PLANE_TABLE && b.dtype == RAD_F32 && b.extent[0] == 1 &&
                b.extent[1] == ((int64_t)1 << f.bits)
@@ -368,7 +370,7 @@ static const RadPlanesHeader* cb_joined(const RadTensor& t) {
  * `row_bytes` apart, the layout rad_planes.h keeps. */
 struct CbTensor {
     RadTensor t;              /* `data`: the codes plane, from the tile's first weight row */
-    float     tab[32];
+    float     tab[64];
     int64_t   cols = 0, row_bytes = 0;
     int       bits = 0;
 };
@@ -381,17 +383,17 @@ struct LdCb {
 };
 
 /* An expert's codes when its entry is the joined form: 1 with `out` filled, 0 for a plain plane
- * (any dtype but u4 and u5), RAD_E_DTYPE for a form these kernels do not read and RAD_E_SHAPE for
- * codes not covering [n, k]. A u4 or u5 entry is always joined: only its table says what a code
- * means. */
+ * (any dtype but u4, u5 and u6), RAD_E_DTYPE for a form these kernels do not read and RAD_E_SHAPE
+ * for codes not covering [n, k]. A u4, u5 or u6 entry is always joined: only its table says what a
+ * code means. */
 static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
-    if (w.dtype != RAD_U4 && w.dtype != RAD_U5) return 0;
+    if (w.dtype != RAD_U4 && w.dtype != RAD_U5 && w.dtype != RAD_U6) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);
     const RadPlanesEntry *ec = nullptr, *et = nullptr;
     const void* codes = h ? rad_planes_find(w.data, "codes", &ec) : nullptr;
     const void* tab = h ? rad_planes_find(w.data, "table", &et) : nullptr;
     if (!codes || !tab || h->n_planes != 2) return RAD_E_DTYPE;
-    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : 0;
+    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : ec->dtype == RAD_U6 ? 6 : 0;
     if (!bits || ec->kind != RAD_PLANE_TILED || ec->block[0] != 1 || ec->block[1] != 1 ||
         et->kind != RAD_PLANE_TABLE || et->dtype != RAD_F32 ||
         et->rows * et->cols != ((int64_t)1 << bits))

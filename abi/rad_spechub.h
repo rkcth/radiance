@@ -37,7 +37,23 @@ typedef struct RadMtpCoupleState {
     int32_t  status, round, x, count;
     int32_t  ids[8];
     double   q[8];
+    /* The node drafted `nkids` children, sampled without replacement from q, and ids[0 .. nkids) are
+     * them in draft order (x == ids[0]; ids[nkids .. count) the rest of the support). nkids <= 1 is
+     * the linear chain's single draw, whose ids keep the shortlist's order, and what the serial
+     * MTP head writes (abi/rad_mtp_rrs.h states the siblings' law; the traversal walk of
+     * abi/rad_mtp_traversal.h reads it). Zero from every writer that is not a sibling draw. */
+    int32_t  nkids;
+    /* The sibling scheme of those children: 0 = Gumbel-top-k without replacement (the only one a
+     * writer in this engine produces), m + 1 = RheoSampling's m deterministic top-q children plus one
+     * sampled from the tail law (abi/rad_mtp_rrs.h). Zero from every other writer. */
+    int32_t  scheme;
+    /* --draft-verify block (abi/rad_mtp_block.h): the length g of the block this row's chain is
+     * verified as one (the rows 0 .. g-1 bound to rounds 1 .. g, staged on every row of it); 0 for
+     * token-by-token verification. Written by the sampler's staging only; zero from the device. */
+    int32_t  blk;
+    int32_t  pad_;
 } RadMtpCoupleState;
+#define RAD_MTP_COUPLE_MAX_RHEO_M 7
 #define RAD_MTP_COUPLE_DRAW_WORDS  (sizeof(RadMtpCoupleDraw) / 4)
 #define RAD_MTP_COUPLE_STATE_WORDS (sizeof(RadMtpCoupleState) / 4)
 #define RAD_MTP_COUPLE_MAX_ROUNDS 8
@@ -46,7 +62,7 @@ typedef struct RadMtpCoupleState {
 #define RAD_MTP_COUPLE_KEY_DRAFT 0x4d5450434f55504cull
 #ifdef __cplusplus
 static_assert(sizeof(RadMtpCoupleDraw) == 32, "MTP coupling draw wire");
-static_assert(sizeof(RadMtpCoupleState) == 152, "MTP coupling state wire");
+static_assert(sizeof(RadMtpCoupleState) == 168, "MTP coupling state wire");
 static_assert(offsetof(RadMtpCoupleState, q) % 8 == 0, "MTP coupling q alignment");
 #endif
 
@@ -101,6 +117,9 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_state_valid(const RadMtpCoupleS
         sum += s.q[i];
         has_x |= s.ids[i] == s.x;
     }
+    if (s.nkids < 0 || s.nkids > s.count || (s.nkids >= 2 && s.ids[0] != s.x)) return false;
+    if (s.scheme < 0 || s.scheme > RAD_MTP_COUPLE_MAX_RHEO_M + 1 || (s.scheme && s.nkids >= 1 && s.ids[0] != s.x))
+        return false;
     return has_x && (sum - 1) <= 1e-12 && (1 - sum) <= 1e-12;
 }
 
@@ -327,6 +346,8 @@ static inline RAD_SPECHUB_HD int32_t rad_dflash_couple_step(const float* sc, con
     s->pos = 0;
     s->round = round;
     s->count = 0;
+    s->nkids = 0;   /* a walk's position is one draw: the chain's wire */
+    s->scheme = 0;
     for (int i = 0; i < 8; ++i) { s->ids[i] = -1; s->q[i] = 0; }
     if (d.mode != 1) {
         s->status = 0;

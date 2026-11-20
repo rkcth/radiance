@@ -22,7 +22,7 @@ plugin claims.
 | `arch/clef_fp8` | `clef` | `fp8_e4m3` | the same over `qwen35_fp8`'s trunk |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert (`data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`) or an AutoRound int4 release (`qwen4exp-autoround-i8-hc8m.recipe`) |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 experts at top-8 under sigmoid routing, attention and dense layers as the container stores them; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
-| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; Ling-3.0-tiny from its bf16 checkpoint with an IQ8R trunk and rotated int8 experts (`data/recipes/ling-3.0-tiny-iq8r.recipe`, TP1/2; flash's clamped SwiGLU layers have no int8 form); bf16 KV |
+| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; Ling-3.0-tiny from its bf16 checkpoint with an IQ8R trunk and rotated int8 experts (`data/recipes/ling-3.0-tiny-iq8r.recipe`, TP1/2), and flash on the same trunk with rotated four-bit experts (`data/recipes/ling-3.0-flash-iq8r-w4nl64.recipe`; its clamped layers clamp, then quantise); bf16 KV |
 | `arch/bailing_hybrid_gguf` | `bailinghybrid` | `gguf_ftype_25` | Ling-3.0-tiny (24 layers, MLA every fourth with a 256-wide query LoRA, 128 experts of 512 at top-8) as the IQ4_NL GGUF release, its experts re-quantised by `data/recipes/ling-3.0-tiny-iq4.recipe`; no MTP; bf16 KV |
 | `arch/bailing_hybrid_gguf_q80` | `bailinghybrid` | `gguf_ftype_7` | the same tiny family, Q8_0 GGUF release, served whole |
 | `arch/bailing_hybrid_gguf_q4km` | `bailinghybrid` | `gguf_ftype_15` | the same tiny family, Q4_K_M GGUF release, served whole |
@@ -30,6 +30,7 @@ plugin claims.
 | `arch/bailing_hybrid_gguf_q6k` | `bailinghybrid` | `gguf_ftype_18` | the same tiny family, Q6_K GGUF release, served whole |
 | `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them; pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16 or IQ8R, one rank |
+| `arch/lfm3_bf16` | `lfm3` | *(empty)* | LiquidAI's LFM3 (LFM3-1.7B), bf16 or IQ8R, one rank: LFM2's short convolutions with full and sliding-window (256) GQA attention, sandwich norms, a partial rotary on the full layers and a sigmoid gate per query head. Text only |
 | `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
 | `arch/spark25_w8a8` | `spark25` | `w8a8_fwht128` | the same with rotated int8 weights and activations (`data/recipes/spark-x26-4b-iq8r.recipe`); an optional DSpark drafter stays bf16 |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
@@ -39,7 +40,7 @@ plugin claims.
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, the E2B/E4B form at one rank, and the 12B (`gemma4_unified`, its image and audio embedders in place of a tower), with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
-| `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16, or their gate_up rotated int8 (`data/recipes/gemma4-26b-a4b-df-i8.recipe`) |
+| `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with the shared BF16 vision tower and z-lab's DFlash drafter; routed experts bf16, or their gate_up rotated int8 (`data/recipes/gemma4-26b-a4b-df-i8.recipe`) |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or IQ8R |
 | `arch/krea2` | `krea2` | *(empty)* | Krea 2 Raw and Turbo, an image generator: Qwen3-VL-4B's tapped layers through a text-fusion transformer, a 12.9B single-stream DiT and Wan 2.1's VAE, from the diffusers pipeline directory; bf16 or IQ8R |
 | `arch/sdxl` | `sdxl` | *(empty)* | Stable Diffusion XL and its finetunes (Illustrious, NoobAI, Pony), an image generator: CLIP ViT-L and OpenCLIP bigG text encoders, the 2.6B UNet sampled by k-diffusion's Euler, Euler ancestral or DPM++ 2M on ComfyUI's schedules, the SDXL VAE; from the single-file checkpoint, bf16, one card |
@@ -738,6 +739,25 @@ that equality. `docs/QSA.md` is the decomposition.
 The vision tower is declared when the container carries one and `mm-max-patches` is not 0
 (`arch/common/rad_block_vit.h`, `spec.md` §11).
 
+**A decode step is its launches.** A verify pass at depth 3 is ~900 launches a rank in ~10 ms on two
+R9700, against 4.1 GB of weights read a rank (6.4 ms at the cards' 640 GB/s): the connections' reads,
+the delta net's update, the routers and the reductions are bound by their own chains of loads, not
+by bytes, and every launch behind another costs the step ~1.6 us where it waits for it and ~0.5 us
+where it does not (measured by adding launches; `scripts/stampseq.py`). So where a recorded pass
+lets a launch start beside the last ordered one (`Ctx::haz_mark`), the plugin issues the small
+launches of a decode step where they ride, the same kernels on the same operands in another order
+(`qwen4exp_fp8.cpp`, `kVerifyRows`): k and v in front of the q|gate projection; the indexer's
+keys behind the attention's own launches where nothing of the layer reads them (within the
+exactness bound); the router's weight read beside the mixer's reduction; and from two rows the
+shared expert's down projection in front of the routed one and the weight reads at 32 workgroups
+instead of 64. Chain 3 with coupling, one server, interleaved rounds: 12.11 -> 11.82 ms a step
+(-2.5%) with the chained kernels' wait polling by grid size (`libr4d/r4d_chain.h`); a plain decode
+step takes the order that helps at one row (router read, k and v, the indexer's keys). What did not
+help is in the comments beside each: a read of the mixer's first projection or of the connections'
+matrices in front of their reads, the shared arm beside the router, more workgroups for the reads
+(128: +2.0%, 256: +7.4%), and a connection read that asks for its own matrices before its wait
+(+2.3%).
+
 ---
 
 # `glm5next`: GLM-5.3-Flash
@@ -1089,6 +1109,12 @@ IQ8R (tiny, `data/recipes/ling-3.0-tiny-iq8r.recipe`): the KDA q|k|v, forget, ga
   the embedding and the head stay bf16. TP1 and TP2 (at TP4 the dense 1152-column slice cuts a
   256-column group and is refused).
 
+IQ8R with four-bit experts (flash, `data/recipes/ling-3.0-flash-iq8r-w4nl64.recipe`): the trunk
+  as above; the routed experts rotated four-bit codes into the w4nl codebook at an E4M3 scale a
+  (row, 64) (`moe_gemm_q` at `w4nl64a8i8h`), read against the trunk's rotated int8 codes.
+  The clamped layers write `swiglu_step`'s bf16 product and quantise it with `had_quant_act_i8g`.
+  Declared at one, two and four ranks; served on two and four cards.
+
 GGUF releases (tiny): IQ4_NL, Q8_0, Q4_K_M, Q5_K_M, Q6_K -- the file's `general.file_type` is
   the claim (`gguf_ftype_25`, `_7`, `_15`, `_17`, `_18`); the release files carry their
   producer's renumbered ftable (IQ4_NL 25, Q4_K_M 15, Q5_K_M 17, Q6_K 18, Q8_0 7), not the
@@ -1148,8 +1174,10 @@ shards the same way; its norms take no collective (each block's all-reduce stays
 `all_reduce` before the residual add), so no `ar_` norm is declared at two ranks.
 
 **The trunk's form** is read from layer 0's fused q|k|v. A rotated int8 trunk needs rotated
-experts (int8 or a rotated four-bit form) and no SwiGLU clamp: the int8 gated products have no
-clamped form, so flash's clamped layers (routed 35-41, shared 34-41) are refused on it by name.
+experts (int8 or a rotated four-bit form). Flash's clamped layers (routed 35-41, shared 34-41)
+write the clamped bf16 product (`swiglu_step`) and quantise it with `had_quant_act_i8g` at the
+group of the down projection that reads it: one launch more than the unclamped
+`gated_had_quant_i8g`, in those layers only.
 Rotated int8 experts under an unrotated trunk are refused too. Where no loaded library serves
 `rmsnorm_had_quant_i8g` (a CPU-only engine), each int8 linear quantises the norm's bf16 output
 itself and the routed experts read a rotated int8 copy written once a layer.
@@ -1394,7 +1422,7 @@ parallel (the model is served on one card).
 
 ---
 
-# `gemma4`: Gemma 4 text and its DFlash drafter
+# `gemma4`: Gemma 4 vision, text and DFlash
 
 `arch/gemma4` serves a container converted from Google's bf16 checkpoint
 (`Gemma4ForConditionalGeneration` or `Gemma4ForCausalLM`), the recipe choosing what is int8:
@@ -1698,8 +1726,10 @@ tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces the
   31B) a picture's or video frame's placeholders attend to each other both ways on the sliding
   layers; the global layers stay causal. That is transformers' Gemma 4 mask
   (`create_masks_for_vision_model`), KerasHub's and vLLM's; transformers' `gemma4_unified` forward
-  overlays every layer, which differs little on most pictures. The scheduler ends no prefill chunk
-  inside such a run (`Scheduler::bidi_fit`), the trunk pass names its runs (`RadBatch::n_bidi`), and
+  overlays every layer, which differs little on most pictures. The scheduler avoids splitting a
+  run that fits an admitted step, including alignment (`Scheduler::bidi_fit`). An over-budget run
+  is clipped to the staged chunk and does not have equivalent full-image attention. The trunk
+  pass names its runs (`RadBatch::n_bidi`), and
   each sliding layer attends a run's rows a second time with `attn_paged` at `causal` 0 over the
   cache up to the run's end, written over their causal result. The window stays, as in
   transformers' mask (the window AND (causal OR the same picture)): it bounds the keys behind a row.
@@ -1748,9 +1778,27 @@ is declared at the end of the layer it taps, where it is issued. Declared after 
 let the planner share `dflash_src` with `moe_edn`, which every MoE layer writes, and acceptance
 would collapse silently. arch_test holds the two live ranges to overlap.
 
-**Not declared.** The vision tower (`arch/gemma4_bf16` and `arch/embgemma2` declare Gemma 4's): a
-container that carries one is served with `mm-max-patches: 0`. An fp8 attention or dense arm:
-under a tenth of the weight bytes, and the dense arm's 2112 is not whole 128-blocks either.
+**Vision.** The 26B-A4B uses the same BF16 tower implementation as the 31B, with its own
+2816 × 1152 projector. Each rank runs the tower, and the decoder scatters the projected rows
+before the embedding all-reduce. With `use_bidirectional_attention: "vision"`, only the sliding
+layers read image spans in both directions. Without a paged attention kernel with unrestricted
+lookahead, the processor limits each image or video frame to the sliding window. Containers
+converted without the tower default to text-only serving. Set `mm-max-patches: 0` to disable
+vision explicitly.
+
+The shared BF16 tower does not depend on the experts' encoding. This integration retains the
+current BF16 and rotated-int8 expert paths; it does not re-enable retired block-FP8 linears.
+A split image run only sees keys staged in its chunk; correct row insertion does not establish
+full-image bidirectional numerical equivalence when a run cannot fit a step.
+
+**Adding a tower to an existing RAD.** `rad-convert VISION.safetensors --add-vision BASE.rad
+--config SOURCE_CONFIG -o NEW.rad` copies the compatible text/MoE/DFlash container's original
+weight planes, scales and vocabularies and adds BF16 Vision weights. `NEW.rad` must not exist;
+`--plan-only` validates without writing. Use a tower/config from the same checkpoint/tokenizer
+family: matching dimensions and token bounds alone do not establish checkpoint identity.
+
+**Not declared.** An fp8 attention or dense arm: under a tenth of the weight bytes, and the dense
+arm's 2112 is not whole 128-blocks either.
 
 ---
 
@@ -1858,6 +1906,102 @@ embedding scale through `embed_lookup`'s `mult` (only when it is not 1, so other
 unchanged). On 64 held-out translation pieces it accepts 3.3 tokens a verify step: 152 tok/s a
 stream and 364 at four, against 56 and 175 without it on the same pieces (the table's 205 at four
 is one 800-token translation run four times).
+
+---
+
+# `lfm3`: LiquidAI's LFM3
+
+`arch/lfm3_bf16` serves `Lfm3ForCausalLM`, text only, one rank, from a bf16 container or an IQ8R
+one (`data/recipes/lfm3-1.7b-iq8r.recipe`). It is `lfm2_bf16`'s
+graph (short gated convolutions between attention layers, SwiGLU, a tied head) with LFM3's
+differences. transformers has no LFM3 class; the reference is the modelling code LiquidAI ships
+with the checkpoint (`modeling_lfm3.py`, `lfm3_conv.py`).
+
+```
+LFM3-1.7B (LiquidAI/LFM3-1.7B)
+  24 layers, hidden 2048, vocab 128000 tied to the embedding, norm_eps 1e-5
+  layer_types: conv at 0, 1 and every odd layer; full_attention at 2, 6, .., 22;
+    sliding_attention at 4, 8, .., 20
+    conv     causal, 7 taps (conv_L_cache), no bias: in_proj -> B, C, x; C * conv(B * x) -> out_proj
+    full     16 heads / 4 kv x 128, rope theta 1e6 over the first 64 dimensions of each head
+             (partial_rotary_factor 0.5), the other 64 unrotated
+    sliding  16 heads / 4 kv x 128, rope theta 1e4 over the whole head, window 256 (q - k < 256)
+  q and k RMS-normed per head; after attention each query head is scaled by sigmoid(gate_proj(h))
+    before out_proj
+  sandwich norms: operator_norm -> mixer -> post_operator_norm -> add;
+    ffn_norm -> feed-forward -> post_ffn_norm -> add. RMSNorm, plain gain
+  feed-forward w1|w3 2 x 7680 (silu) -> w2
+  final norm; tied head; no embedding scale
+```
+
+Traps:
+
+- **The gate is sigmoid, not 2 x sigmoid.** `head_gate` computes `2 * sigmoid(g)` (the families it
+  was written for train the gate around 1), so it is not used here. The plugin maps each of
+  `gate_proj`'s 16 rows `head_dim` times (`RAD_MAP_ROWS`), which makes the gate a `gemm_nt` to the
+  hidden width, then `sigmoid` and `mul`: 91.6 MB more in the container (2.6%) and no new kernel.
+- **Two rotaries.** The full-attention layers rotate half of each head at theta 1e6
+  (`rope_rows` with `rotary_dim` 64 and the `head` ladder); the sliding layers rotate all of it at
+  1e4. Swapping the thetas, or rotating the whole head on the full layers, each still produces
+  fluent text on short prompts.
+- **The window is on the sliding layers only**, and is a mask over a full-length cache in the
+  reference; here those layers keep a `RAD_KV_WINDOW` group of their own and the full layers a
+  `RAD_KV_FULL` one. A document shorter than 256 tokens does not exercise the difference.
+- **Four norms a layer.** The post norms sit on the branch, before the residual add, not on the
+  stream. Leaving them out changes every logit; putting them after the add does too.
+- **Three states roll back under speculation**: the convolution's last six inputs and both KV
+  groups.
+- **A raw prompt gets no BOS unless the container says so.** The checkpoint's tokenizer states no
+  `add_bos_token` and its post-processor adds none, so `/v1/completions` runs a raw prompt as
+  written (the chat template writes `<|startoftext|>` itself). Without it some first tokens (`//`
+  is one) start the forward in a regime of small activations where bf16 arithmetic, the
+  reference's own code in bf16 included, departs from float32 by far more than it does behind
+  BOS. Start a raw prompt with `<|startoftext|>`, or set `"add_bos_token": true` in
+  `tokenizer_config.json` before `rad-convert`: the server then puts exactly one BOS in front.
+
+8-bit linears. The trunk's format is read off layer 0's first linear, as `lfm2_bf16` reads it, and
+every trunk linear must have it: `in_proj` and `out_proj` of a convolution, `q_proj`, `k_proj`,
+`v_proj` and `out_proj` of an attention layer, `w1|w3` and `w2`. An int8 trunk (codes at a bf16
+scale a 128 of K, plain or rotated by `fwht128`; or IQ8R's u8 scale a 256 of K under a bf16 scale
+a row) is `gemm_nt_q` at `i8a8` or `i8a8h` behind the matching activation quantiser; a bf16 trunk
+declares no code plane and is the graph above, byte for byte. The recipe is the rotated form at
+group 128, the one libr4d, libhalo and the host libraries all serve; libhalo has no row for the
+rotated quantiser at 256, so a container at IQ8R's group runs on libr4d and the host libraries
+only. Three things stay bf16 in an 8-bit
+container: the gate (`gate_proj` is 16 rows; its sigmoid scales a whole head, so the recipe
+leaves it out and the plugin refuses it quantised), the convolution kernel, and the tied head
+with the embedding (libavx and libref carry no `logits_gemm_i8`, and this container is meant to
+run on every library). The recipe is round to nearest, without calibration data:
+`lfm3-1.7b-iq8r.rad` is 2.6 GB for bf16's 4.1 GB. LFM3's widths (2048, 7680) divide both groups;
+a model whose widths do not is refused, as are a trunk that mixes bf16 and int8 linears or the two
+scale groups, and block fp8.
+
+Refused at declare, not ignored: `conv_bias`, `use_sandwich_norm: false`, a `rope_type` other than
+`default`, a layer kind other than the three, a `conv_L_cache` outside 2..8, sliding layers
+without a `sliding_window`, and more than one rank. A step that asks for an encoder or media rows
+fails. `partial_rotary_factor` is read per attention class, so either class may carry one.
+
+Kernels: libref and libavx serve every op, and so does libr4d: attention at (128, 4 queries a
+kv head) takes `attn_decode_h128_gqa4` up to 16 query rows and `attn_window_h128_gqa4` past
+that, for the full layers (window 0) as for the sliding ones. libhalo carries the same pair of
+attention rows, and `rope_rows` and `rmsnorm_rows` under their row-form names (launched as
+`rope` and `rmsnorm`).
+
+The sandwich joins are `norm_add_norm` where a library serves it (libr4d and libhalo; Gemma's
+join): a layer's post norm, add and feed-forward norm are one launch, and so are its
+feed-forward's post norm, add and the next layer's input norm. At 24 layers that is 50 launches
+for the chain's 144. The last layer's feed-forward keeps the chain (the final norm is on the
+gathered rows), and so does every layer on libref and libavx, which do not carry the op. The
+fused kernel rounds where the chain rounds. On libr4d a step gives the chain's bytes. On libhalo
+it does at prefill row counts and not at decode ones: libhalo's `rmsnorm` folds a row's sum of
+squares over the workgroup width `halo_act_threads` picks for the row count, the join over 256
+lanes whatever the count, so below 73 rows (at a hidden width under 4096) the two sum in
+different orders.
+
+Checked against the reference's float32 forward on a tiny random LFM3 (conv, full, conv, sliding;
+window 8) at every position of the golden prompt (`tests/lfm3_golden.h`, made by
+`tests/mklfm3golden.py`), and in the family tests for chunking, batching, decode against prefill,
+concurrent requests and speculation.
 
 ---
 

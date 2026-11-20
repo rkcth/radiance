@@ -17,6 +17,7 @@
 #include "lookup.h"
 #include "metrics.h"
 #include "ngram.h"
+#include "suffix.h"
 #include "diag/diagnose.h"
 
 #include <chrono>
@@ -82,6 +83,8 @@ struct SchedReq {
     void drafter_reset() {
         n_draft      = 0;
         draft_next   = 0;
+        draft_suffix = false;
+        suffix_hot   = false;
         conv_cursor  = 0;
         draft_filled = 0;
         draft_lo     = 0;
@@ -93,6 +96,13 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+    /* --draft-suffix (suffix.h): the proposal the step being planned carries is a suffix chain
+     * (StepEntry::suffix); and whether the last commit left the sequence's history ending in a
+     * recurring pattern, which keeps the next step from being issued ahead (it is built after the
+     * commit, where the lookup can run). */
+    bool        draft_suffix = false;
+    bool        suffix_hot = false;
+    SuffixIndex suffix_ix;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
      * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
      * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
@@ -489,8 +499,10 @@ public:
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
 
-    /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition). */
-    int64_t tail_checkpoint(int64_t target) const;
+    /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition).
+     * `in_step`: the snapshot is taken inside the last chunk (set_ckpt_inside), which it does not
+     * split, so nearest's quarter-interval floor does not apply. */
+    int64_t tail_checkpoint(int64_t target, bool in_step = false) const;
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
@@ -521,6 +533,10 @@ public:
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
      * saves (Engine::serve). */
     void    set_span_min(int64_t tokens);
+    /* Whether a checkpoint may lie inside a chunk (RadBatch::ckpt_cut): the plugin snapshots
+     * inside the step (RadArchProbe::ckpt_snap_ok) and the engine holds a stage for it. Set once
+     * by the engine after init; false keeps every checkpoint at a chunk's end. */
+    void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
      * to prefill, so the next step most likely carries a chunk the stager arms for. */
     bool    prefill_continues() const;
@@ -562,13 +578,24 @@ private:
     int64_t       stage_rows_ = 0;
     /* set_span_min: the shortest prefill a span is taken for, 0 for any. */
     int64_t       span_min_ = 0;
+    /* set_ckpt_inside */
+    bool          ckpt_inside_ = false;
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
+    enum class AdmissionFailure { None, Capacity, ExternalCapacity, Allocator };
+    AdmissionFailure admission_failure_ = AdmissionFailure::None;
+    bool          admission_reclaim_pending_ = false; /* eviction hit its per-step work bound */
+    bool          idle_refuse_ = false;       /* idle engine: this refusal will not clear by waiting */
+    bool          room_wait_ = false;         /* the refusal is the fresh prefill's room gate */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* A request finished while others still run: the next step is planned at the shared budget,
+     * not a span (step()), so that the finished conversation's next turn, which a client sends at
+     * once, waits for a shared step rather than a spanned one. Consumed by that step. */
+    bool          finished_beside_ = false;
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;
@@ -651,6 +678,9 @@ private:
      * far the match behind the proposal runs back (NgramIndex::propose), -1 when the proposal did
      * not come from the index (--debug-draft-oracle). */
     int draft_ngram(SchedReq& s, int depth, int* match = nullptr) const;
+    /* --draft-suffix: the suffix proposal for `s`'s next step, over its committed history, into
+     * `out` (RAD_SCHED_MAX_SPEC entries). Returns its length, 0 for none. */
+    int suffix_propose(SchedReq& s, int32_t* out, int* match = nullptr);
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;
@@ -903,6 +933,9 @@ private:
      * preempted request: after --preempt-wait-ms the scheduler reclaims cache blocks and preempts
      * a decoding runner until one of them can prefill. A runner still prefilling is not a victim. */
     bool preempted_can_prefill(const SchedReq& s) const;
+    /* A fresh prefill: the whole prompt plus one decode position fits in every FULL paged group,
+     * with one block past that for every running sequence. WINDOW/RING recycle. */
+    bool fresh_prefill_can_fit(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();

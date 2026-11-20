@@ -109,3 +109,41 @@ __device__ __forceinline__ void r4d_ar_hc_write_word(const unsigned short* __res
     *hp = hv;
   }
 }
+
+// The write's operands read ahead of the handshake, for a kernel whose threads each own one word
+// (r4d_ar_hc_write_reg_kernel): a row's gains and the word's hc stream words depend on nothing the
+// peer sends, so their loads ride under the push and the flag round trip instead of following the
+// reduce. r4d_ar_hc_write_apply is r4d_ar_hc_write_word over those registers: the same values in
+// the same arithmetic, so the same bytes.
+#define R4D_ARHC_MAX 8
+struct R4dArHcPre {
+  float g[R4D_ARHC_MAX];
+  int4  hv[R4D_ARHC_MAX];
+};
+__device__ __forceinline__ void r4d_ar_hc_write_load(const unsigned short* __restrict__ inj,
+                                                     const unsigned short* __restrict__ h, int row,
+                                                     int i0, int n, int hc, long irow, long hrow,
+                                                     R4dArHcPre& p) {
+#pragma unroll
+  for (int c = 0; c < R4D_ARHC_MAX; ++c) {
+    if (c >= hc) break;
+    p.g[c] = bf2f(inj[(long)row * irow + c]);
+    p.hv[c] = *reinterpret_cast<const int4*>(h + (long)row * hrow + (long)c * n + i0);
+  }
+}
+__device__ __forceinline__ void r4d_ar_hc_write_apply(unsigned short* __restrict__ h, int row,
+                                                      int i0, int n, int hc, long hrow,
+                                                      const unsigned short* yv, R4dArHcPre& p) {
+  float v[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) v[j] = bf2f(yv[j]);
+#pragma unroll
+  for (int c = 0; c < R4D_ARHC_MAX; ++c) {
+    if (c >= hc) break;
+    int4 hv = p.hv[c];
+    unsigned short* he = reinterpret_cast<unsigned short*>(&hv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) he[j] = f2bf(bf2f(he[j]) + p.g[c] * v[j]);
+    *reinterpret_cast<int4*>(h + (long)row * hrow + (long)c * n + i0) = hv;
+  }
+}

@@ -44,11 +44,11 @@ inline bool log_once(std::atomic<bool>& flag) {
     return flag.compare_exchange_strong(expected, true);
 }
 
-/* The whole text of a file, refused BEFORE it is read when it is bigger than `cap`. Files a
- * container supplies are screened by size as well as by JSON budget: the bounded read counts
- * values, not bytes, and the slurp used to be the unbounded step -- a multi-gigabyte
- * tokenizer.json grew the string before anything said no. RAD_E_IO when unreadable,
- * RAD_E_FORMAT when past the cap; nothing is read then. */
+/* The whole text of a file, refused before it is read when it is bigger than `cap`. Files a
+ * container supplies are screened by size as well as by JSON budget: the bounded parse counts
+ * values, not bytes, so without the size screen a multi-gigabyte tokenizer.json would be read
+ * into memory whole before anything refused it. RAD_E_IO when unreadable, RAD_E_FORMAT when past
+ * the cap; nothing is read then. */
 int read_text_file(const std::string& path, std::string& out, size_t cap);
 
 /* What one container-supplied JSON file may be: past the largest real tokenizer.json by wide

@@ -78,6 +78,7 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
         rad_spechub_row(0, rad_mine_mtp_couple_propose_launch),
         rad_spechub_row(1, rad_mine_mtp_couple_verify_launch),
         rad_spechub_row(2, rad_mine_dflash_couple_launch),
+        rad_spechub_row(3, rad_mine_mtp_trav_verify_launch),
     };
     if (i >= 0 && i < RAD_SPECHUB_N_OPS) return &dev[i];
     i -= RAD_SPECHUB_N_OPS;
@@ -86,6 +87,7 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
         ref_row(0, rad_ref_mtp_couple_propose, "ref_mtp_couple_propose"),
         ref_row(1, rad_ref_mtp_couple_verify, "ref_mtp_couple_verify"),
         ref_row(2, rad_ref_dflash_couple, "ref_dflash_couple_propose"),
+        ref_row(3, rad_ref_mtp_trav_verify, "ref_mtp_trav_verify"),
     };
     if (i < 0 || i >= RAD_SPECHUB_N_OPS) return nullptr;
     return &ref[i];

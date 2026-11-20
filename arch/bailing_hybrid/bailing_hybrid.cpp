@@ -42,7 +42,8 @@
  *     library serves the rotating norm, each linear quantises the norm's bf16 output itself and
  *     the routed experts read a rotated copy written once a layer. The linears the recipe keeps
  *     bf16 (the KDA beta, the MLA's low-rank q and kv and its head gate) read the norm's bf16
- *     output in either case. Unclamped SwiGLU only: the int8 gated products have no clamped form.
+ *     output in either case. A clamped SwiGLU (flash's last layers) writes the bf16 product,
+ *     which had_quant_act_i8g quantises: one launch more than the unclamped gated product.
  *   - any other (bf16, the four-bit experts of ling3-w4a8-rtn and ling-3.0-tiny-iq4, the GGUF
  *     releases): the norms write E4M3 codes, each linear reads the bf16 plane or quantises it
  *     itself, and four-bit experts read the E4M3 pair (rotated ones a rotated copy of it).
@@ -854,7 +855,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     int64_t shared_g8 = m.trunk_g8;
     if (m.trunk_rot) {
         /* The routed experts read the trunk's rotated int8 codes (MoeFP8::a8), which only a
-         * rotated expert meets; and the int8 gated products have no clamped form. */
+         * rotated expert meets. A clamped layer clamps, then quantises (GateQuantFP8). */
         for (int l = (int)s.dense_layers; l < (int)s.n_layer + (mtp ? 1 : 0); ++l) {
             const MoeFP8::Config& c = msrc[(size_t)l].cfg;
             if (c.expert_bf16 || !c.expert_rot) {
@@ -862,14 +863,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 "routed experts are %s; a rotated trunk's experts read its int8 codes "
                                 "and are stored rotated (data/recipes/ling-3.0-tiny-iq8r.recipe)\n",
                         l, c.expert_bf16 ? "plain bf16" : "unrotated");
-                return RAD_E_UNSUPPORTED;
-            }
-            if (c.swiglu_limit > 0 || c.shared_swiglu_limit > 0) {
-                fprintf(stderr, "radiance: bailing_hybrid: layer %d clamps its SwiGLU (routed %g, "
-                                "shared %g) and the trunk is rotated int8, whose gated products "
-                                "write int8 codes with no clamped form; this checkpoint is served "
-                                "with a bf16 or four-bit trunk\n",
-                        l, c.swiglu_limit, c.shared_swiglu_limit);
                 return RAD_E_UNSUPPORTED;
             }
         }

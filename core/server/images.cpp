@@ -22,7 +22,6 @@
  */
 #include "server.h"
 #include "loras.h"
-#include "../lora/adapter.h"
 #include "oai.h"
 
 #include "gen/gen.h"
@@ -163,6 +162,16 @@ std::vector<uint8_t> on_white(const std::vector<uint8_t>& rgba, int32_t w, int32
 }  /* namespace */
 
 HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
+    if (!deps_.images || !deps_.tok)
+        return error_response(err_not_implemented(
+            "the images API requires an image generation model; this one generates text"),
+            req.peer);
+    const ImageGenInfo& info = deps_.images->info();
+    const char* ep = edit ? "/v1/images/edits" : "/v1/images/generations";
+    if (edit && info.max_refs <= 0)
+        return error_response(err_not_implemented("this model makes images from text only"),
+                              req.peer);
+
     /* ---- the body, JSON or (an edit's usual form) multipart, as one JSON object */
     json body = json::object();
     std::vector<std::vector<uint8_t>> files;
@@ -229,9 +238,6 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         }
     }
 
-    auto release_admission = [this](Server*) { release(1); };
-    std::unique_ptr<Server, decltype(release_admission)> admission(nullptr, release_admission);
-    const char* ep = edit ? "/v1/images/edits" : "/v1/images/generations";
     /* ---- the fields */
     ImgReq r;
     r.edit = edit;
@@ -264,111 +270,21 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         *out = v;
         return 1;
     };
-    std::string model;
-    const int specified = str("model", &model);
-    if (specified < 0 || (specified > 0 && model.empty()))
-        return error_response(err_bad("model", "expected a nonempty model name"), req.peer);
-    if (str("prompt", &r.prompt) <= 0)
-        return error_response(err_bad("prompt", "expected a prompt string"), req.peer);
-
-    /* Parse adapter choices before acquiring an image turn. The syntax is independent
-     * of the selected checkpoint, and invalid choices should not trigger a switch. */
+    if (str("prompt", &r.prompt) < 0)
+        return error_response(err_bad("prompt", "expected a string"), req.peer);
+    if (!body.contains("prompt"))
+        return error_response(err_bad("prompt", "the prompt is required"), req.peer);
+    /* Runtime LoRA adapters: `loras` and <lora:...> tags, which leave the prompt. */
     std::vector<std::pair<std::string, double>> loras;
-    std::string lora_field;
-    if (opt_.queue_image) {
-        std::string why;
-        if (parse_loras(body, &r.prompt, &loras, &lora_field, &why) < 0)
-            return error_response(err_bad(lora_field.c_str(), why), req.peer);
+    {
+        std::string field, why;
+        if (parse_loras(body, &r.prompt, &loras, &field, &why) < 0)
+            return error_response(err_bad(field.c_str(), why), req.peer);
+        if (!loras.empty() && !opt_.gen_lora_acquire)
+            return error_response(err_unsupported(field.c_str(), "this server was started without "
+                                                                 "adapters (--lora, --lora-dir)"),
+                                  req.peer);
     }
-
-    ImageDispatchTiming dispatch_timing;
-    std::vector<lora::PinnedAdapter> pinned_loras;
-    std::shared_ptr<void> adapter_request_lease;
-    std::shared_ptr<void> dispatch_hold;
-    Deps::ImageEndpoint images;
-    if (opt_.queue_image) {
-        size_t bytes = req.body.size();
-        for (const auto& part : req.form) bytes += part.data.size();
-        for (const auto& file : files) bytes += file.size();
-        bytes += mask_bytes.size();
-
-        /* Keep HTTP workers free for text and administrative requests. The body cap also
-         * bounds the aggregate bytes held by waiting images, including decoded uploads. */
-        if (auto no = admit(1, req.peer)) return *no;
-        admission.reset(this);
-        if (!loras.empty() && opt_.pin_image_loras) {
-            std::string why;
-            const int status = opt_.pin_image_loras(loras, &pinned_loras, &adapter_request_lease, &why, true);
-            if (status == RAD_E_FULL) return error_response(err_overloaded(why), req.peer);
-            if (status < 0) {
-                ApiError error = err_bad("loras", why);
-                if (status == RAD_E_NOTFOUND) { error.status = 404; error.type = "not_found_error"; }
-                if (status == RAD_E_STATE) { error.status = 409; error.type = "conflict_error"; }
-                if (status == RAD_E_IO || status == RAD_E_NOMEM) {
-                    error.status = 503;
-                    error.type = "service_unavailable";
-                }
-                return error_response(error, req.peer);
-            }
-        }
-        const size_t waiters = size_t(queue_depth_);
-        const size_t max_bytes = 2 * opt_.max_body_bytes;
-        std::string why;
-        const auto cancelled = [&] { return stopping_.load() || req.peer_gone(); };
-        const auto dispatch_start = std::chrono::steady_clock::now();
-        const int st = opt_.queue_image(model, bytes, waiters, max_bytes, cancelled,
-                                        &images, &dispatch_hold, &dispatch_timing, &why);
-        const auto dispatch_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - dispatch_start).count();
-        dispatch_timing.selection_ns = dispatch_ns - dispatch_timing.queued_ns;
-        if (st < 0) {
-            if (st == RAD_E_CANCELLED && !stopping_.load()) {
-                metrics_.observe_http(499);
-                return HttpResponse::text(499, "client closed request\n");
-            }
-            if (st == RAD_E_FULL) {
-                metrics_.observe_rejected();
-                return error_response(err_overloaded(why), req.peer);
-            }
-            ApiError err = err_bad("model", why.empty() ? rad_strerror(st) : why);
-            if (st == RAD_E_NOTFOUND) { err.status = 404; err.type = "not_found_error"; }
-            if (st == RAD_E_CANCELLED || st == RAD_E_STATE || st == RAD_E_NOMEM ||
-                st == RAD_E_IO || st == RAD_E_DEVICE) {
-                err.status = 503;
-                err.type = "service_unavailable";
-            }
-            return error_response(err, req.peer);
-        }
-    }
-    if (!opt_.queue_image) images = image_endpoint();
-    if (!images && opt_.acquire_image) {
-        ApiError e = err_bad("model", "no image model is ready");
-        e.status = 503;
-        e.type = "service_unavailable";
-        return error_response(e, req.peer);
-    }
-    if (!images)
-        return error_response(err_not_implemented(
-            "the images API requires an image generation model; this one generates text"),
-            req.peer);
-    const ImageGenInfo& info = images.gen->info();
-    if (edit && info.max_refs <= 0)
-        return error_response(err_not_implemented("this model makes images from text only"),
-                              req.peer);
-
-    if (!images.model_id.empty() && specified > 0 && model != images.model_id)
-        return error_response(err_bad("model", "expected " + images.model_id), req.peer);
-    if (!opt_.queue_image) {
-        std::string why;
-        if (parse_loras(body, &r.prompt, &loras, &lora_field, &why) < 0)
-            return error_response(err_bad(lora_field.c_str(), why), req.peer);
-    }
-    const auto& lora_acquire = opt_.acquire_image ? images.lora_acquire : opt_.gen_lora_acquire;
-    if (!loras.empty() && !(opt_.pin_image_loras ? bool(images.pinned_lora_acquire)
-                                                : bool(lora_acquire)))
-        return error_response(err_unsupported(lora_field.c_str(), "this server was started without "
-                                                                  "adapters (--lora, --lora-dir)"),
-                              req.peer);
     /* An empty prompt becomes " ", as in the diffusers pipelines, unless the model pads a short
      * prompt itself (ImageGenInfo::min_tokens), as ComfyUI's tokenizers do. */
     if (r.prompt.empty() && info.min_tokens == 0) r.prompt = " ";
@@ -646,8 +562,6 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
 
     /* ---- the request: prompts rendered and tokenised, pictures resized */
     auto g = std::make_unique<gen::Request>();
-    g->dispatch_hold = std::move(dispatch_hold);
-    g->adapter_request_lease = std::move(adapter_request_lease);
     g->width = r.w;
     g->height = r.h;
     g->n = r.n;
@@ -776,7 +690,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         }
         std::shared_ptr<mm::Item> it;
         std::string why;
-        if (images.gen->picture(rgb, &it, &why) < 0 || !it)
+        if (deps_.images->picture(rgb, &it, &why) < 0 || !it)
             return error_response(err_bad("image", "the picture could not be used: " + why),
                                   req.peer);
         items.push_back(std::move(it));
@@ -836,7 +750,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             const std::string seg = rendered.substr(pos, at == std::string::npos ? std::string::npos
                                                                                  : at - pos);
             if (!seg.empty()) {
-                auto ids = images.tok->encode(seg, false, /*parse_special=*/true);
+                auto ids = deps_.tok->encode(seg, false, /*parse_special=*/true);
                 out->tokens.insert(out->tokens.end(), ids.begin(), ids.end());
             }
             if (at == std::string::npos) break;
@@ -860,7 +774,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             out->media = std::move(pm);
         }
         /* The fixed turn the generator drops; the prompt must start with it. */
-        const auto drop = images.tok->encode(info.drop_prefix, false, true);
+        const auto drop = deps_.tok->encode(info.drop_prefix, false, true);
         if (drop.size() > out->tokens.size() ||
             !std::equal(drop.begin(), drop.end(), out->tokens.begin())) {
             /* The model's own templates disagree; nothing the request did. */
@@ -872,7 +786,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         while ((int64_t)out->tokens.size() - out->n_drop < info.min_tokens)
             out->tokens.push_back(info.pad_token);
         if (info.aux_tokens) {
-            if (images.gen->encode_aux(prompt, &out->aux) < 0) {
+            if (deps_.images->encode_aux(prompt, &out->aux) < 0) {
                 *err = err_internal("the prompt could not be read by the model's second "
                                     "tokenizer");
                 return RAD_E_STATE;
@@ -918,82 +832,55 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             return error_response(err, req.peer);
     }
 
-    if (!admission) {
-        if (auto no = admit(1, req.peer)) return *no;
-        admission.reset(this);
-    }
+    if (auto no = admit(1, req.peer)) return *no;
+    auto release_admission = [this](Server*) { release(1); };
+    std::unique_ptr<Server, decltype(release_admission)> admission(this, release_admission);
 
     /* ---- the adapters' slot, held until the request is done */
     std::string lora_note;
     if (!loras.empty()) {
         std::string why;
-        auto acquire = [&] {
-            if (opt_.pin_image_loras)
-                return images.pinned_lora_acquire(pinned_loras, &g->lora_slot, &g->lora_hold,
-                                                  &lora_note, &why);
-            return lora_acquire(loras, &g->lora_slot, &g->lora_hold, &lora_note, &why);
-        };
-        int s;
-        if (opt_.acquire_image) {
-            std::unique_lock lock(image_adapter_mu_);
-            const auto waiter = image_adapter_waiters_.insert(image_adapter_waiters_.end(), 0);
-            bool waiting_for_slot = false;
-            for (;;) {
-                if (req.peer_gone()) { s = RAD_E_CANCELLED; break; }
-                if (stopping_.load()) { s = RAD_E_STATE; why = "the server is shutting down"; break; }
-                if (waiter == image_adapter_waiters_.begin()) {
-                    lock.unlock();
-                    s = acquire();
-                    lock.lock();
-                    if (s != RAD_E_FULL) break;
-                    if (!waiting_for_slot) {
-                        RAD_INFO("images: waiting for an adapter slot");
-                        waiting_for_slot = true;
-                    }
-                }
-                /* The image driver releases its slot after retiring the request. Poll
-                 * only the head while also checking for disconnected clients. */
-                image_adapter_turn_.wait_for(lock, std::chrono::milliseconds(50));
-            }
-            image_adapter_waiters_.erase(waiter);
+        std::unique_lock lock(image_adapter_mutex_);
+        const auto turn = image_adapter_waiters_.insert(image_adapter_waiters_.end(), 0);
+        auto finish_turn = [&](Server*) {
+            if (!lock.owns_lock()) lock.lock();
+            image_adapter_waiters_.erase(turn);
             image_adapter_turn_.notify_all();
-        } else {
-            s = acquire();
+        };
+        std::unique_ptr<Server, decltype(finish_turn)> waiting(this, finish_turn);
+        int s;
+        for (;;) {
+            if (req.peer_gone()) return HttpResponse::text(499, "client closed request\n");
+            if (stopping_.load()) return error_response(err_overloaded("server stopping"), req.peer);
+            if (turn == image_adapter_waiters_.begin()) {
+                lock.unlock();
+                s = opt_.gen_lora_acquire(loras, &g->lora_slot, &g->lora_hold, &lora_note, &why);
+                lock.lock();
+                if (s != RAD_E_FULL) break;
+            }
+            // Slot retirement happens in the generator, independently of the HTTP response.
+            image_adapter_turn_.wait_for(lock, std::chrono::milliseconds(50));
         }
         if (s < 0) {
-            if (s == RAD_E_CANCELLED) {
-                metrics_.observe_http(499);
-                return HttpResponse::text(499, "client closed request\n");
-            }
             ApiError e = err_bad("loras", why);
             if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
-            else if (s != RAD_E_INVAL && s != RAD_E_SHAPE && s != RAD_E_FORMAT &&
-                     s != RAD_E_UNSUPPORTED) { e.status = 503; e.type = "server_error"; }
+            else if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
             return error_response(e, req.peer);
         }
-        /* The composed slot owns the weights now. Release this request's
-         * source references while its lease still tracks adapter use. */
-        pinned_loras.clear();
     }
 
-    if (opt_.acquire_image && req.peer_gone()) {
-        metrics_.observe_http(499);
-        return HttpResponse::text(499, "client closed request\n");
-    }
-
-    /* ---- queued on the generator */
+    /* ---- queued */
     std::shared_ptr<gen::Ticket> ticket = g->ticket;
     {
         std::string why;
-        const int s = images.gen->submit(std::move(g), &why);
+        const int s = deps_.images->submit(std::move(g), &why);
         if (s < 0) {
             ApiError e = err_bad("", why.empty() ? std::string(rad_strerror(s)) : why);
             if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
             return error_response(e, req.peer);
         }
     }
-    /* The driver owns the turn after submission. Encoding needs only the ticket. */
-    images = {};
+    admission.release(); // The response now owns the admission count.
     std::string lora_s;
     for (const auto& [n, w] : loras) lora_s += (lora_s.empty() ? " loras=" : ",") + n + fmt(":%g", w);
     RAD_INFO("images: %s %dx%d n=%d steps=%d seed=%llu%s%s%s%s", edit ? "edit" : "generation", r.w,
@@ -1054,17 +941,6 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     };
     const int64_t created = (int64_t)std::time(nullptr);
 
-    const auto set_dispatch_timing = [&](HttpResponse& response) {
-        if (!opt_.queue_image) return;
-        const auto selection = dispatch_timing.selection;
-        const char* source = selection == ImageSelection::Warm ? "warm" :
-                             selection == ImageSelection::Cold ? "cold" : "active";
-        response.set_header("Server-Timing",
-            rad::fmt("image_queue;dur=%.3f, image_selection;dur=%.3f, image_activation;desc=\"%s\"",
-                double(dispatch_timing.queued_ns) / 1e6,
-                double(dispatch_timing.selection_ns) / 1e6, source));
-    };
-
     if (!r.stream) {
         std::vector<gen::Image> done;
         for (;;) {
@@ -1077,15 +953,17 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             if (!to) break;
             if (req.peer_gone()) {
                 ticket->cancel.store(true);
+                release(1);
                 metrics_.observe_http(499);
                 return HttpResponse::text(499, "client closed request\n");
             }
             if (stopping_.load()) {
                 ticket->cancel.store(true);
+                release(1);
                 return error_response(err_overloaded("the server is shutting down"), req.peer);
             }
         }
-        admission.reset();
+        release(1);
         if (ticket->status() < 0 || (int32_t)done.size() != r.n) {
             /* RAD_E_INVAL is the driver's admission refusal (a request this deployment can never
              * serve, e.g. conditioning longer than the cache), so a 400; anything else failed
@@ -1121,9 +999,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         out["size"] = size_s;
         out["usage"] = usage();
         metrics_.observe_http(200);
-        auto response = HttpResponse::json_body(200, json_dump(out));
-        set_dispatch_timing(response);
-        return response;
+        return HttpResponse::json_body(200, json_dump(out));
     }
 
     /* ---- streamed: partial images as previews arrive, one completed event per image */
@@ -1131,12 +1007,12 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     res.status = 200;
     res.content_type = "text/event-stream";
     res.set_header("Cache-Control", "no-cache");
-    set_dispatch_timing(res);
     const std::string kind = edit ? "image_edit" : "image_generation";
     auto finished = std::make_shared<bool>(false);
-    std::shared_ptr<Server> stream_admission(std::move(admission));
+    auto released = std::make_shared<bool>(false);
     const std::string quality = r.quality;
-    res.next = [this, ticket, kind, encode, created, size_s, bg_out, fmt, quality, usage, finished](std::string& chunk) mutable -> bool {
+    res.next = [this, ticket, kind, encode, created, size_s, bg_out, fmt, quality, usage, finished,
+                released](std::string& chunk) mutable -> bool {
         if (*finished) return false;
         gen::Image im;
         bool to = false;
@@ -1163,6 +1039,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         }
         if (to) { chunk.clear(); return !stopping_.load(); }
         *finished = true;
+        if (!*released) { *released = true; release(1); }
         if (ticket->status() < 0) {
             json ev;
             ev["type"] = "error";
@@ -1175,9 +1052,9 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         chunk.clear();
         return false;
     };
-    res.on_close = [ticket, stream_admission = std::move(stream_admission)](bool ok) mutable {
+    res.on_close = [this, ticket, released](bool ok) {
         if (!ok) ticket->cancel.store(true);
-        stream_admission.reset();
+        if (!*released) { *released = true; release(1); }
     };
     metrics_.observe_http(200);
     return res;

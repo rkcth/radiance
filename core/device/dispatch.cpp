@@ -368,6 +368,22 @@ void VMem::release() {
     ext_.clear();
 }
 
+int64_t VMem::committed_bytes(int64_t off, int64_t bytes) const {
+    if (off < 0 || bytes <= 0 || off > size_ || bytes > size_ - off) return 0;
+    const int64_t end = off + bytes;
+    int64_t total = 0;
+    for (const auto& extent : ext_)
+        total += std::max<int64_t>(0, std::min(end, extent.first + extent.second) -
+                                      std::max(off, extent.first));
+    return total;
+}
+
+int64_t VMem::committed_suffix() const {
+    if (ext_.empty()) return 0;
+    const auto& last = ext_.back();
+    return last.first + last.second == size_ ? last.second : 0;
+}
+
 bool VMem::is_committed(int64_t off, int64_t bytes) const {
     if (bytes <= 0) return true;
     if (off < 0 || off + bytes > size_) return false;
@@ -934,26 +950,40 @@ int  rad_event_sync(RadEvent e) {
 }
 void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
 
+/* The VRAM the runtime keeps as queue scratch on `p`'s card once kernels with a private segment
+ * (spill, or a local array: step_advance's) have been dispatched: the runtime hands a queue
+ * scratch memory at the first such dispatch, and the card showed +114 MiB after the first
+ * speculative step and kept it, 150 MiB with a larger segment. Left out of the budget, it is
+ * taken from the margin: serving ran with 27-65 MiB of a card free. 5 MiB a CU (the R9700 reports
+ * 32), 160 MiB, over the measured. */
+extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
+    if (!p || p->is_host_backend || p->unified) return 0;
+    return (int64_t)p->n_cu * (5LL * 1024 * 1024);
+}
+
 /* Whether launches chain, by engine: rad_dev_chain_infer on a thread of an engine (EngineScope)
  * records that engine's answer and rad_dev_chain_enabled on any of its threads reads it. A process
  * serves several models, each with its own plugin's answer; a single answer for the process was
  * the answer of whichever model started last. Owner 0 is a thread outside every engine (a tool, a
  * test). Only where the backend chains: the AQL backend writes the record a chained form reads,
- * while a HIP launch carries only the kernel's own arguments. */
+ * while a HIP launch carries only the kernel's own arguments. The answer is 2 where every chained
+ * form the engine can launch fences itself (RadKernelChainFn saying 2), which
+ * rad_dev_chain_unfenced reads. */
 static std::mutex              g_chain_mu;
-static std::map<int, int>      g_chain_pays;    /* by owner */
+static std::map<int, int>      g_chain_pays;    /* by owner: 0, 1, or 2 (their packets unacquired) */
 static std::atomic<uint64_t>   g_chain_gen{1};
 void rad_dev_chain_infer(int pays) {
     {
         std::lock_guard<std::mutex> lk(g_chain_mu);
-        g_chain_pays[rad::engine_owner()] = pays ? 1 : 0;
+        g_chain_pays[rad::engine_owner()] = pays == 2 ? 2 : pays ? 1 : 0;
     }
     g_chain_gen.fetch_add(1, std::memory_order_release);
 }
-int rad_dev_chain_enabled(void) {
-    /* Asked on every launch: a thread keeps its engine's answer until some answer changes. */
+/* The calling thread's engine's answer where the backend chains, else 0: asked on every launch,
+ * so a thread keeps it until some answer changes. */
+static int chain_mode() {
     thread_local uint64_t seen = 0;
-    thread_local int      owner = -1, on = 0;
+    thread_local int      owner = -1, mode = 0;
     const uint64_t gen = g_chain_gen.load(std::memory_order_acquire);
     const int      o = rad::engine_owner();
     if (seen != gen || owner != o) {
@@ -963,12 +993,14 @@ int rad_dev_chain_enabled(void) {
             const auto it = g_chain_pays.find(o);
             if (it != g_chain_pays.end()) pays = it->second;
         }
-        on = pays && std::strcmp(rad::device_backend_name(), "aql") == 0 ? 1 : 0;
+        mode = pays && std::strcmp(rad::device_backend_name(), "aql") == 0 ? pays : 0;
         seen = gen;
         owner = o;
     }
-    return on;
+    return mode;
 }
+int rad_dev_chain_enabled(void)  { return chain_mode() != 0; }
+int rad_dev_chain_unfenced(void) { return chain_mode() == 2; }
 
 int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
     return dev()->event_elapsed_ms(a, b, out);

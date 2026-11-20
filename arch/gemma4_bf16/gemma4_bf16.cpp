@@ -2269,7 +2269,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
              (long long)dg.n_layer, (long long)m.n_main, (long long)dg.n_head_all,
              (long long)dg.n_head_kv_all, (long long)dg.head_dim, (long long)dg.n_ff_all,
              dc.causal ? "causal" : "non-causal", (long long)dc.window, m.n_taps,
-             (long long)dc.steps(), m.df2.head_i8 ? "8-bit" : "2-bit");
+             (long long)dc.steps(), m.df2.head_i8 ? "8-bit" : m.df2.head_bf16 ? "bf16" : "2-bit");
     return RAD_OK;
 }
 

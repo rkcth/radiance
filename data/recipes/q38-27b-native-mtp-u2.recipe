@@ -1,0 +1,11 @@
+# Optional companion to the dense 64-layer Qwen3.8-27B IQR target recipes.
+# The checkpoint must carry native mtp.* tensors. With a split target head, prepare
+# it with tools/vhead.py --keep-lm-head. Do not pass --draft-model (DFlash2 wins).
+# These rules name only the extra block and its draft projection; they need no Grams.
+blk.64.attn_qg.weight      rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.attn_k.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.attn_v.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.attn_output.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.ffn_gate_up.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128
+blk.64.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128
+mtp.draft_head.weight      rtn codes=u2 zero=u8 group=128 scale=f16

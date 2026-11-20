@@ -717,6 +717,7 @@ int Vocab::load(VocabBuild b) {
      * text never becomes terminal, and the list is explicit rather than a pattern, so a token
      * like `<|end_of_thinking|>` does not end generations. Every addition is logged. */
     eog_.clear();
+    eog_named_.clear();
     if (b_.eos >= 0) eog_.push_back(b_.eos);
     if (b_.eot >= 0 && b_.eot != b_.eos) eog_.push_back(b_.eot);
     {
@@ -764,6 +765,7 @@ int Vocab::load(VocabBuild b) {
             if (id < 0 || id >= (int32_t)b_.tokens.size()) continue;
             if (std::find(eog_.begin(), eog_.end(), id) != eog_.end()) continue;
             eog_.push_back(id);
+            eog_named_.push_back(id);
             named += (named.empty() ? "" : " ") + b_.tokens[id] + "=" + std::to_string(id);
         }
         if (!named.empty())
@@ -798,6 +800,18 @@ float Vocab::score(int32_t id) const {
     return b_.scores[id];
 }
 
+
+std::vector<int32_t> Vocab::drop_named_eog(const std::vector<int32_t>& ids) {
+    std::vector<int32_t> out;
+    for (int32_t id : ids) {
+        const auto n = std::find(eog_named_.begin(), eog_named_.end(), id);
+        if (n == eog_named_.end()) continue;
+        eog_named_.erase(n);
+        eog_.erase(std::remove(eog_.begin(), eog_.end(), id), eog_.end());
+        out.push_back(id);
+    }
+    return out;
+}
 
 bool Vocab::is_eog(int32_t id) const {
     return id >= 0 && std::find(eog_.begin(), eog_.end(), id) != eog_.end();

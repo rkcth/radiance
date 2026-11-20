@@ -374,7 +374,8 @@ static const RadOperandSpec oMoeGemmQ[] = { { "a", RAD_OPD_IN, 0 },
                                             { "expert_offset", RAD_OPD_IN, 0 },
                                             { "w_odd", RAD_OPD_WTAB, 0 },
                                             { "w_odd_scale", RAD_OPD_WTAB, 0 },
-                                            { "y", RAD_OPD_OUT, 0 } };
+                                            { "y", RAD_OPD_OUT, 0 },
+                                            { "split", RAD_OPD_IN, 1 } };
 /* `a_group` is an int8 activation's scale group, which no row here reads: the dtypes this library
  * serves take E4M3 or int4 activations, and the op's schema is one for every library. */
 static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
@@ -647,7 +648,8 @@ static const RadOperandSpec oMoeGemmQMod4[] = { { "a", RAD_OPD_IN, 0 }, { "a_sca
                                                 { "w_1", RAD_OPD_WTAB, 0 }, { "w_1_scale", RAD_OPD_WTAB, 0 },
                                                 { "w_2", RAD_OPD_WTAB, 0 }, { "w_2_scale", RAD_OPD_WTAB, 0 },
                                                 { "w_3", RAD_OPD_WTAB, 0 }, { "w_3_scale", RAD_OPD_WTAB, 0 },
-                                                { "y", RAD_OPD_OUT, 0 } };
+                                                { "y", RAD_OPD_OUT, 0 },
+                                                { "split", RAD_OPD_IN, 1 } };
 
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,

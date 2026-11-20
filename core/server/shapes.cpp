@@ -57,7 +57,9 @@ int read_ask(const HttpRequest& q, const OaiLimits& lim, const gen::ShapeGenInfo
         *err = err_bad(p, why);
         return RAD_E_INVAL;
     };
-    static const char* const kFields[] = { "image", "seed", "octree_resolution",
+    /* `model` names the model in a process that serves several (the front routes by it); the
+     * reference's own server takes none, and a one-model process ignores it. */
+    static const char* const kFields[] = { "model", "image", "seed", "octree_resolution",
                                            "num_inference_steps", "guidance_scale", "type",
                                            "volume_decoding", "texture", "text", "mesh",
                                            "face_count", "num_chunks", "mc_algo" };

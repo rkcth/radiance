@@ -1140,11 +1140,10 @@ TEST(the_c_surface_drives_the_builder) {
     rad_weight w = rad_decl_weight(h, "blk.0.ffn_gate.weight", &wd);
     CHECK(w != RAD_NULL_HANDLE);
 
-    const rad_weight weights[] = { w };
     rad_op op = RAD_OP(h, "t_gemm",
                        RAD_PARAMS(RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
                                   RAD_STR("dtype", "bf16")),
-                       weights, 1);
+                       RAD_WEIGHTS(w));
     CHECK(op != RAD_NULL_HANDLE);
     CHECK_EQ(rad_op_resolved(h, op), 1);
     CHECK_EQ(rad_op_resolved(h, 99), 0);
@@ -1182,6 +1181,35 @@ TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     CHECK(p.drafter.name == nullptr);
     CHECK_EQ(p.drafter.kind, (int)RAD_DRAFT_SERIAL);
     CHECK_EQ(p.drafter.depth, 3);
+}
+
+TEST(calibration_history_declares_no_draft_depth_or_proposal) {
+    Registry reg;
+    RadBuildCtx ctx = make_ctx();
+    ctx.max_spec = 0;
+    ctx.calib_dir = "/tmp/calibration";
+    ctx.calib_tokens = 16;
+
+    RadDrafterDecl d{};
+    d.name = "mtp";
+    d.kind = RAD_DRAFT_HISTORY;
+    Builder b(reg, make_meta(), ctx);
+    CHECK_OK(rad_declare_drafter(&b, &d));
+    CHECK_EQ(b.program().drafter.depth, 0);
+    CHECK_EQ(b.program().drafter.proposal, RAD_NULL_HANDLE);
+    CHECK_EQ(b.program().drafter.proposal_pitch, 0);
+
+    Builder proposed(reg, make_meta(), ctx);
+    d.proposal_pitch = 1;
+    CHECK_EQ(rad_declare_drafter(&proposed, &d), RAD_E_INVAL);
+    d.proposal_pitch = 0;
+    ctx.max_spec = 1;
+    Builder speculative(reg, make_meta(), ctx);
+    CHECK_EQ(rad_declare_drafter(&speculative, &d), RAD_E_INVAL);
+    ctx.max_spec = 0;
+    ctx.calib_dir = nullptr;
+    Builder serving(reg, make_meta(), ctx);
+    CHECK_EQ(rad_declare_drafter(&serving, &d), RAD_E_INVAL);
 }
 
 /* rad_drafter_short_block applies only to a declared block drafter, and only to a block shorter

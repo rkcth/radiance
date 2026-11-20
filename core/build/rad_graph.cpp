@@ -253,7 +253,10 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
     }
 
     /* ---------------------------------------------------------------- the drafter (spec §10) */
-    if (p.drafter.kind != RAD_DRAFT_NONE) {
+    if (p.drafter.kind == RAD_DRAFT_HISTORY) {
+        s += fmt("---- drafter: '%s', RAD_DRAFT_HISTORY -- calibration pass, no proposals\n\n",
+                 p.drafter_name.c_str());
+    } else if (p.drafter.kind != RAD_DRAFT_NONE) {
         const bool blk = p.drafter.kind == RAD_DRAFT_BLOCK;
         s += fmt("---- drafter: '%s', %s, %d token(s) a step\n",
                  p.drafter_name.c_str(),
@@ -729,7 +732,8 @@ std::string dump_graph_json(const Program& p, Registry* r) {
     if (p.drafter.kind != RAD_DRAFT_NONE) {
         json d;
         d["name"]  = p.drafter_name;
-        d["kind"]  = p.drafter.kind == RAD_DRAFT_BLOCK ? "block" : "serial";
+        d["kind"]  = p.drafter.kind == RAD_DRAFT_HISTORY ? "history"
+                   : p.drafter.kind == RAD_DRAFT_BLOCK ? "block" : "serial";
         d["depth"] = p.drafter.depth;
         if (p.drafter.kind == RAD_DRAFT_BLOCK) {
             d["window"] = p.drafter.window;

@@ -276,8 +276,8 @@ TEST(the_file_is_json_written_at_boot_and_replaced_through_a_rename) {
 }
 
 /* The profile file is local data with a contract, and its tmp name is predictable. These pin
- * the loader's refusals -- a negative count (which used to wrap into a ~100% share), an
- * n_trunk_layers that truncates through int32 into exactly the "another model" match -- and
+ * the loader's refusals -- a negative count (which read unsigned would wrap into a share near
+ * 100%), an n_trunk_layers that truncates through int32 into exactly the "another model" match -- and
  * that the tmp name is created exclusively: a symlink planted there must survive untouched. */
 TEST(the_profile_file_and_its_tmp_name_keep_their_contracts) {
     auto profile = [](const std::string& body) {

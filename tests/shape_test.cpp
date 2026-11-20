@@ -341,9 +341,7 @@ TEST(a_request_runs_cond_steps_latent_and_the_grid_levels) {
     REQUIRE(r != nullptr);
     auto t = r->ticket;
     std::string why;
-    CHECK(!f.drv.busy());
     CHECK_OK(f.drv.submit(std::move(r), &why));
-    CHECK(f.drv.busy());
     CHECK_EQ(t->steps, 3);
     CHECK_EQ(t->resolution, 128);
     std::string kinds;
@@ -352,7 +350,6 @@ TEST(a_request_runs_cond_steps_latent_and_the_grid_levels) {
     for (int i = 0; i < 1000; ++i) {
         const RadBatch* b = f.drv.next(i);
         if (!b) break;
-        CHECK(f.drv.busy());
         const RadShapeGenBatch* S = b->sgen_b;
         REQUIRE(S != nullptr);
         kinds += kind_of(b->gen);
@@ -377,9 +374,7 @@ TEST(a_request_runs_cond_steps_latent_and_the_grid_levels) {
             f.answer(b, 0.5f);
         }
         CHECK_OK(f.drv.done());
-        CHECK(f.drv.busy());
     }
-    CHECK(!f.drv.busy());
     /* 65^3 coarse points in passes of 4096, then the finer level's shell. */
     REQUIRE(kinds.size() > 5);
     CHECK_EQ(kinds.substr(0, 5), std::string("CSSSL"));

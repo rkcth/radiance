@@ -75,6 +75,10 @@ extern "C" int64_t halo_rad_attn_prefill_h256_v4_scratch(const RadArgs* a) {
 extern "C" int64_t halo_rad_attn_prefill_h256_k6_scratch(const RadArgs* a) {
     return halo_prefill_scratch<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA>(a, 352);
 }
+/* The int8 cache: a token's row is 2 * 256 + 4 = 516 bytes. */
+extern "C" int64_t halo_rad_attn_prefill_h256_i8_scratch(const RadArgs* a) {
+    return halo_prefill_scratch<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA>(a, 516);
+}
 #define P_SPLIT(a, r) halo_prefill_split_setup<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA>((a), (r))
 
 extern "C" int halo_attn_prefill_h256_gqa6_fp8kv(const HaloArgs* a, hipStream_t s) {
@@ -88,6 +92,9 @@ extern "C" int halo_attn_prefill_h256_gqa6_fp8v4kv(const HaloArgs* a, hipStream_
 }
 extern "C" int halo_attn_prefill_h256_gqa6_k6v4kv(const HaloArgs* a, hipStream_t s) {
     return prefill_launch<0, O_V4 | O_K6>(a, s);
+}
+extern "C" int halo_attn_prefill_h256_gqa6_i8kv(const HaloArgs* a, hipStream_t s) {
+    return prefill_launch<0, O_KVI8>(a, s);
 }
 
 // The e4m3 legs over an 8-bit cache: `legs` 1 Q.K^T, 2 P.V, 3 both. XOPT names the cache.
@@ -170,6 +177,16 @@ extern "C" int halo_rad_attn_prefill_h256_k6v4(const RadArgs* a, RadStream s) {
     return halo_attn_prefill_h256_gqa6_k6v4kv(&r, (hipStream_t)s);
 }
 
+/* The int8 cache: a token's row is 2 * 256 + 4 = 516 bytes (int8 K and V, an f16 scale each). */
+extern "C" int halo_rad_attn_prefill_h256_i8(const RadArgs* a, RadStream s) {
+    if (check_dims_once() != RAD_OK) return HALO_NO(RAD_E_SHAPE);
+    HaloArgs r;
+    int rc = fill_paged_row(a, &r, 256, 516);
+    if (rc != RAD_OK) return rc;
+    P_SPLIT(a, &r);
+    return halo_attn_prefill_h256_gqa6_i8kv(&r, (hipStream_t)s);
+}
+
 /* The 8-bit caches with e4m3 products. `legs` is the row's `prefill_fp8`, which its constraint has
  * matched: 1 Q.K^T, 2 P.V, 3 both. `row` is a token's bytes in a (block, head) page: 512 for fp8,
  * 400 for fp8_v4, 352 for k6_v4. */
@@ -235,6 +252,9 @@ extern "C" int halo_attn_decode_h256_gqa6_fp8v4kv(const HaloArgs* a, hipStream_t
 extern "C" int halo_attn_decode_h256_gqa6_k6v4kv(const HaloArgs* a, hipStream_t stream) {
     return decode_launch<A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, HALO_D_OPT | O_V4 | O_K6, 0>(a, stream);
 }
+extern "C" int halo_attn_decode_h256_gqa6_i8kv(const HaloArgs* a, hipStream_t stream) {
+    return decode_launch<A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, HALO_D_OPT | O_KVI8, 0>(a, stream);
+}
 
 /* ---- the plugin ABI entry points of the decode band */
 
@@ -248,6 +268,10 @@ extern "C" int64_t halo_rad_attn_decode_h256_v4_scratch(const RadArgs* a) {
 /* The k6_v4 cache: a token's row is 22 * 256 / 16 = 352 bytes (int6 K, int4 V, f16 scales). */
 extern "C" int64_t halo_rad_attn_decode_h256_k6_scratch(const RadArgs* a) {
     return decode_scratch<A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, HALO_D_OPT>(a, 352);
+}
+/* The int8 cache: a token's row is 2 * 256 + 4 = 516 bytes. */
+extern "C" int64_t halo_rad_attn_decode_h256_i8_scratch(const RadArgs* a) {
+    return decode_scratch<A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, HALO_D_OPT>(a, 516);
 }
 
 extern "C" int halo_rad_attn_decode_h256_fp8(const RadArgs* a, RadStream s) {
@@ -282,4 +306,12 @@ extern "C" int halo_rad_attn_decode_h256_k6v4(const RadArgs* a, RadStream s) {
     int rc = decode_common<A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, HALO_D_OPT>(a, &r, 352);
     if (rc != RAD_OK) return rc;
     return halo_attn_decode_h256_gqa6_k6v4kv(&r, (hipStream_t)s);
+}
+
+extern "C" int halo_rad_attn_decode_h256_i8(const RadArgs* a, RadStream s) {
+    if (check_dims_once() != RAD_OK) return HALO_NO(RAD_E_SHAPE);
+    HaloArgs r;
+    int rc = decode_common<A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, HALO_D_OPT>(a, &r, 516);
+    if (rc != RAD_OK) return rc;
+    return halo_attn_decode_h256_gqa6_i8kv(&r, (hipStream_t)s);
 }

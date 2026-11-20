@@ -60,6 +60,9 @@ class DraftController {
 public:
     struct Params {
         int  max_depth = 0;       /* the deployment's window; 0 disables speculation entirely */
+        /* The head's own rounds when the window is wider than they are (--draft-suffix: a suffix
+         * step verifies more rows than the head drafts); 0 = max_depth. */
+        int  head_depth = 0;
         /* The adaptive policy: `--draft-window adaptive` with a serial drafter, decided by
          * Scheduler::init. Off, the depth is max_depth. */
         bool adapt = false;
@@ -114,7 +117,7 @@ public:
 
     /* The draft depth for the next step; 0 means do not speculate. Constant: under the adaptive
      * policy it is the ceiling, and window_for() is the window. */
-    int  next_depth() const { return p_.max_depth; }
+    int  next_depth() const { return p_.head_depth > 0 ? p_.head_depth : p_.max_depth; }
 
     /* ---------------------------------------------------------- the adaptive policy */
     bool adaptive() const { return adapt_; }
@@ -146,7 +149,7 @@ public:
     /* The deepest window a step at depth D carries: D capped at the deepest stop it was chosen
      * over; the ceiling before the first choice or with the policy off. Proposals from outside
      * the head (prompt lookup) are held to it, so they add no deeper pass shape. */
-    int  step_window() const { return adapt_ && step_w_ > 0 ? step_w_ : p_.max_depth; }
+    int  step_window() const { return adapt_ && step_w_ > 0 ? step_w_ : next_depth(); }
 
     /* T(R): a drafting decode step of `q_rows` query rows (every sequence's verified token and
      * its drafts) took `ms` since the end of the previous step, the head's rounds included. Fed

@@ -29,6 +29,11 @@
 // The residual is read and written; each thread rewrites only the columns it read, so the second
 // pass reads its own writes back.
 //
+// `rmsnorm_quant_i8g` and its two-rank all-reduce form are the same junction with quant_act_i8g's
+// quantiser instead (GRP): row-major codes and an f32 scale per (row, 128 columns), what gemm_nt_q
+// reads at i8a8, w4a8i8_asym and w5a8i8. Only the epilogue differs; it reads the same bf16 norm
+// output from LDS, so the codes are the norm + quant_act_i8g pair's bytes.
+//
 // Returns a negative code instead of throwing, for the reason given in halo_gemm_fp8a8.hip.
 #include "halo_chain.h"
 #include "halo.h"
@@ -37,6 +42,7 @@
 #include "halo_common.h"
 #include "halo_ar_seq.h"
 #include "halo_ar_wide.h"
+#include "halo_q8.h"
 #include <cstdint>
 
 namespace {
@@ -64,15 +70,20 @@ __device__ __forceinline__ float gain(const void* w, uint32_t i, bool f32) {
     return f32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
 }
 
+// quant_act_i8g's group, the width of one scale (halo_quant_act_fp8.hip's kGroup).
+constexpr uint32_t kGroupI8g = 128;
+
 // RES:  a residual is present; the norm is taken of `res + d` (stored back into `res`), where d is
 //       the branch `x` itself or, with POST, rmsnorm(x; w_post).  Without RES the norm is of `x`.
 // SCL:  the sum is multiplied by the [1] scalar before it is stored and normalised.
-// `ybuf` holds the row's norm output for the fragment-order store, which reads across threads.
+// GRP:  quant_act_i8g's codes and scales (halo_q8.h's q8_row_i8g) instead of quant_act_i8's; `Sr`
+//       then holds n / 128 scales.
+// `ybuf` holds the row's norm output for the code store, which reads across threads.
 //
 // The row body from the junction on: `s1` is the post-norm's factor, already reduced over `xr` by
 // the caller (the plain kernel takes it off the row; the all-reduce form off the reduced sum it has
 // just stored). l2 and lm are this function's own reduction planes.
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false>
 __device__ __forceinline__ void junction_row(
     const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
     const void* __restrict__ wp, float sv, signed char* __restrict__ qr, float* __restrict__ Sr,
@@ -102,6 +113,11 @@ __device__ __forceinline__ void junction_row(
         ybuf[i] = y;
         if (yr) yr[i] = y;
         m = fmaxf(m, fabsf(bf2f(y)));
+    }
+    if constexpr (GRP) {
+        __syncthreads();   // publishes ybuf to every thread
+        q8_row_i8g<THR>(ybuf, qr, Sr, n);
+        return;
     }
     m = halo_wave_max(m);
     if ((threadIdx.x & 31) == 0) lm[threadIdx.x >> 5] = m;
@@ -151,7 +167,13 @@ __device__ __forceinline__ int4 fold_word8(const int4* const* src4, size_t k) {
     return a;
 }
 
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+// A row's scales: one, or n / 128 at quant_act_i8g's grid.
+template <bool GRP>
+__device__ __forceinline__ uint32_t scales_a_row(uint32_t n) {
+    return GRP ? n / kGroupI8g : 1u;
+}
+
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -170,10 +192,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
         ss = block_sum<THR / kWave>(ss, l1);
         s1 = rsqrtf(ss / (float)n + eps);
     }
-    junction_row<WF32, RES, POST, SCL, THR>(
+    junction_row<WF32, RES, POST, SCL, THR, GRP>(
         xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, SCL ? scalar_of(sc, sc_f32) : 1.0f,
-        q + (size_t)row * n, S + row, yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1,
-        ybuf, l2, lm);
+        q + (size_t)row * n, S + (size_t)row * scales_a_row<GRP>(n),
+        yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1, ybuf, l2, lm);
 }
 
 // The same kernel at decode heights (THR 1024, n <= 1024 * EPT), with every operand of the row
@@ -184,8 +206,8 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
 // columns in registers and none needs another's; only the fragment-order store crosses threads,
 // through `ybuf`. The sums, their order and every element's arithmetic are junction_row's, so the
 // output bytes are the same. One row of it, for this kernel and for the all-reduce's tail
-// (ar_rmsnorm_quant_i8_tail_kernel).
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
+// (ar_rmsnorm_quant_i8_tail_kernel). GRP as in junction_row.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT, bool GRP = false>
 __device__ __forceinline__ void junction_reg_row(
     const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -249,6 +271,11 @@ __device__ __forceinline__ void junction_reg_row(
             m = fmaxf(m, fabsf(bf2f(y)));
         }
     }
+    if constexpr (GRP) {
+        __syncthreads();   // publishes ybuf to every thread
+        q8_row_i8g<THR>(ybuf, qr, Sr, n);
+        return;
+    }
     m = halo_wave_max(m);
     if ((tid & 31) == 0) lm[tid >> 5] = m;
     __syncthreads();   // also publishes ybuf to every thread
@@ -268,7 +295,7 @@ __device__ __forceinline__ void junction_reg_row(
     }
 }
 
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT, bool GRP = false>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -277,10 +304,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
     extern __shared__ uint16_t ybuf[];
     __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
     const uint32_t row = blockIdx.x;
-    junction_reg_row<WF32, RES, POST, SCL, THR, EPT>(
+    junction_reg_row<WF32, RES, POST, SCL, THR, EPT, GRP>(
         x + (size_t)row * x_ld, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sc, sc_f32,
-        q + (size_t)row * n, S + row, yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, ybuf,
-        l1, l2, lm);
+        q + (size_t)row * n, S + (size_t)row * scales_a_row<GRP>(n),
+        yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, ybuf, l1, l2, lm);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -303,7 +330,7 @@ __device__ __forceinline__ unsigned int arq8_load_acq(const unsigned int* p) {
     return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -364,9 +391,10 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
         }
         float s1 = 0.0f;
         if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
-        junction_row<WF32, RES, POST, SCL, THR>(
-            xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sv, q + (size_t)row * n, S + row,
-            yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1, ybuf, l2, lm);
+        junction_row<WF32, RES, POST, SCL, THR, GRP>(
+            xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sv, q + (size_t)row * n,
+            S + (size_t)row * scales_a_row<GRP>(n), yo ? yo + (size_t)row * y_ld : nullptr, n, eps,
+            wadd, s1, ybuf, l2, lm);
         __syncthreads();   /* the planes and ybuf are re-used by the next row this block owns */
     }
 }
@@ -845,9 +873,11 @@ __global__ __launch_bounds__(THR) void halo_r4dchain_ar_rmsnorm_quant_i8_sp(HALO
 //   5 out_bf16  [M][n] bf16, optional the norm output the unfused norm would have stored
 //   6 w_post    [n]    optional       a post-norm on x before the add; needs the residual
 //   7 scalar    [1]    optional       multiplies the sum; needs the residual
+// rmsnorm_quant_i8g (`grp`) takes the same operands with quant_act_i8g's grid: q row-major, scale
+// [M][n / 128], n a multiple of 128.
 enum { RQ_X = 0, RQ_RES, RQ_W, RQ_Q, RQ_S, RQ_Y, RQ_WP, RQ_SC };
 
-extern "C" int halo_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
+static int rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream, bool grp) {
     int emit_rc = RAD_OK;
     const RadTensor* x  = halo_opt(a, RQ_X);
     const RadTensor* rs = halo_opt(a, RQ_RES);
@@ -868,13 +898,14 @@ extern "C" int halo_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     if (wp && (halo_numel(wp) != n || wp->dtype != w->dtype)) return HALO_NO(RAD_E_SHAPE);
     if (sc && (halo_numel(sc) != 1 || (sc->dtype != RAD_F32 && sc->dtype != RAD_BF16)))
         return HALO_NO(RAD_E_SHAPE);
+    if (grp && n % kGroupI8g) return HALO_NO(RAD_E_SHAPE);   // whole scale groups
     if (halo_numel(q) != M * n || !halo_contig(q)) return HALO_NO(RAD_E_SHAPE);
-    if (halo_numel(s) != M || !halo_contig(s)) return HALO_NO(RAD_E_SHAPE);
+    if (halo_numel(s) != M * (grp ? n / kGroupI8g : 1) || !halo_contig(s)) return HALO_NO(RAD_E_SHAPE);
     if (y && halo_numel(y) != M * n) return HALO_NO(RAD_E_SHAPE);
     if (rs && halo_numel(rs) != M * n) return HALO_NO(RAD_E_SHAPE);
     const long long xp = halo_row_pitch(x), rp = rs ? halo_row_pitch(rs) : n, yp = y ? halo_row_pitch(y) : n;
     if (xp < 0 || rp < 0 || yp < 0) return HALO_NO(RAD_E_STRIDE);
-    // The row's norm output is staged in LDS for the cross-thread fragment-order store.
+    // The row's norm output is staged in LDS for the cross-thread code store.
     const size_t lds = (size_t)n * sizeof(uint16_t);
     if (lds > 60 * 1024) return HALO_NO(RAD_E_SHAPE);
 
@@ -895,35 +926,40 @@ extern "C" int halo_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
                   : thr == 512  ? (n <= 4096 ? 8 : n <= 6144 ? 12 : n <= 8192 ? 16 : 0)
                   : 0;
 
-#define HALO_RQI8_T(WF, RS, PO, SC, T) emit_rc = HALO_EMIT(stream,                                 \
-    (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)M), dim3(T), lds,               \
+#define HALO_RQI8_T(WF, RS, PO, SC, T, G) emit_rc = HALO_EMIT(stream,                              \
+    (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T, G>), dim3((uint32_t)M), dim3(T), lds,            \
     (const uint16_t*)halo_p(x), (uint16_t*)halo_wp(rs), halo_p(w), halo_p(wp), halo_p(sc), scf,       \
     (signed char*)halo_wp(q), (float*)halo_wp(s), (uint16_t*)halo_wp(y), (uint32_t)n, eps, wadd,    \
     (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
-#define HALO_RQI8_R(WF, RS, PO, SC, T, E) emit_rc = HALO_EMIT(stream,                              \
-    (rmsnorm_quant_i8_reg_kernel<WF, RS, PO, SC, T, E>), dim3((uint32_t)M), dim3(T), lds,        \
+#define HALO_RQI8_R(WF, RS, PO, SC, T, E, G) emit_rc = HALO_EMIT(stream,                           \
+    (rmsnorm_quant_i8_reg_kernel<WF, RS, PO, SC, T, E, G>), dim3((uint32_t)M), dim3(T), lds,     \
     (const uint16_t*)halo_p(x), (uint16_t*)halo_wp(rs), halo_p(w), halo_p(wp), halo_p(sc), scf,       \
     (signed char*)halo_wp(q), (float*)halo_wp(s), (uint16_t*)halo_wp(y), (uint32_t)n, eps, wadd,    \
     (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
-#define HALO_RQI8(WF, RS, PO, SC)                                                                  \
-    do { if (thr == 1024 && ept == 4)      HALO_RQI8_R(WF, RS, PO, SC, 1024, 4);                   \
-         else if (thr == 1024 && ept == 6) HALO_RQI8_R(WF, RS, PO, SC, 1024, 6);                   \
-         else if (thr == 1024 && ept == 8) HALO_RQI8_R(WF, RS, PO, SC, 1024, 8);                   \
-         else if (thr == 512 && ept == 8)  HALO_RQI8_R(WF, RS, PO, SC, 512, 8);                    \
-         else if (thr == 512 && ept == 12) HALO_RQI8_R(WF, RS, PO, SC, 512, 12);                   \
-         else if (thr == 512 && ept == 16) HALO_RQI8_R(WF, RS, PO, SC, 512, 16);                   \
-         else if (thr == 1024) HALO_RQI8_T(WF, RS, PO, SC, 1024);                                  \
-         else if (thr == 512) HALO_RQI8_T(WF, RS, PO, SC, 512);                                    \
-         else if (thr == 256) HALO_RQI8_T(WF, RS, PO, SC, 256);                                    \
+#define HALO_RQI8(WF, RS, PO, SC, G)                                                               \
+    do { if (thr == 1024 && ept == 4)      HALO_RQI8_R(WF, RS, PO, SC, 1024, 4, G);                \
+         else if (thr == 1024 && ept == 6) HALO_RQI8_R(WF, RS, PO, SC, 1024, 6, G);                \
+         else if (thr == 1024 && ept == 8) HALO_RQI8_R(WF, RS, PO, SC, 1024, 8, G);                \
+         else if (thr == 512 && ept == 8)  HALO_RQI8_R(WF, RS, PO, SC, 512, 8, G);                 \
+         else if (thr == 512 && ept == 12) HALO_RQI8_R(WF, RS, PO, SC, 512, 12, G);                \
+         else if (thr == 512 && ept == 16) HALO_RQI8_R(WF, RS, PO, SC, 512, 16, G);                \
+         else if (thr == 1024) HALO_RQI8_T(WF, RS, PO, SC, 1024, G);                               \
+         else if (thr == 512) HALO_RQI8_T(WF, RS, PO, SC, 512, G);                                 \
+         else if (thr == 256) HALO_RQI8_T(WF, RS, PO, SC, 256, G);                                 \
          else return HALO_NO(RAD_E_INVAL); } while (0)
-#define HALO_RQI8_W(WF)                                                                            \
-    do { if (!rs)            HALO_RQI8(WF, false, false, false);                                   \
-         else if (!wp && !sc) HALO_RQI8(WF, true, false, false);                                   \
-         else if (wp && !sc)  HALO_RQI8(WF, true, true, false);                                    \
-         else if (wp && sc)   HALO_RQI8(WF, true, true, true);                                     \
-         else                 HALO_RQI8(WF, true, false, true); } while (0)
-    if (w->dtype == RAD_F32) HALO_RQI8_W(true);
-    else                     HALO_RQI8_W(false);
+#define HALO_RQI8_W(WF, G)                                                                         \
+    do { if (!rs)            HALO_RQI8(WF, false, false, false, G);                                \
+         else if (!wp && !sc) HALO_RQI8(WF, true, false, false, G);                                \
+         else if (wp && !sc)  HALO_RQI8(WF, true, true, false, G);                                 \
+         else if (wp && sc)   HALO_RQI8(WF, true, true, true, G);                                  \
+         else                 HALO_RQI8(WF, true, false, true, G); } while (0)
+    if (grp) {
+        if (w->dtype == RAD_F32) HALO_RQI8_W(true, true);
+        else                     HALO_RQI8_W(false, true);
+    } else {
+        if (w->dtype == RAD_F32) HALO_RQI8_W(true, false);
+        else                     HALO_RQI8_W(false, false);
+    }
 #undef HALO_RQI8_W
 #undef HALO_RQI8
 #undef HALO_RQI8_R
@@ -931,20 +967,31 @@ extern "C" int halo_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     return emit_rc;
 }
 
+extern "C" int halo_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
+    return rad_rmsnorm_quant_i8(a, stream, false);
+}
+
+/* quant_act_i8g's grid: a separate op, not a parameter, since its scale plane has another shape and
+ * its codes another order (as quant_act_i8 and quant_act_i8g are two ops). */
+extern "C" int halo_rad_rmsnorm_quant_i8g(const RadArgs* a, RadStream stream) {
+    return rad_rmsnorm_quant_i8(a, stream, true);
+}
+
 // The fused all-reduce form's launch. The IPC arguments are halo_ar_oneshot_2rank_exact's -- the
 // double-buffered scratch, the per-block flags and the device-resident sequence counters -- and the
 // rest is the junction's. `x` is the message and takes no pitch; `nblocks` is clamped to M (a block
-// owns whole rows). Returns 0, or a negative code for a shape it does not serve.
+// owns whole rows). `grp` takes quant_act_i8g's grid (ar_rmsnorm_quant_i8g): `s` is [M][n / 128]
+// and n a multiple of 128. Returns 0, or a negative code for a shape it does not serve.
 extern "C" int halo_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
                                        long my_flags, long seq_ctrs, long slot_stride16,
                                        long x, long res, long w, long wp, long sc, int sc_f32,
                                        long y, long q, long s, int M, int n, float eps, float wadd,
                                        int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                                       int drain, int acq) {
+                                       int drain, int acq, int grp) {
     if (!x || !w || !q || !s) return -1;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
-    if (n % 16) return -3;
+    if (n % 16 || (grp && n % (int)kGroupI8g)) return -3;
     if ((wp || sc) && !res) return -5;
     if ((size_t)n * sizeof(uint16_t) > 60 * 1024) return -6;
     if (!r_ld) r_ld = n;
@@ -955,8 +1002,8 @@ extern "C" int halo_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long
     if (nb > nbw) nb = nbw;
     const int thr = halo_act_threads(M, n);
     const size_t lds = (size_t)n * sizeof(uint16_t);
-#define HALO_ARQ8_T(WF, RS, PO, SC, T)                                                             \
-    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)nb),       \
+#define HALO_ARQ8_T(WF, RS, PO, SC, T, G)                                                          \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T, G>), dim3((uint32_t)nb),    \
                        dim3(T), lds, (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res,          \
                        (const void*)w, (const void*)wp, (const void*)sc, (uint32_t)sc_f32,       \
                        (signed char*)q, (float*)s, (uint16_t*)y, (int4*)peer_scratch,            \
@@ -964,18 +1011,23 @@ extern "C" int halo_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long
                        (unsigned int*)my_flags, (unsigned int*)seq_ctrs, M, (uint32_t)n, eps,    \
                        wadd, (uint32_t)r_ld, (uint32_t)y_ld, (int)slot_stride16, drain, acq,      \
                        (unsigned)nbw)
-#define HALO_ARQ8(WF, RS, PO, SC)                                                                  \
-    do { if (thr == 1024)     HALO_ARQ8_T(WF, RS, PO, SC, 1024);                                   \
-         else if (thr == 512) HALO_ARQ8_T(WF, RS, PO, SC, 512);                                    \
-         else                 HALO_ARQ8_T(WF, RS, PO, SC, 256); } while (0)
-#define HALO_ARQ8_W(WF)                                                                            \
-    do { if (!res)            HALO_ARQ8(WF, false, false, false);                                  \
-         else if (!wp && !sc) HALO_ARQ8(WF, true, false, false);                                   \
-         else if (wp && !sc)  HALO_ARQ8(WF, true, true, false);                                    \
-         else if (wp && sc)   HALO_ARQ8(WF, true, true, true);                                     \
-         else                 HALO_ARQ8(WF, true, false, true); } while (0)
-    if (w_f32) HALO_ARQ8_W(true);
-    else       HALO_ARQ8_W(false);
+#define HALO_ARQ8(WF, RS, PO, SC, G)                                                               \
+    do { if (thr == 1024)     HALO_ARQ8_T(WF, RS, PO, SC, 1024, G);                                \
+         else if (thr == 512) HALO_ARQ8_T(WF, RS, PO, SC, 512, G);                                 \
+         else                 HALO_ARQ8_T(WF, RS, PO, SC, 256, G); } while (0)
+#define HALO_ARQ8_W(WF, G)                                                                         \
+    do { if (!res)            HALO_ARQ8(WF, false, false, false, G);                               \
+         else if (!wp && !sc) HALO_ARQ8(WF, true, false, false, G);                                \
+         else if (wp && !sc)  HALO_ARQ8(WF, true, true, false, G);                                 \
+         else if (wp && sc)   HALO_ARQ8(WF, true, true, true, G);                                  \
+         else                 HALO_ARQ8(WF, true, false, true, G); } while (0)
+    if (grp) {
+        if (w_f32) HALO_ARQ8_W(true, true);
+        else       HALO_ARQ8_W(false, true);
+    } else {
+        if (w_f32) HALO_ARQ8_W(true, false);
+        else       HALO_ARQ8_W(false, false);
+    }
 #undef HALO_ARQ8_W
 #undef HALO_ARQ8
 #undef HALO_ARQ8_T

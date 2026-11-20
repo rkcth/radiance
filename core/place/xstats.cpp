@@ -349,21 +349,20 @@ std::string xs_json(const XsSnapshot& s) {
 
 int xs_write_atomic(const std::string& path, const std::string& text) {
     const std::string tmp = path + ".tmp." + std::to_string((long long)getpid());
-    /* Created fresh, exclusive, never through a symlink. The name is predictable -- the PID
-     * is public -- and fopen("w") follows links and truncates: a local user pre-creating it
-     * as a symlink had the serving process overwrite whatever file the link named, as the
-     * serving user. An existing name, of any kind, is now a refusal. */
-    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    /* Created exclusively and never through a symbolic link: the name is predictable (the pid is
+     * public), and opening it for writing in the ordinary way would follow a link another local
+     * user placed there and truncate the file it names. The mode is the one fopen gives, less the
+     * umask, so whoever could read the file before can read it after the rename. */
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666);
     if (fd < 0 && errno == EEXIST) {
-        /* A crash can leave our own tmp name behind, and a reboot can reuse the PID; the
-         * name is then ours to clear, its contents nobody's to overwrite. The retry is
-         * exclusive again, so whoever else pre-created it wins only a refusal -- we never
-         * follow it, truncate it, or write through it. */
+        /* A crash can leave this name behind and a later process can have the same pid. The
+         * name is removed, never written through, and the second create is exclusive as well:
+         * it fails if the name could not be removed or was created again in between. */
         ::unlink(tmp.c_str());
-        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666);
     }
     if (fd < 0) {
-        RAD_WARN("--expert-stats: cannot create %s: %s", tmp.c_str(), std::strerror(errno));
+        RAD_WARN("cannot create %s: %s", tmp.c_str(), std::strerror(errno));
         return RAD_E_IO;
     }
     FILE* f = ::fdopen(fd, "w");
@@ -371,19 +370,19 @@ int xs_write_atomic(const std::string& path, const std::string& text) {
         const int err = errno;
         ::close(fd);
         ::unlink(tmp.c_str());
-        RAD_WARN("--expert-stats: cannot open %s: %s", tmp.c_str(), std::strerror(err));
+        RAD_WARN("cannot open %s: %s", tmp.c_str(), std::strerror(err));
         return RAD_E_IO;
     }
     const bool wrote = std::fwrite(text.data(), 1, text.size(), f) == text.size() &&
                        std::fflush(f) == 0 && fsync(fileno(f)) == 0;
     const int err = errno;
     if (std::fclose(f) != 0 || !wrote) {
-        RAD_WARN("--expert-stats: writing %s failed: %s", tmp.c_str(), std::strerror(wrote ? errno : err));
+        RAD_WARN("writing %s failed: %s", tmp.c_str(), std::strerror(wrote ? errno : err));
         ::unlink(tmp.c_str());
         return RAD_E_IO;
     }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        RAD_WARN("--expert-stats: %s -> %s: %s", tmp.c_str(), path.c_str(), std::strerror(errno));
+        RAD_WARN("renaming %s to %s failed: %s", tmp.c_str(), path.c_str(), std::strerror(errno));
         ::unlink(tmp.c_str());
         return RAD_E_IO;
     }
@@ -514,9 +513,9 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
     }
     std::string text;
     char buf[1 << 16];
-    /* Capped WHILE reading. A profile is a handful of integers per layer and expert even for
-     * the largest shipped MoE; anything far past that is not a profile, and the old loop
-     * grew memory with any file it was pointed at before any check ran. */
+    /* Capped while reading, so memory never grows with whatever file the path names. A profile
+     * is a handful of integers per layer and expert even for the largest MoE; anything far past
+     * that is not a profile. */
     static const size_t kMaxProfileBytes = 64u << 20;
     bool too_big = false;
     while (const size_t n = std::fread(buf, 1, sizeof buf, f)) {
@@ -540,8 +539,7 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
     bool over = false, deep = false;
     Json j = Json::parse_container(text, &over, &deep);
     if (over || deep || j.is_discarded()) {
-        RAD_ERR("--expert-profile: %s is not JSON (%s)", path.c_str(),
-                Json::bound_why(over, deep));
+        RAD_ERR("--expert-profile: %s %s", path.c_str(), Json::bound_why(over, deep));
         return RAD_E_INVAL;
     }
     if (!j.is_object() || j.value("format", "") != "radiance-expert-stats/1" ||
@@ -567,10 +565,9 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
     int64_t kept = 0;
     for (size_t l = 0; l < rows.size(); ++l) {
         if (!rows[l].is_array()) continue;
-        /* Counts are unsigned. The facade's arithmetic read casts -- a negative read as
-         * uint64_t wraps to 2^64-ish, and a wrapped count reads as a ~100% share, steering the
-         * planner's pinning at whatever the file's author named. Under the old JSON library a
-         * negative threw its way out of here; refuse the file by name instead. */
+        /* Counts are unsigned. The arithmetic read casts: a negative read as uint64_t wraps to
+         * nearly 2^64, and a wrapped count reads as a share near 100%, steering the planner's
+         * pinning at whatever the file's author named. The file is refused by name instead. */
         for (size_t e = 0; e < rows[l].size(); ++e)
             if (!rows[l][e].is_number_unsigned()) {
                 RAD_ERR("--expert-profile: %s carries a negative or fractional count at decode "

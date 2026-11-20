@@ -94,7 +94,7 @@ export class HttpError extends Error {
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { ...(init?.headers as Record<string, string> | undefined) }
   if (apiKey) headers.Authorization = "Bearer " + apiKey
-  const r = await fetch("/" + path, { cache: "no-store", ...init, headers })
+  const r = await fetch(new URL(path, document.baseURI), { cache: "no-store", ...init, headers })
   if (r.status === 401) {
     if (!needKey) { needKey = true; listeners.forEach((f) => f()) }
     throw new HttpError(401, "an API key is required")

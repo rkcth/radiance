@@ -52,10 +52,16 @@ constexpr uint32_t kGroup = 128;
 //
 // CHAIN brackets the body with the chained launch's wait and add (halo_chain.h); no block returns
 // early. quant_act_fp8_kernel and halo_r4dchain_quant_act_fp8 below are the plain and chained forms.
-template <bool ROT, bool I8 = false, bool CHAIN = false>
+//
+// SUB is the 128-column blocks one scale covers: 1, or 2 for IQ8R's 256-wide group (int8 only,
+// had_quant_act_iq8r), where a wave owns both blocks of a group, rotates each on its own (the
+// rotation stays 128 wide) and takes the amax over the pair. `nkb` counts scale groups. libr4d's
+// form, by the rename transform, inside this file's group-chunk grid.
+template <bool ROT, bool I8 = false, bool CHAIN = false, uint32_t SUB = 1>
 __device__ __forceinline__ void quant_act_fp8_body(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
     uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld) {
+    static_assert(SUB == 1 || (SUB == 2 && I8), "a 256 group is the int8 quantiser's");
     if (CHAIN) halo_chain_wait();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
@@ -63,57 +69,64 @@ __device__ __forceinline__ void quant_act_fp8_body(
     const size_t qrow = (size_t)row * q_ld;
 
     for (uint32_t kb = blockIdx.y * kWaves + wave; kb < nkb; kb += gridDim.y * kWaves) {
-        const uint32_t c0 = kb * kGroup + lane * 4u;
-        float v[4];
+        float v[SUB][4];
         float m = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const uint32_t c = c0 + (uint32_t)j;
-            v[j] = c < K ? __uint_as_float((uint32_t)x[xrow + c] << 16) : 0.0f;
-        }
-        // The rotated launcher requires K % 128 == 0: a partial block would rotate real values
-        // with padding zeros, and the weight has no matching block.
-        if constexpr (ROT) halo_fwht_wave<(int)kGroup>(v, (int)lane);
+        for (uint32_t h = 0; h < SUB; ++h) {
+            const uint32_t c0 = (kb * SUB + h) * kGroup + lane * 4u;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[j]));
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t c = c0 + (uint32_t)j;
+                v[h][j] = c < K ? __uint_as_float((uint32_t)x[xrow + c] << 16) : 0.0f;
+            }
+            // The rotated launcher requires K % 128 == 0: a partial block would rotate real values
+            // with padding zeros, and the weight has no matching block.
+            if constexpr (ROT) halo_fwht_wave<(int)kGroup>(v[h], (int)lane);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[h][j]));
+        }
         m = halo_wave_max(m);
         constexpr float kTop = I8 ? 127.0f : 448.0f;
         const float sc = m > 0.0f ? m * (1.0f / kTop) : 1.0f;
         if (lane == 0) s[(size_t)row * s_ld + kb] = sc;
         const float inv = 1.0f / sc;
-        int pk = 0;
-        if constexpr (I8) {
-            uint32_t b = 0;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int c = (int)rintf(fminf(fmaxf(v[j] * inv, -127.0f), 127.0f));
-                b |= ((uint32_t)c & 0xFFu) << (8 * j);
+        for (uint32_t h = 0; h < SUB; ++h) {
+            const uint32_t c0 = (kb * SUB + h) * kGroup + lane * 4u;
+            int pk = 0;
+            if constexpr (I8) {
+                uint32_t b = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int c = (int)rintf(fminf(fmaxf(v[h][j] * inv, -127.0f), 127.0f));
+                    b |= ((uint32_t)c & 0xFFu) << (8 * j);
+                }
+                pk = (int)b;
+            } else {
+                pk = halo_fp8::cvt_pk_fp8_f32(fminf(fmaxf(v[h][0] * inv, -448.0f), 448.0f),
+                                              fminf(fmaxf(v[h][1] * inv, -448.0f), 448.0f), pk,
+                                              false);
+                pk = halo_fp8::cvt_pk_fp8_f32(fminf(fmaxf(v[h][2] * inv, -448.0f), 448.0f),
+                                              fminf(fmaxf(v[h][3] * inv, -448.0f), 448.0f), pk,
+                                              true);
             }
-            pk = (int)b;
-        } else {
-            pk = halo_fp8::cvt_pk_fp8_f32(fminf(fmaxf(v[0] * inv, -448.0f), 448.0f),
-                                                 fminf(fmaxf(v[1] * inv, -448.0f), 448.0f), pk,
-                                                 false);
-            pk = halo_fp8::cvt_pk_fp8_f32(fminf(fmaxf(v[2] * inv, -448.0f), 448.0f),
-                                                 fminf(fmaxf(v[3] * inv, -448.0f), 448.0f), pk,
-                                                 true);
+            // A ragged last group is written zero-padded; the GEMM's bounds guard keeps the
+            // padding out of the accumulators. The caller must own K rounded up to 4 bytes of `q`.
+            if (c0 < K) *(uint32_t*)(q + qrow + c0) = (uint32_t)pk;
         }
-        // A ragged last group is written zero-padded; the GEMM's bounds guard keeps the padding out
-        // of the accumulators. The caller must own K rounded up to 4 bytes of `q`.
-        if (c0 < K) *(uint32_t*)(q + qrow + c0) = (uint32_t)pk;
     }
     if (CHAIN) halo_chain_done();
 }
 
 #define HALO_QAF_PARAMS const uint16_t* __restrict__ x, uint8_t* __restrict__ q,                  \
     float* __restrict__ s, uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld
-template <bool ROT, bool I8 = false>
+template <bool ROT, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(HALO_QAF_PARAMS) {
-    quant_act_fp8_body<ROT, I8, false>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+    quant_act_fp8_body<ROT, I8, false, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
 }
-template <bool ROT, bool I8 = false>
+template <bool ROT, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(kThreads) void halo_r4dchain_quant_act_fp8(HALO_QAF_PARAMS) {
-    quant_act_fp8_body<ROT, I8, true>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+    quant_act_fp8_body<ROT, I8, true, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
 }
 #undef HALO_QAF_PARAMS
 
@@ -126,17 +139,20 @@ extern "C" int halo_quant_act_fp8_group(void) { return (int)kGroup; }
 //   s  [M][ceil(K/128)]      f32,  `s_ld` elements a row (0 = ceil(K/128))
 //
 // `rot` runs the 128-wide Hadamard first and additionally requires K % 128 == 0 (see the kernel).
+// `wide` (int8 only): one scale per 256 columns (IQ8R), K a multiple of 256, `s` [M][K/256].
 static int quant_act_fp8_launch(long a, long q, long s, int M, int K,
                                 int x_ld, int q_ld, int s_ld, RadStream stream, bool rot,
-                                bool i8 = false, bool chain = false) {
+                                bool i8 = false, bool chain = false, bool wide = false) {
     int emit_rc = RAD_OK;
     if (!a || !q || !s) return -1;
     if (M <= 0 || K <= 0) return -2;
     if (K % 4) return -3;              // a lane owns four columns; see the kernel
     if (rot && (K % (int)kGroup)) return -5;
+    if (wide && (!i8 || K % (2 * (int)kGroup))) return -5;
     if (!x_ld) x_ld = K;
     if (!q_ld) q_ld = K;
-    const int nkb = (K + (int)kGroup - 1) / (int)kGroup;
+    const int grp = wide ? 2 * (int)kGroup : (int)kGroup;
+    const int nkb = (K + grp - 1) / grp;
     if (!s_ld) s_ld = nkb;
     /* The chained form at decode heights, where the row resolved with `chain`. */
     const bool ch = chain && M <= 64;
@@ -148,15 +164,16 @@ static int quant_act_fp8_launch(long a, long q, long s, int M, int K,
     if (chunks > max_chunks) chunks = max_chunks;
     if (chunks < 1) chunks = 1;
     const dim3 grid((uint32_t)M, (uint32_t)chunks);
-#define HALO_QA(ROT_, I8_)                                                                     \
-    (ch ? HALO_EMIT(stream, (halo_r4dchain_quant_act_fp8<ROT_, I8_>), grid,                          \
+#define HALO_QA(ROT_, I8_, SUB_)                                                               \
+    (ch ? HALO_EMIT(stream, (halo_r4dchain_quant_act_fp8<ROT_, I8_, SUB_>), grid,              \
                    dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
                    (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld)               \
-        : HALO_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_>), grid,                            \
+        : HALO_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_, SUB_>), grid,                      \
                    dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
                    (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld))
-    if (i8) emit_rc = rot ? HALO_QA(true, true) : HALO_QA(false, true);
-    else    emit_rc = rot ? HALO_QA(true, false) : HALO_QA(false, false);
+    if (wide)    emit_rc = rot ? HALO_QA(true, true, 2u) : HALO_QA(false, true, 2u);
+    else if (i8) emit_rc = rot ? HALO_QA(true, true, 1u) : HALO_QA(false, true, 1u);
+    else         emit_rc = rot ? HALO_QA(true, false, 1u) : HALO_QA(false, false, 1u);
 #undef HALO_QA
     if (emit_rc != RAD_OK) return -4;
     return (hipGetLastError() != hipSuccess) ? -4 : 0;
@@ -190,17 +207,20 @@ static int rad_quant_act_fp8(const RadArgs* a, RadStream stream, bool rot, bool 
      * `q` and `sc` are written for the GEMM and stay rank 2. */
     if (x->rank < 2 || q->rank != 2 || sc->rank != 2) return HALO_NO(RAD_E_SHAPE);
     const long long M = x->shape[0], K = halo_numel(x) / (x->shape[0] > 0 ? x->shape[0] : 1);
-    const long long grp = halo_quant_act_fp8_group();
+    /* The group is fixed by the weight's scale grid: 128, or 256 for the int8 quantisers (IQ8R).
+     * Any other declared group is refused. */
+    const long long g0 = halo_quant_act_fp8_group();
+    const long long grp = halo_geti_or(a, "group", g0);
+    const bool wide = i8 && grp == HALO_I8_GROUP_WIDE;
+    if (grp != g0 && !wide) return HALO_NO(RAD_E_SHAPE);
     const long long nkb = (K + grp - 1) / grp;
-    /* The group is fixed by the checkpoint's scale grid; a different declared group is refused. */
-    if (halo_geti_or(a, "group", grp) != grp) return HALO_NO(RAD_E_SHAPE);
     if (q->shape[0] != M || q->shape[1] != K) return HALO_NO(RAD_E_SHAPE);
     if (sc->shape[0] != M || sc->shape[1] != nkb) return HALO_NO(RAD_E_SHAPE);
     const long long xp = halo_row_pitch(x), qp = halo_row_pitch(q), sp = halo_row_pitch(sc);
     if (xp < 0 || qp < 0 || sp < 0) return HALO_NO(RAD_E_STRIDE);
     const int e = quant_act_fp8_launch(halo_addr(x), halo_addr(q), halo_addr(sc), (int)M, (int)K,
                                        (int)xp, (int)qp, (int)sp, stream, rot, i8,
-                                       halo_geti_or(a, "chain", 0) != 0);
+                                       halo_geti_or(a, "chain", 0) != 0, wide);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

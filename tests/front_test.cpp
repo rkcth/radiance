@@ -6,9 +6,10 @@
  *   Reads    what the dashboard polls is told apart from requests for work
  *   Jobs     a finished job is answered by its id with no model, until it expires or is deleted
  *
- * No server and no socket: requests and texts in, answers out.
+ * Most cases dispatch in process; discovery activity also uses a loopback listener.
  */
-#include "rad_test.h"
+#include "server_fakes.h"
+#include "cpp-httplib/httplib.h"
 
 #include "server/front.h"
 
@@ -72,7 +73,7 @@ TEST(the_dashboards_reads_do_not_count_as_wanting_a_model) {
 /* The set that must not wake a model for a caller its handler will refuse: exactly the routes
  * Server::register_routes guards with local_operator keyless, and nothing beside them. */
 TEST(guarded_routes_are_the_local_operator_ones) {
-    /* guarded_route now reads the front's own copied routes, so the decision is made by an
+    /* guarded_route reads the front's own copied routes, so the decision is made by an
      * instance's matcher -- a Front with no models installed still carries the full route table
      * (its prototype does), which is exactly the set whose handlers guard. */
     Front f(TransportOptions{}, 0);
@@ -172,6 +173,68 @@ TEST(metrics_from_several_models_declare_each_family_once) {
              "# HELP rad_step_seconds Step time.\n# TYPE rad_step_seconds histogram\n"
              "rad_step_seconds_bucket{model_name=\"a\",le=\"0.1\"} 1\n"
              "rad_step_seconds_sum{model_name=\"a\"} 0.05\n");
+}
+
+
+/* Exercise the public routes: both cards and collection reads retain the server while they
+ * inspect it, but only a request for work changes its idle clock and use count. */
+TEST(model_discovery_does_not_restart_the_idle_clock) {
+    Fixture model;
+    TransportOptions options;
+    options.host = "127.0.0.1";
+    options.port = 0;
+    std::atomic<bool> held_during_description{ false };
+    struct Listener {
+        Front front;
+        std::thread thread;
+        explicit Listener(const TransportOptions& options) : front(options, 0) {}
+        ~Listener() { front.stop(); if (thread.joinable()) thread.join(); }
+    } listener(options);
+    Front& front = listener.front;
+    front.add("test-model", {}, 100, false);
+    front.attach("test-model", {}, model.srv.get());
+    front.set_describe([&front, &held_during_description](const std::string& name) {
+        held_during_description.store(front.activity(name).leases == 1);
+        return std::string("{}");
+    });
+    listener.thread = std::thread([&] { front.run(); });
+    for (int i = 0; i < 200 && !front.port(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(front.port() > 0);
+    if (front.port() <= 0) return;
+    httplib::Client client("127.0.0.1", front.port());
+    client.set_read_timeout(2, 0);
+    const auto before = front.activity("test-model");
+    for (const char* path : { "/v1/models", "/models", "/v1/models/test-model" }) {
+        const auto response = client.Get(path);
+        CHECK(response != nullptr);
+        if (!response) continue;
+        CHECK_EQ(response->status, 200);
+        const json card = json::parse(response->body, nullptr, false);
+        CHECK(card.is_object());
+        if (std::string(path) == "/v1/models/test-model")
+            CHECK_EQ(card.value("id", ""), "test-model");
+        else {
+            CHECK(card.contains("data"));
+            if (card.contains("data")) {
+                CHECK(!card["data"].empty());
+                if (!card["data"].empty()) CHECK_EQ(card["data"][0].value("id", ""), "test-model");
+            }
+        }
+        const auto after = front.activity("test-model");
+        CHECK_EQ(after.uses, before.uses);
+        CHECK_EQ(after.last_used_ns, before.last_used_ns);
+        CHECK_EQ(after.leases, 0);
+    }
+    CHECK(held_during_description.load());
+    const auto response = client.Post("/v1/completions",
+        R"({"model":"test-model","prompt":"hello","max_tokens":2})", "application/json");
+    CHECK(response != nullptr);
+    if (response) CHECK_EQ(response->status, 200);
+    const auto after_work = front.activity("test-model");
+    CHECK_EQ(after_work.uses, before.uses + 1);
+    CHECK(after_work.last_used_ns >= before.last_used_ns);
+    CHECK_EQ(after_work.leases, 0);
 }
 
 RAD_TEST_MAIN()

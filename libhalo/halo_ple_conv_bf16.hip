@@ -31,6 +31,7 @@
 // on `hist < kPcBT`, asserted below.
 #include "halo.h"
 #include "halo_args.h"
+#include "halo_chain.h"
 #include "halo_common.h"
 
 #include <cstdint>
@@ -56,15 +57,16 @@ __device__ __forceinline__ float pc_silu(float z) { return z / (1.0f + expf(-z))
 
 /* SILU is ple_conv's activation; causal_conv1d (LFM2's short convolution) is the same window with
  * no activation, no residual and dilation one. */
+#define PLE_CONV_PARAMS                                                                         \
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,                             \
+    uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,                                  \
+    const uint16_t* __restrict__ resid, const int32_t* __restrict__ sidx,                       \
+    const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,                         \
+    uint16_t* __restrict__ y, const uint16_t* __restrict__ bias, uint32_t n, uint32_t wid,      \
+    uint32_t dil, uint32_t hist, uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,        \
+    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len
 template <bool SILU>
-__global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
-    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
-    uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,
-    const uint16_t* __restrict__ resid, const int32_t* __restrict__ sidx,
-    const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,
-    uint16_t* __restrict__ y, uint32_t n, uint32_t wid, uint32_t dil, uint32_t hist,
-    uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,
-    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len) {
+__device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 
     const uint32_t c = blockIdx.x * kPcThreads + threadIdx.x;
     if (c >= n) return;
@@ -94,8 +96,9 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
     const uint16_t* __restrict__ hc = warm ? dst + off * cs_tok : nullptr;
     uint16_t* __restrict__ yc = y + (size_t)bos * yld + c;
 
+    const float b0 = bias ? bf16_to_f32(bias[c]) : 0.0f;
     for (int32_t t = t0; t < t1; ++t) {
-        float acc = 0.0f;
+        float acc = b0;
 #pragma unroll
         for (uint32_t j = 0; j < kPcMaxW; ++j) {
             if (j < wid) {
@@ -151,18 +154,34 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
         if (i < hist) dst[(size_t)i * cs_tok] = keep[i];
 }
 
+/* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
+ * chained form (halo_chain.h), taken at decode heights. */
+template <bool SILU, class CH>
+__global__ __launch_bounds__(kPcThreads)
+void ple_conv_kernel(PLE_CONV_PARAMS) {
+    if (CH::on) halo_chain_wait();
+    ple_conv_body<SILU>(x, w, cs, cu, resid, sidx, hini, nacc, y, bias, n, wid, dil, hist, xld, rld,
+                        yld, wld, cs_slot, cs_ch, cs_tok, state_len);
+    if (CH::on) halo_chain_done();
+}
+#undef PLE_CONV_PARAMS
+
 enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y };
+/* ple_conv_bias: ple_conv's operands with `b`, the per-channel bias inside the silu (Mamba-2's
+ * conv1d), before `y`. */
+enum { PB_B = PC_Y, PB_Y };
 /* causal_conv1d's operands: ple_conv's without `resid`. */
 enum { CC_X = 0, CC_W, CC_CS, CC_CU, CC_CIDX, CC_HINIT, CC_NACC, CC_Y };
 
 int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, const RadTensor* w,
                 const RadTensor* cs, const RadTensor* cu, const RadTensor* resid,
                 const RadTensor* cidx, const RadTensor* hini, const RadTensor* nacc,
-                const RadTensor* y) {
+                const RadTensor* y, const RadTensor* b = nullptr) {
     if (!x || !w || !cu || !y) return HALO_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || y->dtype != RAD_BF16)
         return HALO_NO(RAD_E_DTYPE);
     if (resid && resid->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
+    if (b && b->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
     if (cs && cs->data && cs->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
     if (cu->dtype != RAD_I32) return HALO_NO(RAD_E_DTYPE);
     if (cidx && cidx->dtype != RAD_I32) return HALO_NO(RAD_E_DTYPE);
@@ -190,6 +209,7 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
      * the band's upper bound and a grid sized by it would run off the arena. */
     if (T <= 0 || ty != T || (resid && tr != T)) return HALO_NO(RAD_E_SHAPE);
     if (wrows < n) return HALO_NO(RAD_E_SHAPE);
+    if (b && (halo_numel(b) != n || !halo_contig(b))) return HALO_NO(RAD_E_SHAPE);
 
     const long long N = halo_numel(cu) - 1;
     if (N <= 0) return HALO_NO(RAD_E_SHAPE);
@@ -211,18 +231,24 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
 
     const uint32_t cb = (uint32_t)((n + kPcThreads - 1) / kPcThreads);
     const uint32_t tb = (uint32_t)((T + kPcBT - 1) / kPcBT);
-    const auto kernel = silu ? ple_conv_kernel<true> : ple_conv_kernel<false>;
-    hipLaunchKernelGGL(kernel, dim3(cb, tb, (uint32_t)N), dim3(kPcThreads), 0, (hipStream_t)s,
-                       (const uint16_t*)halo_addr(x), (const uint16_t*)halo_addr(w),
-                       have_cs ? (uint16_t*)halo_addr(cs) : nullptr,
-                       (const int32_t*)halo_addr(cu),
-                       resid ? (const uint16_t*)halo_addr(resid) : nullptr,
-                       cidx ? (const int32_t*)halo_addr(cidx) : nullptr,
-                       hini ? (const int32_t*)halo_addr(hini) : nullptr,
-                       nacc ? (const int32_t*)halo_addr(nacc) : nullptr,
-                       (uint16_t*)halo_addr(y), (uint32_t)n, (uint32_t)wid, (uint32_t)dil,
-                       (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld,
-                       cs_slot, cs_ch, cs_tok, state_len);
+    const bool chain = halo_geti_or(a, "chain", 0) != 0 && T <= 64;
+#define HALO_PC(S_, CH_)                                                                         \
+    hipLaunchKernelGGL((ple_conv_kernel<S_, CH_>), dim3(cb, tb, (uint32_t)N),                   \
+                       dim3(kPcThreads), 0, (hipStream_t)s,                                      \
+                       (const uint16_t*)halo_addr(x), (const uint16_t*)halo_addr(w),               \
+                       have_cs ? (uint16_t*)halo_addr(cs) : nullptr,                              \
+                       (const int32_t*)halo_addr(cu),                                             \
+                       resid ? (const uint16_t*)halo_addr(resid) : nullptr,                       \
+                       cidx ? (const int32_t*)halo_addr(cidx) : nullptr,                          \
+                       hini ? (const int32_t*)halo_addr(hini) : nullptr,                          \
+                       nacc ? (const int32_t*)halo_addr(nacc) : nullptr,                          \
+                       (uint16_t*)halo_addr(y), b ? (const uint16_t*)halo_addr(b) : nullptr,       \
+                       (uint32_t)n, (uint32_t)wid, (uint32_t)dil,                                \
+                       (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld, \
+                       cs_slot, cs_ch, cs_tok, state_len)
+    if (silu) { if (chain) HALO_PC(true, r4dchain);  else HALO_PC(true, HaloUnchained); }
+    else      { if (chain) HALO_PC(false, r4dchain); else HALO_PC(false, HaloUnchained); }
+#undef HALO_PC
     return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
 }
 
@@ -232,6 +258,14 @@ extern "C" int halo_rad_ple_conv(const RadArgs* a, RadStream s) {
     return conv_launch(a, s, true, halo_opt(a, PC_X), halo_opt(a, PC_W), halo_opt(a, PC_CS),
                        halo_opt(a, PC_CU), halo_opt(a, PC_RESID), halo_opt(a, PC_CIDX),
                        halo_opt(a, PC_HINIT), halo_opt(a, PC_NACC), halo_opt(a, PC_Y));
+}
+
+extern "C" int halo_rad_ple_conv_bias(const RadArgs* a, RadStream s) {
+    const RadTensor* b = halo_opt(a, PB_B);
+    if (!b) return HALO_NO(RAD_E_INVAL);
+    return conv_launch(a, s, true, halo_opt(a, PC_X), halo_opt(a, PC_W), halo_opt(a, PC_CS),
+                       halo_opt(a, PC_CU), halo_opt(a, PC_RESID), halo_opt(a, PC_CIDX),
+                       halo_opt(a, PC_HINIT), halo_opt(a, PC_NACC), halo_opt(a, PB_Y), b);
 }
 
 extern "C" int halo_rad_causal_conv1d(const RadArgs* a, RadStream s) {

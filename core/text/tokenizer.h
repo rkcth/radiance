@@ -120,6 +120,12 @@ public:
      * turn terminator into its last marker, so the decoder renders it for the reply parser, and
      * whatever the parser does not consume is stripped from the content. */
     const std::vector<int32_t>& eog() const { return eog_; }
+    /* Takes out of the end-of-generation set those of `ids` it holds only because the
+     * checkpoint's generation_config.json lists them, and returns the ids taken out. The header's
+     * eos and eot and the control tokens known by their spelling stay: a turn must keep an end.
+     * For a token the model's chat format writes as a call delimiter (the engine's bring-up
+     * decides that, before anything reads the set). */
+    std::vector<int32_t> drop_named_eog(const std::vector<int32_t>& ids);
 
     /* -1 when the exact text is not a token. */
     int32_t find(std::string_view text) const;
@@ -153,6 +159,8 @@ private:
     std::vector<int32_t> byte_of_;                          /* id -> byte, or -1 */
     /* Every token that ends a generation, not just the header's `eos`; see load(). */
     std::vector<int32_t> eog_;
+    /* Those of eog_ that only generation_config.json's eos list put there (drop_named_eog). */
+    std::vector<int32_t> eog_named_;
     /* The chain compiled for encoding: Split DFAs, flat token and merge tables, special-token
      * matcher and segment cache. Built in load(); shared by every Tokenizer over this vocab and
      * every copy of it. */

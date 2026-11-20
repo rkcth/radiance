@@ -128,14 +128,14 @@ double DraftController::yield(const DraftAdapt& s, int d) const {
 }
 
 int DraftController::window_of(const DraftAdapt& s) const {
-    if (!adapt_) return p_.max_depth;
+    if (!adapt_) return next_depth();
     if (s.depth <= 0) return 0;
     const int D = step_d_ > 0 ? step_d_ : p_.max_depth;
     return s.depth < D ? s.depth : D;
 }
 
 int DraftController::window_for(DraftAdapt& s) const {
-    if (!adapt_) return p_.max_depth;
+    if (!adapt_) return next_depth();
     if (s.depth <= 0) start(s);
     return window_of(s);
 }

@@ -114,11 +114,35 @@ using namespace rad::arch;
  * and 13.17): a read here pays ~2 us of launch for what it saves. */
 constexpr int64_t kGdnOutPrefetchBytes = (int64_t)8 << 20;
 constexpr int64_t kGdnOutPrefetchSeqs  = 4;
+/* The rows from which a decode step is taken for a speculative verify, a step of several rows:
+ * where the shared arm's place and the reads' workgroup count below help, against the one row of
+ * a plain decode step, where both cost. ms a step at tp 2 with coupling, in one server with the
+ * rounds interleaved, at two / three / four rows (chain 1 / 2 / 3) and at one: the arm's down
+ * projection in front -0.28% / -0.21% / -0.25% and +0.38%; the reads at 32 workgroups -0.65% /
+ * -0.35% / -0.31% and +0.41%. */
+constexpr int64_t kVerifyRows = 2;
 /* A full-attention layer's out projection likewise, read behind its q, k and v projections
  * (AttnGatedFP8::op_pf_o): the prologue and the attention between them and the projection are
  * short launches with the memory idle. Twelve layers, so less: five interleaved rounds, ms a step
  * without -> with, one stream 12.51 -> 12.45 (every round), two 16.88 -> 16.85. */
 constexpr int64_t kAttnOutPrefetchBytes = (int64_t)8 << 20;
+/* The workgroups of this model's weight reads on a verify step (the `prefetch` op's `blocks`, from
+ * kVerifyRows rows): 32, half the kernel's own 64. The reads run beside the delta net's update,
+ * the attention's prologue and the connections' reductions, all latency-bound kernels of a few
+ * loads a block whose loads queue behind the read's, and at four rows the update lasts half again
+ * as long as at one, so a slower read still lands. Chain 3 with coupling at tp 2, ms a step
+ * against 64 in one server, interleaved: 16 +0.77%, 24 +0.14%, 32 -0.31%, 48 -0.24%, 128 +2.0%,
+ * 256 +7.4%; -0.6% at 32 with the router's read beside. A one-row step keeps 64 (kVerifyRows). */
+constexpr int64_t kPrefetchBlocksVerify = 32;
+/* A layer's router likewise, read behind its mixer's out projection, beside the mixer's reduction
+ * and the feed-forward's connection read (both latency, with the card's memory mostly idle): the
+ * router is 2.5 MB of bf16 that its GEMM otherwise streams cold in front of a top-k that waits for
+ * all of it. Chain 3 with coupling at tp 2, ms a step without -> with, each the mean of two
+ * interleaved rounds in one server: 12.19 -> 12.13 (-0.42% and -0.93%); 12.14 -> 12.09 in another
+ * session. The same read of the shared expert's two weights, or of the indexer's projection, moved
+ * nothing (-0.02%, -0.04%, +0.04%), and of the mixer's first projection in front of its
+ * connection read cost 1.0%: a read there takes the memory from the connection's own. */
+constexpr int64_t kRouterPrefetchBytes = (int64_t)4 << 20;
 
 struct Layer {
     int          full = 0;
@@ -136,6 +160,11 @@ struct Layer {
     /* The layer's calibration inputs (rad_calib_full.h, site_i8), -1 where this run records none:
      * the mixer's input (the delta net's in projection, or q, k and v) and its output projection's. */
     int          cs_in = -1, cs_o = -1;
+    /* The router's weight read beside the mixer's reduction (kRouterPrefetchBytes); 0 where the
+     * deployment reads no weights ahead. */
+    rad_op       op_pf_router = 0;
+    /* The same at a verify step's workgroup count (kPrefetchBlocksVerify), from kVerifyRows rows. */
+    rad_op       op_pf_router_v = 0;
 };
 
 struct Model {
@@ -224,6 +253,16 @@ struct Model {
      * from the real declare, so it declares the same ops. */
     bool      span_on = false;
     bool      pipe_on = false;
+    /* The rows of a piece of a spanned step: one checkpoint interval's, what the routed block's
+     * pass is without --prefill-span-pass step (`moecfg.rows`). The connections' reads, the
+     * indexer's windows, the delta net's pieces and the pipelined step's pieces are a piece tall
+     * whatever the routed pass is. */
+    int64_t   piece_rows = 0;
+    /* --prefill-span-pass step (RadBuildCtx::span_pass_step) on a deployment that spans and does
+     * not pipeline: the routed block's pass is the whole step (`moecfg.rows` is max_tok), so a
+     * spanned step sorts its slots once and each expert's run is the step's. A sizing declare
+     * takes it from the real one, as span_on. */
+    bool      pass_step = false;
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -235,6 +274,9 @@ struct Model {
 
     rad_weight w_tok = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_rope_cs = 0, op_gather = 0, op_logits = 0;
+    /* The indexer's within-step buffers store_keys touches are excluded from sharing (declare),
+     * so a layer's keys may be issued behind its attention's launches (step_serial, QsaSide). */
+    bool   qsa_defer = false;
 
     /* ---- media (arch/common/rad_block_vit.h): the vision tower and the scatter of its rows over
      * the token embeddings, declared only when the container carries a tower and the deployment
@@ -484,6 +526,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * prefill chunk to, so the shipped configuration is one pass. It also sizes four buffers at
          * `rows * top_k`, so a smaller max_tok lowers it. */
         mc.rows        = g.max_tok < 2048 ? g.max_tok : 2048;
+        /* A piece of a spanned step; `mc.rows` itself grows to the step under
+         * --prefill-span-pass step (below, once the span is known). */
+        m.piece_rows   = mc.rows;
         if (mc.n_expert <= 0 || mc.top_k <= 0 || mc.top_k > mc.n_expert) {
             fprintf(stderr, "radiance: qwen4exp: the container describes %lld expert(s) with "
                             "top_k %lld\n", (long long)mc.n_expert, (long long)mc.top_k);
@@ -774,21 +819,42 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const int64_t v_dim    = m.gcfg.v_dim();
     const int64_t conv_dim = m.gcfg.conv_dim();
     const int64_t T        = g.max_tok;
-    const int64_t ER       = m.moecfg.rows * m.moecfg.top_k;
 
     m.b_h   = decl_b(b, nm.f("h_wide"), g.act_dtype, {T, HN});
     m.a_x.x = decl_b(b, nm.f("x"),      g.act_dtype, {T, g.n_embd});
     if (ctx->shape_probe) {
-        m.span_on = g_model[rad_build_slot(ctx)].span_on;
-        m.pipe_on = g_model[rad_build_slot(ctx)].pipe_on;
+        m.span_on   = g_model[rad_build_slot(ctx)].span_on;
+        m.pipe_on   = g_model[rad_build_slot(ctx)].pipe_on;
+        m.pass_step = g_model[rad_build_slot(ctx)].pass_step;
     } else {
         m.span_on = ctx->max_mixed_tok > 0 && ctx->max_mixed_tok < g.max_tok &&
-                    g.max_tok > m.moecfg.rows;
+                    g.max_tok > m.piece_rows;
         /* Only where the blocks issue their own all-reduce at a step wider than a pass: at two
          * ranks the gated residual's fused write takes every step's (ar_exact_write_rows), so such
          * a step runs serially. */
         m.pipe_on = m.span_on && g.world > 1 && ar_exact_write_rows(g) < g.max_tok;
+        /* --prefill-span-pass step, where a spanned step runs serially: nothing there needs the
+         * routed pass to be a piece (the pipelined step overlaps a piece's pass with the other
+         * piece's all-reduce, and keeps them), and a pass over the whole step reads each expert's
+         * weight once for two or four times the rows. A calibration run keeps its pieces: its
+         * statistics are taken a pass at a time. */
+        m.pass_step = ctx->span_pass_step != 0 && m.span_on && !m.pipe_on && !m.moecfg.calib;
+        if (ctx->span_pass_step != 0 && !m.pass_step && g.rank == 0)
+            rad_note(b, "--prefill-span-pass step: the routed pass stays one checkpoint interval "
+                        "(%s)", !m.span_on ? "this deployment has no step wider than an interval"
+                              : m.pipe_on  ? "a spanned step is pipelined here, a pass a piece "
+                                             "beside the other piece's all-reduce"
+                                           : "a calibration run takes its statistics a pass at a "
+                                             "time");
     }
+    /* Every op of a pass is per row, but the grouped trellis GEMM takes a run of one or two rows
+     * through its dot path and a longer one through its tiles, which agree only within f32
+     * rounding before the bf16 store: the step's longer runs move rows between the two, so the
+     * bytes are not those of piece-tall passes (the class of difference another chunk size makes,
+     * GUIDE 4.5). The planes below at `rows * top_k` grow with it. A sizing declare's max_tok is
+     * its level's, so a level holds one pass of its own rows. */
+    if (m.pass_step) m.moecfg.rows = g.max_tok;
+    const int64_t ER       = m.moecfg.rows * m.moecfg.top_k;
     /* The pipelined step's all-reduces run on the second lane, in place over `x`, so it is the one
      * buffer that lane touches; it is live over the whole program anyway. */
     if (m.pipe_on) RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_x.x));
@@ -801,7 +867,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Under a span every connection reads a step wider than a pass a pass at a time
      * (HyperConn::read_pieces, and the pipelined step's own reads), so the reads are declared no
      * wider than a pass and their scratch is sized for that band. */
-    if (m.span_on) m.hccfg.read_rows = m.moecfg.rows;
+    if (m.span_on) m.hccfg.read_rows = m.piece_rows;
     RAD_ARCH_TRY(m.a_x.declare_qs(b, nm, g, "x", g.n_embd, 0, m.trunk_i8));
     /* The connections write int8 codes themselves when every reader of their codes is an int8
      * linear: the trunk's are, and the routed experts then read the rotated copy or the bf16
@@ -810,9 +876,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* A read's rotated copy takes its plain codes' dtype, so beside int8 codes the routed arm is
      * int8 too: the experts read had_quant_act_i8g's codes through the grouped GEMM's int8 rows
      * (MoeFP8::a8), which the rotated four-bit plane, the codebook at E4M3 scales a 64 or 32 of K
-     * and rotated int8 experts have. The codebook at a bf16 scale a 128 and the five-bit one do
-     * not: under them the connections keep E4M3 codes, as for unrotated experts. */
-    const bool exp8 = m.moecfg.expert_rot && !m.moecfg.expert_w5 &&
+     * and rotated int8 experts have. The codebook at a bf16 scale a 128 and the five- and six-bit
+     * ones do not: under them the connections keep E4M3 codes, as for unrotated experts. */
+    const bool exp8 = m.moecfg.expert_rot && !m.moecfg.expert_w5 && !m.moecfg.expert_w6 &&
                       (!m.moecfg.expert_nl || m.moecfg.expert_g64);
     m.hccfg.codes_i8 = (m.trunk_i8 && (exp8 || m.moecfg.expert_bf16)) ? 1 : 0;
     m.a_x.q8_fed     = m.hccfg.codes_i8 != 0;
@@ -862,8 +928,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * pass (QsaIndexer::step, with the bounds in b_pipe_cu). The plane is the largest buffer
          * the span would otherwise grow, max_ctx / ratio floats a query row (512 MiB more at 4096
          * rows and 256K of context). */
-        const int64_t qsa_rows = (m.span_on && ctx->max_mixed_tok <= m.moecfg.rows)
-                                     ? m.moecfg.rows : g.max_tok;
+        const int64_t qsa_rows = (m.span_on && ctx->max_mixed_tok <= m.piece_rows)
+                                     ? m.piece_rows : g.max_tok;
         m.qsacfg.plane_rows = qsa_rows < g.max_tok ? qsa_rows : 0;
         /* One row per query, not per sequence (arch/common/rad_qsa.h). The score plane is the
          * only buffer whose size is the product of two deployment bounds, so an oversized one is
@@ -884,6 +950,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               { g.max_tok, m.qsacfg.topk + 1 });
         m.qsaw.nsel  = decl_b(b, nm.f("qsa_nsel"),  RAD_I32, { g.max_tok });
         m.qsaw.sequ  = decl_b(b, nm.f("qsa_sequ"),  RAD_I32, { g.max_tok });
+        if (m.qsaw.qk && m.qsaw.stage && m.qsaw.page && m.qsaw.bpos && m.qsaw.nc) {
+            /* What store_keys reads and writes is in use behind the attention's launches when a
+             * layer's keys are deferred behind them (QsaSide), past the last use the linear order
+             * gives these buffers, so the planner must not lay an attention buffer over them.
+             * A few MiB of arena (qk is the largest, max_tok x 640 bf16). */
+            RAD_ARCH_TRY(rad_buf_concurrent(b, m.qsaw.qk));
+            RAD_ARCH_TRY(rad_buf_concurrent(b, m.qsaw.stage));
+            RAD_ARCH_TRY(rad_buf_concurrent(b, m.qsaw.page));
+            RAD_ARCH_TRY(rad_buf_concurrent(b, m.qsaw.bpos));
+            RAD_ARCH_TRY(rad_buf_concurrent(b, m.qsaw.nc));
+            m.qsa_defer = true;
+        }
         if (!m.qsaw.qk || !m.qsaw.q || !m.qsaw.stage || !m.qsaw.page ||
             !m.qsaw.bpos || !m.qsaw.nc || !m.qsaw.score || !m.qsaw.sel || !m.qsaw.nsel ||
             !m.qsaw.sequ)
@@ -936,8 +1014,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.arm8) {
         /* The int8 routed arm's two pairs, rotated at a scale a 128 and written by their
          * producers: the gated product's by gated_had_quant_i8g, the input's by the read. */
-        /* A trellis gate_up may be paired with W5NL down. Keep its E4M3 pair as well so that
-         * the gated intermediate can use the down projection's own activation format. */
+        /* A trellis gate_up may be paired with a codebook (W5NL, W6NL) down. Keep its E4M3 pair
+         * as well so that the gated intermediate can use the down projection's own activation
+         * format. */
         RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER, true,
                                         m.moecfg.expert_iqr != 0, RAD_FP8_BLOCK));
         m.a_eff.q8_fed = m.a_eff.q8_rot = true;
@@ -1172,10 +1251,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 lay.attn.qsa_nsel     = m.qsaw.nsel;
                 lay.attn.qsa_sequ     = m.qsaw.sequ;
                 lay.attn.qsa_topk     = m.qsacfg.topk;
-                /* The exactness bound, below which prefill issues the cheaper dense attention.
-                 * Decode ignores it and always takes the sparse path, keeping that path exercised
-                 * on every step. */
+                /* The exactness bound, at or below which a step of several rows a sequence
+                 * (prefill, a verify) issues the cheaper dense attention. Plain decode keeps the
+                 * sparse row's launch at every context, so that kernel is exercised on every
+                 * step. */
                 lay.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
+                /* At or below that bound the indexer scores nothing (AttnGatedFP8::qsa_use): a
+                 * row alone in its sequence is at the context's last position on this model (a
+                 * plain decode row; the core's and the card's `seqused` is its position + 1), and
+                 * pass_key() carries the exact bound's side of it. */
+                lay.attn.qsa_table_rows = true;
+                lay.attn.qsa_exact_host = true;
             }
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
             /* An attention-zero rank keeps no attention cache: its block is a fill of zeros
@@ -1240,8 +1326,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         MoeFP8::Src ms{};
         ms.cfg              = m.moecfg;
-        /* The legacy expert tap can be limited to selected layers, including the MTP
-         * layer below. Keep the whole-expert placement selected by m.moecfg.calib. */
+        /* The expert tap can be limited to selected layers (RADIANCE_CALIB_LAYERS), the MTP
+         * layer below among them. The whole-expert placement m.moecfg.calib selects stays. */
         ms.cfg.calib        = m.moecfg.calib && calib_layer_on((int)l);
         ms.router           = nm.ckpt("%s.%lld.mlp.gate.weight", pre, (long long)l);
         RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",
@@ -1318,6 +1404,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(m.mixer.declare(b, nm, g, nm.f("output_hc"), mc, mixw, mixs));
     }
 
+    /* ---- the issue order of a decode step's small launches (AttnGatedFP8::kv_first_rows,
+     * MoeFP8::sh_down_first_lo): at decode and verify heights the k and v projections go in
+     * front of the q|gate projection, and from kVerifyRows rows the shared down projection in
+     * front of the routed down GEMM, so the card launches the small ones while the wide one is
+     * still being placed. The same kernels on the same operands; only what a recorded pass
+     * starts first changes. */
+    {
+        for (Layer& lay : m.layers) {
+            if (lay.full) lay.attn.kv_first_rows = kPrefetchRows;
+            lay.mlp.sh_down_first_lo = kVerifyRows;
+            lay.mlp.sh_down_first_hi = kPrefetchRows;
+        }
+    }
+
     /* ---- the delta nets' out projections, read beside their decode recurrent updates
      * (kGdnOutPrefetchBytes), and the full-attention layers' beside the attention
      * (kAttnOutPrefetchBytes). At more than one rank; --weight-prefetch off declares none. */
@@ -1325,11 +1425,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         for (Layer& lay : m.layers) {
             if (lay.full) {
                 lay.attn.op_pf_o = decl_prefetch(b, lay.attn.o.w, kAttnOutPrefetchBytes);
+                lay.attn.op_pf_o_v = decl_prefetch(b, lay.attn.o.w, kAttnOutPrefetchBytes,
+                                                   kPrefetchBlocksVerify);
+                lay.attn.pf_o_v_rows = kVerifyRows;
                 continue;
             }
             lay.gdn.op_pf_out   = decl_prefetch(b, lay.gdn.out.w, kGdnOutPrefetchBytes);
             lay.gdn.pf_out_rows = kPrefetchRows;
             lay.gdn.pf_out_seqs = kGdnOutPrefetchSeqs;
+            lay.gdn.op_pf_out_v   = decl_prefetch(b, lay.gdn.out.w, kGdnOutPrefetchBytes,
+                                                  kPrefetchBlocksVerify);
+            lay.gdn.pf_out_v_rows = kVerifyRows;
+        }
+        for (Layer& lay : m.layers) {
+            if (!lay.mlp.w_router) continue;
+            lay.op_pf_router = decl_prefetch(b, lay.mlp.w_router, kRouterPrefetchBytes);
+            lay.op_pf_router_v = decl_prefetch(b, lay.mlp.w_router, kRouterPrefetchBytes,
+                                               kPrefetchBlocksVerify);
         }
     }
 
@@ -1479,12 +1591,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* Set before declare(), as for the trunk: `attn_paged` declares `sel` and `seqused` as
          * reads, which must precede the op. */
         m.mtp.attn.kv_block = 4;
+        /* The head's layer takes the trunk's issue order at decode heights (declare, above). */
+        m.mtp.attn.kv_first_rows = kPrefetchRows;
+        m.mtp.mlp.sh_down_first_lo = kVerifyRows;
+        m.mtp.mlp.sh_down_first_hi = kPrefetchRows;
         if (m.qsaw.qk) {
             m.mtp.attn.qsa_sel      = m.qsaw.sel;
             m.mtp.attn.qsa_nsel     = m.qsaw.nsel;
             m.mtp.attn.qsa_sequ     = m.qsaw.sequ;
             m.mtp.attn.qsa_topk     = m.qsacfg.topk;
             m.mtp.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
+            /* As the trunk's layers: a round's row is the head's context's last position
+             * (ADV_ROUND), and the history pass is one row only where it commits one. */
+            m.mtp.attn.qsa_table_rows = true;
+            m.mtp.attn.qsa_exact_host = true;
             ts.qsa         = m.qsacfg;
             ts.qsa.mode    = m.mtp.attn.mode;
             ts.qsa.qk_proj = nm.ckpt("%s.layers.0.self_attn.indexer.index_qk_proj.weight", mpre);
@@ -1568,7 +1688,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * of the sharing pool (declare). The collectives there are declared at `overlap` 1, whose rows
  * leave the CUs to the work beside them. */
 static bool pipelined(const Model& m, int64_t T) {
-    const int64_t R = m.moecfg.rows;
+    const int64_t R = m.piece_rows;
     if (!m.pipe_on || R <= 0 || T <= R) return false;
     if (m.moecfg.calib || m.calib.on || dbg_resid_on() || !m.op_embed_ar) return false;
     for (const Layer& l : m.layers) {
@@ -1606,7 +1726,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
         m.pipe_cu_h = (int32_t*)rad_dev_alloc(2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
         if (m.pipe_cu_h) {
             m.pipe_cu_h[0] = 0;
-            m.pipe_cu_h[1] = (int32_t)m.moecfg.rows;
+            m.pipe_cu_h[1] = (int32_t)m.piece_rows;
         } else if (m.g.rank == 0) {
             fprintf(stderr, "radiance: qwen4exp: no pinned host memory for the window bounds; a "
                             "step wider than a pass cannot run\n");
@@ -1614,7 +1734,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
     }
     if (!m.pipe_cu_h) return nullptr;
     int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
-    if (batch->n_tok > m.moecfg.rows && batch->n_seq == 1) {
+    if (batch->n_tok > m.piece_rows && batch->n_seq == 1) {
         const RadStream s = rad_stream(c);
         if (rad_memcpy_async(d, m.pipe_cu_h, 2 * sizeof(int32_t), s) != RAD_OK ||
             rad_memcpy_async(d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK)
@@ -1625,7 +1745,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
 
 static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
-    const int64_t T = batch->n_tok, R = m.moecfg.rows;
+    const int64_t T = batch->n_tok, R = m.piece_rows;
     const int64_t K = (T + R - 1) / R;
     auto r0 = [&](int64_t p) { return p * R; };
     auto rn = [&](int64_t p) { return T - p * R < R ? T - p * R : R; };
@@ -1658,7 +1778,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 
     /* The delta net runs a piece at a time over the bounds (ArPieces::cu) in a step of one
      * prefill sequence in two pieces. */
-    const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL
+    const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
+                         batch->ckpt_cut <= 0
                        ? pcu : nullptr;
 
     const int64_t n = (int64_t)m.layers.size();
@@ -1666,6 +1787,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         if (m.ple_layer == 0) m.ple.step(c, batch);
         for (int64_t p = 0; p < K; ++p) m.layers[0].hc_mix.read(c, T, r0(p), rn(p));
     }
+    /* The pass's first full-attention layer with an indexer makes what every such layer shares of
+     * its step (QsaIndexer::step, `first`). */
+    bool qsa_first = true;
     for (int64_t li = 0; li < n; ++li) {
         const Layer& l = m.layers[(size_t)li];
         /* The mixer finishes its output a piece at a time where its last stages are per row and
@@ -1674,7 +1798,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         MixAr ms{c, &l};
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
-        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
+        if (l.full) {
+            l.qsa.step(c, l.attn.w.h, batch, pcu, l.attn.qsa_use(batch), qsa_first);
+            if (l.qsa.on()) qsa_first = false;
+            l.attn.step(c, batch, false, &pc);
+        }
         else        l.gdn.step(c, batch, false, &pc);
         auto ar_mix = [&](int64_t p) {
             if (l.full) l.attn.issue_ar(c, r0(p), rn(p));
@@ -1719,6 +1847,18 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
 }
 
+/* A full-attention layer's indexer keys behind its attention's launches (QsaIndexer::deferrable,
+ * SideOps): store_keys's three stages in turn, one a call, and whatever is left at flush(). */
+struct QsaSide {
+    RadCtx*           c = nullptr;
+    const QsaIndexer* q = nullptr;
+    const RadBatch*   batch = nullptr;
+    int               next = 1;
+    void one() { if (next <= 3) q->step_part(c, batch, next++); }
+    void flush() { while (next <= 3) one(); }
+    static void at(void* u, int) { ((QsaSide*)u)->one(); }
+};
+
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
  * other where step_pipelined's conditions do not hold. */
 static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
@@ -1739,22 +1879,50 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
+    /* The pass's first full-attention layer with an indexer makes what every such layer shares of
+     * its step (QsaIndexer::step, `first`). */
+    bool qsa_first = true;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
         if (li == m.ple_layer) m.ple.step(c, batch);
-        l.hc_mix.read_pieces(c, T);
+        /* A checkpoint inside the step (RadBatch::ckpt_cut) cuts the reads' pieces there. */
+        l.hc_mix.read_pieces(c, T, batch->ckpt_cut);
         /* The calibration taps read the codes the mixer's GEMMs read: its input before it runs,
          * its output projection's input before the feed-forward's connection reuses the pair. */
         if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, T);
         /* The indexer runs first, since the attention reads its selection. The block's input is
          * already normed and quantised by the connection (`ext_in`), so `w.h` is final. */
-        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }
+        if (l.full) {
+            const int use = l.attn.qsa_use(batch);
+            /* At decode heights within the exactness bound nothing of the layer reads the
+             * indexer's keys or tail (they are for later steps), so only the projection stays in
+             * front, beside the attention's own, and the three launches behind it ride behind the
+             * attention's (QsaSide) instead of holding its projections back in turn: -0.3% to
+             * -0.8% a step on chain 3 with coupling at tp 2. */
+            if (m.qsa_defer && T <= kPrefetchRows && batch->phase == RAD_PHASE_DECODE &&
+                l.qsa.deferrable(batch, use, qsa_first)) {
+                QsaSide sd{c, &l.qsa, batch};
+                const SideOps so{QsaSide::at, &sd};
+                l.qsa.step_proj(c, l.attn.w.h, batch);
+                l.attn.step(c, batch, true, nullptr, &so);
+                sd.flush();
+            } else {
+                l.qsa.step(c, l.attn.w.h, batch, pcu, use, qsa_first);
+                l.attn.step(c, batch);
+            }
+            if (l.qsa.on()) qsa_first = false;
+        }
         else        l.gdn.step(c, batch);
         if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
+        /* The router's weight, read beside the write's reduction and the read behind it. */
+        if (batch->phase == RAD_PHASE_DECODE)
+            prefetch_beside(c, l.op_pf_router_v && T >= kVerifyRows ? l.op_pf_router_v
+                                                                    : l.op_pf_router,
+                            l.mlp.w_router, T);
         l.hc_mix.write(c, T, 0, T);
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
-        l.hc_ffn.read_pieces(c, T);
+        l.hc_ffn.read_pieces(c, T, batch->ckpt_cut);
         l.mlp.step(c, batch);
         l.hc_ffn.write(c, T, 0, T);
         /* The request's control vector, on the stream the write just finished. */
@@ -1827,23 +1995,37 @@ static void step(RadCtx* c, const RadBatch* batch) {
 uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (!c || !batch) return 0;
     if (batch->enc) return 1;
+    Model& m = g_model[rad_slot(c)];
+    /* Which side of the indexer's exactness bound the step is on by the attention group's exact
+     * host bound, by which the full-attention layers and the indexer decide whether the step
+     * needs scores (AttnGatedFP8::qsa_within, qsa_exact_host). The core's key holds only the
+     * rounded context bound, so the side is keyed here: one more recording of each pass kind as a
+     * request crosses the bound. `sel` is 2 within the bound and 0 past it or where it is
+     * unknown, which is where the blocks fall back to the rounded bound the core keys. */
+    uint64_t sel = 0;
+    if (used_max_h && batch->kv && m.kv_full && m.qsacfg.budget > 0 && m.qsacfg.ratio > 0)
+        for (int i = 0; i < batch->n_kv_groups; ++i)
+            if (batch->kv[i].group == m.kv_full) {
+                if (used_max_h[i] > 0 &&
+                    used_max_h[i] <= m.qsacfg.budget + m.qsacfg.ratio - 1) sel = 2;
+                break;
+            }
     /* A decode pass, a speculative verify or an MTP draft included, issues every launch at the
      * step's keyed context bound (RadArgs::kv_used_max_h), never the live maximum, so the core's
      * key holds its geometry. */
-    if (batch->phase == RAD_PHASE_DECODE) return 1;
+    if (batch->phase == RAD_PHASE_DECODE) return 1 | sel;
     /* Mixed batches split the query rows into decode and prefill subsets before attention, which
      * read the live maximum. The whole-batch host summary cannot key those subset geometries
      * exactly, nor a drafter's or a verify's rows inside a prefill pass. */
     if (batch->phase == RAD_PHASE_MIXED || batch->draft_pass != 0 || batch->n_spec > 0) return 0;
 
-    Model& m = g_model[rad_slot(c)];
     bool has_full_attention = false;
     for (const Layer& layer : m.layers) {
         if (!layer.full) continue;
         if (layer.attn.kv_block != 4) return 0;
         has_full_attention = true;
     }
-    if (!has_full_attention) return 1;
+    if (!has_full_attention) return 1 | sel;
     if (m.g.head_dim != 256 || (m.g.gqa() != 6 && m.g.gqa() != 12) || !m.kv_full ||
         !used_max_h || !batch->kv || batch->n_kv_groups <= 0)
         return 0;
@@ -1869,7 +2051,10 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     const int bq = nwarps * 16 / m.g.gqa();
     const int splits = rad_prefill_splits_for_live(bq, tile, q_len, total_q, num_seqs,
                                                     kv_heads, m.g.max_ctx, used, wgps);
-    return rad_prefill_grid_key(q_len, bq, splits, kv_heads, num_seqs, nwarps * 32);
+    const uint64_t grid = rad_prefill_grid_key(q_len, bq, splits, kv_heads, num_seqs, nwarps * 32);
+    /* 0 stays "unknown"; the side of the bound rides in a bit the grid key's mix does not leave
+     * meaningful, so two sides are two keys. */
+    return grid ? ((grid << 2) | 1 | sel) : 0;
 }
 
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
@@ -1887,6 +2072,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * have chained forms: on two R9700 a full pass under the draft head went from 13.9 to 12.5 ms
      * and the step without the head from 9.98 to 9.17 ms at one sequence. */
     out->chain_pays = RAD_CHAIN_ALWAYS;
+    /* A step of one prefill sequence with its checkpoint inside it (RadBatch::ckpt_cut): the delta
+     * net runs its recurrence in two pieces and snapshots between them (rad_block_gdn_fp8.h), and
+     * the connection reads cut their pieces at the checkpoint (HyperConn::read_pieces), so the
+     * rows before it read what a chunk ending there reads. */
+    out->ckpt_snap_ok = 1;
     return RAD_OK;
 }
 

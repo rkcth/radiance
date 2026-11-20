@@ -5,9 +5,12 @@
 //
 // head_dim 128 is Unlimited-OCR's decoder (10 query heads over 10 KV heads): the plain MHA case,
 // served here so its q slice of the fused q|k|v plane is read in place instead of being lifted into
-// a dense buffer. Gemma 4's text layers: sliding layers are 16 query heads over 8 KV heads at
-// head_dim 256 with a 1024-token window, full layers 16 over 2 at head_dim 512. Where this overlaps
-// libhalo's other h256 legs, the row table decides (halo_rows.cpp).
+// a dense buffer. head_dim 128 at gqa 4 is LFM3's attention (16 query heads over 4 KV heads): full
+// layers, and sliding layers with a 256-token window; its decode steps stay on
+// halo_attn_paged_h128_gqa4.hip and every longer q_len lands here. Gemma 4's text layers: sliding
+// layers are 16 query heads over 8 KV heads at head_dim 256 with a 1024-token window, full layers
+// 16 over 2 at head_dim 512. Where this overlaps libhalo's other legs, the row table decides
+// (halo_rows.cpp).
 //
 // Two kernels behind one entry point, as in libr4d:
 //   - Scalar, for decode and verify: a workgroup owns one (sequence, KV head, slice of BQ query
@@ -157,10 +160,28 @@ __device__ __forceinline__ void fp8x4(unsigned w, float (&f)[4]) {
 __device__ __forceinline__ unsigned pack2(float a, float b) { return bf16x2_rne_nan(a, b); }
 __device__ __forceinline__ uint16_t bf16_of(float f) { return (uint16_t)(bf16_hi_rne_nan(f) >> 16); }
 
+/* Four int8 codes as their values. */
+__device__ __forceinline__ void i8x4(unsigned w, float (&f)[4]) {
+    f[0] = (float)(signed char)(w & 0xffu);
+    f[1] = (float)(signed char)((w >> 8) & 0xffu);
+    f[2] = (float)(signed char)((w >> 16) & 0xffu);
+    f[3] = (float)(signed char)(w >> 24);
+}
+/* Four bytes of an 8-bit cache: E4M3 (KV8 1) or int8 codes (KV8 2, the int8 cache). */
+template <int KV8>
+__device__ __forceinline__ void kv8x4(unsigned w, float (&f)[4]) {
+    if constexpr (KV8 == 2) i8x4(w, f);
+    else fp8x4(w, f);
+}
+/* An f16 at `p` as a float: one of the int8 cache's scales. */
+__device__ __forceinline__ float f16_at(const unsigned char* p) {
+    return (float)__builtin_bit_cast(_Float16, *(const unsigned short*)p);
+}
+
 /* Four elements of one slot row, at element offset `e`, out of the LDS tile. */
-template <bool KV8>
+template <int KV8>
 __device__ __forceinline__ void lds4(const unsigned char* row, int e, float (&f)[4]) {
-    if constexpr (KV8) fp8x4(*(const unsigned*)(row + e), f);
+    if constexpr (KV8) kv8x4<KV8>(*(const unsigned*)(row + e), f);
     else bf16x4(*(const uint2*)(row + 2 * e), f);
 }
 
@@ -195,9 +216,16 @@ struct AttnArgs {
     const float*         vdes;
     uint16_t*            out;    long long o_rs, o_hs;
     float*               part;                             /* split-KV partials, or null */
+    const float*         sinks;                            /* [query heads] or null */
     int*                 tinfo;                            /* [tile] = (first row, positions) */
     float qscale;                                          /* softmax scale * log2(e) */
     int   max_blocks, n_seq, q_len, tps, kv_heads, causal, window, n_split;
+    int   shared_window;                                    /* all query rows use sequence anchor */
+    /* 1: a non-causal window bounds the keys behind only (launch_attn's FWD) */
+    int   ahead;
+    /* A tree verify (attn_paged_qrow_tree): RadBatch::spec_parent, one a query row; read only by
+     * the TREE instances. */
+    const int*           tpar;
 };
 
 /* Tile `tile` of a ragged batch: its sequence and which BQ-position slice of that sequence's query
@@ -244,21 +272,25 @@ __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* 
 /* ------------------------------------------------------------------ the attention kernel */
 /* The body; attn_kernel and its chained form halo_win_r4dchain_attn (halo_chain.h) wrap it below,
  * since its blocks return early. */
-template <int HD, int GQA, bool KV8>
+template <int HD, int GQA, int KV8, bool TREE = false>
 __device__ __forceinline__ void attn_body(AttnArgs A) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, RW = R / kWaves, BQ = R / GQA;
     constexpr int NC = HD / 128;                     /* 4-element chunks a lane holds of a row */
     constexpr int ESZ = KV8 ? 1 : 2;
-    constexpr int KEY_BYTES = 2 * HD * ESZ;          /* one slot: K then V */
+    constexpr int TAIL = KV8 == 2 ? 4 : 0;           /* the int8 cache's two f16 scales */
+    constexpr int KEY_BYTES = 2 * HD * ESZ + TAIL;   /* one slot: K then V (then the scales) */
     constexpr int TILE_U4 = BK * KEY_BYTES / 16;
-    constexpr int NPT = TILE_U4 / kThreads;          /* 16-byte loads a thread, per tile */
+    /* 16-byte loads a thread, per tile. With the scales a tile is not whole threads: the last
+     * round is short, and a block's loads are found by division. */
+    constexpr int NPT = (TILE_U4 + kThreads - 1) / kThreads;
     constexpr int BLK_U4 = 16 * KEY_BYTES / 16;      /* one paged block of one kv head */
     constexpr int NB = BK / 16;                      /* paged blocks a key tile spans */
     static_assert(R % kWaves == 0 && R % GQA == 0, "rows must split over waves and heads");
-    static_assert(TILE_U4 % kThreads == 0 && BLK_U4 % kThreads == 0, "tile must split over threads");
+    static_assert(TAIL != 0 || (TILE_U4 % kThreads == 0 && BLK_U4 % kThreads == 0),
+                  "tile must split over threads");
     static_assert(BK == 32 || BK == 16, "the reduce-scatter is written for 16 or 32 keys");
 
-    __shared__ uint4 s_kv[TILE_U4];
+    __shared__ uint4 s_kv[NPT * kThreads];
     __shared__ int s_scan[kWaves];
     __shared__ int s_res[2];
 
@@ -288,16 +320,32 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
     }
     if (npos <= 0) return;                           /* uniform across the block */
 
+    /* TREE: the sequence's first rows' parents staged once (a tree block is at most 64 rows), so
+     * each row's walk below reads LDS rather than a chain of dependent global loads. */
+    __shared__ int s_tpar[TREE ? 64 : 1];
+    if constexpr (TREE) {
+        if (A.tpar) {
+            const int nst = imin(qlen, 64);
+            for (int r = tid; r < nst; r += kThreads) s_tpar[r] = A.tpar[tokb + r];
+            __syncthreads();
+        }
+    }
+
     const int tok0 = tokb + pfirst;
     const int qbase = ctx - qlen + pfirst;           /* absolute position of the tile's first query */
     const int plast = qbase + npos - 1;
     const int causal = A.causal, window = A.window;
+    const int tbase = ctx - qlen;                    /* first query position, the block anchor */
+    const int window_base = A.shared_window ? tbase : ((TREE && A.tpar) ? tbase : qbase);
 
-    /* ---- the tile's key range, and this split's share of it */
-    int hi = causal ? plast + 1 : ctx;
-    if (!causal && window > 0) hi = imin(hi, plast + window);
+    /* ---- the tile's key range, and this split's share of it. Without the shared anchor, the
+     * ahead form or a tree these are the plain forms' bounds unchanged. */
+    int hi = causal ? (A.shared_window ? tbase + 1 : plast + 1) : ctx;
+    if (!causal && window > 0 && !A.shared_window && !A.ahead) hi = imin(hi, plast + window);
     hi = imin(imin(hi, ctx), A.max_blocks * 16);
-    const int lo = window > 0 ? imax(0, qbase - window + 1) : 0;
+    /* A tree row's window is measured from the block's first position plus its depth, which can
+     * be below its own position; an anchor-window launch also uses the first row for every query. */
+    const int lo = window > 0 ? imax(0, window_base - window + 1) : 0;
     const int lo_a = lo & ~(BK - 1);
     const int nkt = hi > lo_a ? (hi - lo_a + BK - 1) / BK : 0;
     const int per = (nkt + A.n_split - 1) / A.n_split;
@@ -310,6 +358,11 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
     float qf[RW][NC][4], o[RW][NC][4], m[RW], l[RW];
     int pos[RW];
     bool val[RW];
+    /* TREE: each row's ancestors inside the block (a bit per row of the block, itself included),
+     * whether it is a tree row at all, and the position its window is measured from. */
+    uint64_t tm[RW];
+    int wq[RW];
+    bool tr[RW];
 #pragma unroll
     for (int i = 0; i < RW; ++i) {
         const int r = wave * RW + i, p = r / GQA, g = r - p * GQA;
@@ -317,6 +370,28 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
         pos[i] = qbase + p;
         m[i] = -__builtin_inff();
         l[i] = 0.0f;
+        tm[i] = 0;
+        wq[i] = pos[i];
+        tr[i] = false;
+        if constexpr (TREE) {
+            const int rel = pfirst + p;              /* the row within its sequence's rows */
+            if (A.tpar && val[i] && rel < 64) {
+                int pj = s_tpar[rel];
+                if (pj != -2) {
+                    uint64_t mk = 1ull << rel;
+                    int dep = 0;
+                    for (int at = rel; pj >= 0 && pj < at; ) {
+                        mk |= 1ull << pj;
+                        ++dep;
+                        at = pj;
+                        pj = s_tpar[pj];
+                    }
+                    tr[i] = true;
+                    tm[i] = mk;
+                    wq[i] = tbase + dep;
+                }
+            }
+        }
         const uint16_t* qp = A.q + (long long)(tok0 + p) * A.q_rs + (long long)(kh * GQA + g) * A.q_hs;
         const float qs = A.qscale * kds;             /* k_descale folds into the query */
 #pragma unroll
@@ -348,10 +423,18 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
         }
 #pragma unroll
         for (int i = 0; i < NPT; ++i) {
-            const int b = (i * kThreads) / BLK_U4;   /* constant: BLK_U4 is a multiple of 256 */
-            const int off = tid + i * kThreads - b * BLK_U4;
-            if (pre_ok[b]) pre[i] = *(const w4_t*)((const uint4*)src[b] + off);
-            else           pre[i] = zero4;
+            if constexpr (TAIL) {
+                const int gi = tid + i * kThreads;
+                const int b = gi >= BLK_U4 ? NB - 1 : 0;
+                const int off = gi - b * BLK_U4;
+                pre[i] = zero4;
+                if (gi < TILE_U4 && pre_ok[b]) pre[i] = *(const w4_t*)((const uint4*)src[b] + off);
+            } else {
+                const int b = (i * kThreads) / BLK_U4;   /* constant: BLK_U4 is a multiple of 256 */
+                const int off = tid + i * kThreads - b * BLK_U4;
+                if (pre_ok[b]) pre[i] = *(const w4_t*)((const uint4*)src[b] + off);
+                else           pre[i] = zero4;
+            }
         }
     };
 
@@ -385,6 +468,7 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
 #pragma unroll
                     for (int e = 0; e < 4; ++e) acc = __builtin_fmaf(qf[i][c][e], k[e], acc);
                 }
+                if constexpr (KV8 == 2) acc *= f16_at(row + 2 * HD);
                 sc[j] = acc;
             }
             if constexpr (BK == 32) {
@@ -395,8 +479,14 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
                 reduce_scatter<8, BK>(sc, lane);
             }
             const int pq = pos[i];
-            bool vis = kok && (causal ? kk <= pq : true);
-            if (window > 0) vis = vis && (pq - kk < window) && (causal || kk - pq < window);
+            bool vis = kok && (causal ? kk <= (A.shared_window ? tbase : pq) : true);
+            if constexpr (TREE)
+                if (tr[i] && vis && kk >= tbase) vis = ((tm[i] >> (kk - tbase)) & 1ull) != 0;
+            const int wpq = A.shared_window ? tbase : (TREE ? wq[i] : pq);
+            if (A.shared_window)
+                vis = vis && (wpq - kk < window);
+            else if (window > 0)
+                vis = vis && (wpq - kk < window) && (causal || A.ahead || kk - wpq < window);
             const float sv = vis ? sc[0] : -__builtin_inff();
             const float mn = __builtin_fmaxf(m[i], wave_max(sv));
             if (mn == -__builtin_inff()) return;     /* nothing visible yet: uniform */
@@ -412,12 +502,13 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
                 const float pj = readlane(p, j);     /* uniform; a masked key's V is never read */
                 if (pj != 0.0f) {
                     const unsigned char* row = sb + j * KEY_BYTES;
+                    const float pv = KV8 == 2 ? pj * f16_at(row + 2 * HD + 2) : pj;
 #pragma unroll
                     for (int c = 0; c < NC; ++c) {
                         float v[4];
                         lds4<KV8>(row, HD + c * 128 + lane * 4, v);
 #pragma unroll
-                        for (int e = 0; e < 4; ++e) o[i][c][e] = __builtin_fmaf(pj, v[e], o[i][c][e]);
+                        for (int e = 0; e < 4; ++e) o[i][c][e] = __builtin_fmaf(pv, v[e], o[i][c][e]);
                     }
                 }
             }
@@ -432,6 +523,21 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
         if (!val[i]) continue;
         const int r = wave * RW + i, p = r / GQA, g = r - p * GQA;
         if (A.n_split == 1) {
+            /* A sink joins the row's max and sum with no value (log2 domain, as m and l). */
+            if (A.sinks && m[i] != -__builtin_inff()) {
+                const float s2 = A.sinks[kh * GQA + g] * 1.4426950408889634f;
+                if (s2 > m[i]) {
+                    const float corr = ex2(m[i] - s2);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) o[i][c][e] *= corr;
+                    l[i] = l[i] * corr + 1.0f;
+                    m[i] = s2;
+                } else {
+                    l[i] += ex2(s2 - m[i]);
+                }
+            }
             const float inv = l[i] > 0.0f ? vds / l[i] : 0.0f;
             uint16_t* op = A.out + (long long)(tok0 + p) * A.o_rs + (long long)(kh * GQA + g) * A.o_hs;
 #pragma unroll
@@ -516,24 +622,28 @@ __device__ __forceinline__ void bf16x8_f16(const w4_t w, unsigned (&h)[8]) {
         h[2 * q + 1] = f16_bits(bf16w_hi(in[q]));
     }
 }
-/* fp8 e4m3 -> bf16 bits (the K tile), exact: the f32 a byte widens to has nothing below bit 16 */
-__device__ __forceinline__ void fp8x16_bf16(const w4_t w, unsigned (&h)[16]) {
+/* fp8 e4m3 or int8 -> bf16 bits (the K tile), exact: the f32 a byte widens to has nothing below
+ * bit 16 */
+template <int KV8>
+__device__ __forceinline__ void kv8x16_bf16(const w4_t w, unsigned (&h)[16]) {
     const unsigned in[4] = { w.x, w.y, w.z, w.w };
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
         float f[4];
-        fp8x4(in[q], f);
+        kv8x4<KV8>(in[q], f);
 #pragma unroll
         for (int e = 0; e < 4; ++e) h[q * 4 + e] = __float_as_uint(f[e]) >> 16;
     }
 }
 
-template <int HD, int GQA, bool KV8>
+template <int HD, int GQA, int KV8>
 __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
     using G = WGeo<HD>;
     constexpr int NS = G::NS, R = G::R, BQ = R / GQA, KS = G::KS, VS = G::VS;
     constexpr int ESZ = KV8 ? 1 : 2;
-    constexpr int SLOT = 2 * HD * ESZ;            /* bytes of one key's slot: K then V */
+    /* bytes of one key's slot: K then V, and at KV8 2 the token's two f16 scales, which make a
+     * slot's 16-byte loads start on a 4-byte boundary */
+    constexpr int SLOT = 2 * HD * ESZ + (KV8 == 2 ? 4 : 0);
     constexpr int CW = 16 / ESZ;                  /* cache elements one 16-byte load carries */
     constexpr int NCH = HD / CW;                  /* such chunks a head */
     constexpr int NKI = 16 * NCH;                 /* K items a tile: (key, chunk) */
@@ -549,6 +659,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
     /* The slices' partial scores meet here. Head_dim 128 is one slice -- there is nothing to
      * exchange -- so the stage costs neither the 16 KiB nor a barrier per key tile there. */
     __shared__ float4 s_x[NS > 1 ? kWWaves * 32 * 2 : 1];
+    __shared__ unsigned s_sc[KV8 == 2 ? 16 : 1];  /* a key's scales: K's f16 low, V's high */
     __shared__ int s_scan[kWWaves];
     __shared__ int s_res[2];
 
@@ -580,7 +691,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
     const int plast = qbase + npos - 1;
     const int causal = A.causal, window = A.window;
     int hi = causal ? plast + 1 : ctx;
-    if (!causal && window > 0) hi = imin(hi, plast + window);
+    if (!causal && window > 0 && !A.ahead) hi = imin(hi, plast + window);
     hi = imin(imin(hi, ctx), A.max_blocks * 16);
     const int lo = window > 0 ? imax(0, qbase - window + 1) : 0;
     const int lo_a = lo & ~15;
@@ -615,11 +726,17 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
     for (int mc = 0; mc < NKS; ++mc)
 #pragma unroll
         for (int e = 0; e < 8; ++e) oacc[mc][e] = 0.0f;
-    float m = -__builtin_inff(), l = 0.0f;
+    /* The learned sink is a key with no value: it joins the running max and the denominator
+     * (log2 domain). Keys are split across lane and lane^16, so only lane h=0 seeds the sink's
+     * weight of one; the final lt2 adds the two lanes. Without sinks: -inf and 0, as before. */
+    const float sink = A.sinks ? A.sinks[kh * GQA + g] * 1.4426950408889634f
+                               : -__builtin_inff();
+    float m = sink, l = (A.sinks && h == 0) ? 1.0f : 0.0f;
 
     /* ---- the key tiles, one paged block each, prefetched one ahead through registers */
     w4_t pk[KPT], pv[VPT][2];
     const w4_t zero4 = {0u, 0u, 0u, 0u};
+    unsigned psc = 0u;
     bool pre_ok = false;
     auto fetch = [&](int kt) __attribute__((always_inline)) {
         const int k0 = lo_a + kt * 16, lb = k0 >> 4;
@@ -637,6 +754,10 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 const int key = idx / NCH, ch = idx - key * NCH;
                 pk[j] = *(const w4_t*)(base + key * SLOT + ch * 16);
             }
+        }
+        if constexpr (KV8 == 2) {
+            psc = 0u;
+            if (pre_ok && tid < 16) psc = *(const unsigned*)(base + tid * SLOT + 2 * HD);
         }
 #pragma unroll
         for (int j = 0; j < VPT; ++j) {
@@ -670,7 +791,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 const w4_t w = keep ? pk[j] : zero4;
                 if constexpr (KV8) {
                     unsigned hb[16];
-                    fp8x16_bf16(w, hb);
+                    kv8x16_bf16<KV8>(w, hb);
                     uint4* dst = (uint4*)(kb + key * KS + ch * 32);
                     dst[0] = make_uint4(hb[0] | hb[1] << 16, hb[2] | hb[3] << 16,
                                         hb[4] | hb[5] << 16, hb[6] | hb[7] << 16);
@@ -680,6 +801,9 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                     *(w4_t*)(kb + key * KS + ch * 16) = w;
                 }
             }
+        }
+        if constexpr (KV8 == 2) {
+            if (tid < 16) s_sc[tid] = psc;
         }
         /* ---- V: [dim][key] as f16, two keys a dword; the row order rotated by 2 per 8-lane
          * group, so the four groups of a wave write four different rows mod 8 -- 32 banks */
@@ -693,15 +817,15 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 const w4_t wb = (tok && kb1 >= lo && kb1 < hi) ? pv[j][1] : zero4;
                 unsigned d[CW];                      /* f16 pairs: key 2kp low, 2kp + 1 high */
                 if constexpr (KV8) {
-                    /* every e4m3 value is exact in f16 (|v| <= 448, subnormals 2^-9 up), so the
-                     * pack's round-toward-zero leaves the same bits */
+                    /* every e4m3 value is exact in f16 (|v| <= 448, subnormals 2^-9 up), and so
+                     * is an int8 code, so the pack's round-toward-zero leaves the same bits */
                     const unsigned ia[4] = {wa.x, wa.y, wa.z, wa.w};
                     const unsigned ib[4] = {wb.x, wb.y, wb.z, wb.w};
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {
                         float fa[4], fb[4];
-                        fp8x4(ia[q], fa);
-                        fp8x4(ib[q], fb);
+                        kv8x4<KV8>(ia[q], fa);
+                        kv8x4<KV8>(ib[q], fb);
 #pragma unroll
                         for (int e = 0; e < 4; ++e) d[q * 4 + e] = WP::pk(fa[e], fb[e]);
                     }
@@ -769,6 +893,13 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 for (int e = 0; e < 8; ++e) tot[e] = j == 0 ? v[e] : tot[e] + v[e];
             }
         }
+        /* The int8 cache: a key's dot is over its codes, times its K scale. Element e is key
+         * 2*e + h on gfx1151 (libr4d's 8*h + e on gfx12). */
+        if constexpr (KV8 == 2) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+                tot[e] *= (float)__builtin_bit_cast(_Float16, (unsigned short)(s_sc[2 * e + h] & 0xffffu));
+        }
 
         /* ---- online softmax, row n: eight keys here, eight in lane ^ 16. Element e is key
          * 2*e + h on gfx1151 (halo_dt16.h), the two halves covering a tile between them. */
@@ -789,7 +920,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 const int kk = k0 + 2 * e + h;
                 bool vis = rval && tok && kk >= lo && kk < hi;
                 if (causal) vis = vis && kk <= pos;
-                if (window > 0) vis = vis && (pos - kk < window) && (causal || kk - pos < window);
+                if (window > 0) vis = vis && (pos - kk < window) && (causal || A.ahead || kk - pos < window);
                 sv[e] = vis ? tot[e] * sscale : -__builtin_inff();
                 mx = __builtin_fmaxf(mx, sv[e]);
             }
@@ -815,6 +946,24 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 l = __builtin_amdgcn_fdot2(__builtin_bit_cast(v2hf_dt, pw[e]), one, l, false);
         }
         m = mn;
+        /* The int8 cache: a key's row of V codes enters at its probability times its V scale,
+         * the f16 probability (as the denominator summed it) rounded once more. Key 2*e + h. */
+        if constexpr (KV8 == 2) {
+            typedef _Float16 h2v __attribute__((ext_vector_type(2)));
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                h2v pp = __builtin_bit_cast(h2v, pw[w]);
+#pragma unroll
+                for (int k2 = 0; k2 < 2; ++k2) {
+                    const int e = 2 * w + k2;
+                    /* a masked key's scale is whatever its slot holds: its zero stays zero */
+                    const float pe = (float)pp[k2];
+                    const float vs = (float)__builtin_bit_cast(_Float16, (unsigned short)(s_sc[2 * e + h] >> 16));
+                    pp[k2] = pe != 0.0f ? (_Float16)(pe * vs) : (_Float16)0.0f;
+                }
+                pw[w] = __builtin_bit_cast(uint32_t, pp);
+            }
+        }
         /* gfx1151's B fragment wants the sixteen keys of the tile in order and a lane holds one
          * parity of them: p16w (halo_dt16.h) interleaves the half-pair's eight values. */
         uint32_t pw16[8];
@@ -897,8 +1046,12 @@ __device__ __forceinline__ void merge_body(AttnArgs A) {
             for (int c = 0; c < NC; ++c) *(uint2*)(op + c * 128 + lane * 4) = make_uint2(0u, 0u);
             continue;
         }
-        const float w0 = ex2(m0 - mt), w1 = ex2(m1 - mt);    /* an empty split: ex2(-inf) = 0 */
-        const float lt = wave_sum(__builtin_fmaf(l0, w0, l1 * w1));
+        /* A sink joins the max and the sum with no value (log2 domain); without one this is the
+         * plain merge, bit for bit (ms = mt, + 0). */
+        const float s2 = A.sinks ? A.sinks[kh * GQA + g] * 1.4426950408889634f : ninf;
+        const float ms = __builtin_fmaxf(mt, s2);
+        const float w0 = ex2(m0 - ms), w1 = ex2(m1 - ms);    /* an empty split: ex2(-inf) = 0 */
+        const float lt = wave_sum(__builtin_fmaf(l0, w0, l1 * w1)) + (A.sinks ? ex2(s2 - ms) : 0.0f);
         const float inv = lt > 0.0f ? 1.0f / lt : 0.0f;
         float acc[NC][4];
 #pragma unroll
@@ -981,12 +1134,14 @@ static constexpr int64_t scratch_need() {
 
 /* The plain kernels and their chained forms (halo_chain.h, RadKernelChainFn): the chained ones wait
  * for the kernels before them on the queue in their prologue and count themselves in at the end. */
-template <int HD, int GQA, bool KV8>
-__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) { attn_body<HD, GQA, KV8>(A); }
-template <int HD, int GQA, bool KV8>
+template <int HD, int GQA, int KV8, bool TREE = false>
+__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
+    attn_body<HD, GQA, KV8, TREE>(A);
+}
+template <int HD, int GQA, int KV8, bool TREE = false>
 __global__ __launch_bounds__(kThreads) void halo_win_r4dchain_attn(AttnArgs A) {
     halo_chain_wait();
-    attn_body<HD, GQA, KV8>(A);
+    attn_body<HD, GQA, KV8, TREE>(A);
     halo_chain_done();
 }
 template <int HD, int GQA>
@@ -998,10 +1153,25 @@ __global__ __launch_bounds__(kThreads) void halo_win_r4dchain_merge(AttnArgs A) 
     halo_chain_done();
 }
 
-template <int HD, int GQA, bool KV8>
-static int launch_attn(const RadArgs* a, RadStream stream) {
+/* KV8: 0 the bf16 cache, 1 E4M3, 2 the int8 cache (kv_store_i8's slots). TREE: a tree verify's
+ * mask (attn_paged_qrow_tree, the ninth operand its parents), causal only, never the WMMA kernel.
+ * SHARED: the first query row anchors every row's window (attn_paged_anchor_window). FWD: a
+ * non-causal window bounding the keys behind only (attn_paged_ahead). `sink`: attn_paged_sink,
+ * whose eighth operand is the per-head sinks and ninth the output. */
+template <int HD, int GQA, int KV8, bool TREE = false, bool SHARED = false, bool FWD = false>
+static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, BQ = R / GQA, ESZ = KV8 ? 1 : 2;
-    if (!a || a->n_t < 8) return HALO_NO(RAD_E_INVAL);
+    /* A slot's elements: K then V, and for the int8 cache its four bytes of scales
+     * (abi/rad_builder.h, rad_kv_row_elems). */
+    constexpr int SLOT_E = 2 * HD + (KV8 == 2 ? 4 : 0);
+    if (!a || a->n_t < (TREE || sink ? 9 : 8)) return HALO_NO(RAD_E_INVAL);
+    /* attn_paged_sink keeps its output where the tree operand would be: never both. */
+    if (TREE && sink) return HALO_NO(RAD_E_INVAL);
+    /* attn_paged_qrow_tree's ninth operand: one int32 a query row (docs/OPS.md). Causal only. */
+    const RadTensor* tp = TREE ? halo_opt(a, 8) : nullptr;
+    if (TREE && (!tp || !tp->data)) return HALO_NO(RAD_E_INVAL);
+    if (TREE && tp->dtype != RAD_I32) return HALO_NO(RAD_E_DTYPE);
+    if (TREE && halo_geti_or(a, "causal", 1) != 1) return HALO_NO(RAD_E_UNSUPPORTED);
     const RadTensor* q  = halo_opt(a, AP_Q);
     const RadTensor* kv = halo_opt(a, AP_KV);
     const RadTensor* bt = halo_opt(a, AP_BT);
@@ -1009,8 +1179,9 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     const RadTensor* kd = halo_opt(a, AP_KDS);
     const RadTensor* vd = halo_opt(a, AP_VDS);
     const RadTensor* cu = halo_opt(a, AP_CU);
-    const RadTensor* o  = halo_opt(a, AP_OUT);
-    if (!q || !kv || !bt || !su || !o) return HALO_NO(RAD_E_INVAL);
+    const RadTensor* sk = sink ? halo_opt(a, AP_OUT) : nullptr;
+    const RadTensor* o  = halo_opt(a, sink ? AP_OUT + 1 : AP_OUT);
+    if (!q || !kv || !bt || !su || !o || (sink && !sk)) return HALO_NO(RAD_E_INVAL);
 
     if (halo_geti_or(a, "head_dim", HD) != HD || halo_geti_or(a, "gqa", GQA) != GQA ||
         halo_geti_or(a, "block_size", 16) != 16)
@@ -1018,19 +1189,25 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     const long long causal = halo_geti_or(a, "causal", 1);
     const long long window = halo_geti_or(a, "window", 0);
     if ((causal != 0 && causal != 1) || window < 0 || window > (1ll << 30)) return HALO_NO(RAD_E_SHAPE);
+    /* The open-ended window is a non-causal one: a causal row has nothing ahead, and without a
+     * window there is nothing to bound. */
+    if (FWD && (causal != 0 || window == 0)) return HALO_NO(RAD_E_SHAPE);
 
     if (q->dtype != RAD_BF16 || o->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
-    if (kv->dtype != (uint32_t)(KV8 ? RAD_F8E4M3 : RAD_BF16)) return HALO_NO(RAD_E_DTYPE);
+    if (kv->dtype != (uint32_t)(KV8 == 2 ? RAD_I8 : KV8 ? RAD_F8E4M3 : RAD_BF16))
+        return HALO_NO(RAD_E_DTYPE);
     if (bt->dtype != RAD_I32 || su->dtype != RAD_I32 || (cu && cu->dtype != RAD_I32))
         return HALO_NO(RAD_E_DTYPE);
     if ((kd && kd->dtype != RAD_F32) || (vd && vd->dtype != RAD_F32)) return HALO_NO(RAD_E_DTYPE);
+    if (sk && sk->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
 
-    /* the cache: [n_blocks, kv_heads, 16, 2 * head_dim], slots dense */
-    if (kv->rank != 4 || kv->shape[2] != 16 || kv->shape[3] != 2 * HD) return HALO_NO(RAD_E_SHAPE);
-    if (kv->stride[3] != 1 || kv->stride[2] != 2 * HD) return HALO_NO(RAD_E_STRIDE);
+    /* the cache: [n_blocks, kv_heads, 16, 2 * head_dim (+ 4)], slots dense */
+    if (kv->rank != 4 || kv->shape[2] != 16 || kv->shape[3] != SLOT_E) return HALO_NO(RAD_E_SHAPE);
+    if (kv->stride[3] != 1 || kv->stride[2] != SLOT_E) return HALO_NO(RAD_E_STRIDE);
     const int64_t kvh = kv->shape[1];
     if (kvh <= 0 || kvh > 65535) return HALO_NO(RAD_E_SHAPE);
     const int64_t qh = kvh * GQA;
+    if (sk && halo_numel(sk) != qh) return HALO_NO(RAD_E_SHAPE);
 
     /* q and out: [rows, heads * head_dim], each at its own row pitch (attn_paged_qrow reads q as a
      * column slice of a fused q|k|v projection). */
@@ -1040,6 +1217,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     q_hs = o_hs = HD;
     if (qhn != qh || ohn != qh) return HALO_NO(RAD_E_SHAPE);
     if (orows < rows) return HALO_NO(RAD_E_SHAPE);
+    if (TREE && halo_numel(tp) < rows) return HALO_NO(RAD_E_SHAPE);
     const int64_t n_seq = halo_numel(su);
     if (rows == 0) return RAD_OK;
     if (n_seq <= 0 || n_seq > (1 << 24)) return HALO_NO(RAD_E_SHAPE);
@@ -1098,6 +1276,10 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     A.kv_heads = (int)kvh;
     A.causal = (int)causal;
     A.window = (int)window;
+    A.shared_window = SHARED;
+    A.ahead = FWD ? 1 : 0;
+    A.sinks = sk ? (const float*)sk->data : nullptr;
+    A.tpar = TREE ? (const int*)tp->data : nullptr;
     const double scale = halo_getf(a, "scale", 1.0 / __builtin_sqrt((double)HD));
     A.qscale = (float)(scale * 1.4426950408889634);
     A.n_split = 1;
@@ -1112,7 +1294,10 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
             qmax_w = halo_geti_or(a, "q_len", rows);
             if (qmax_w <= 0 || qmax_w > rows) qmax_w = rows;
         }
-        const bool shaped = qmax_w >= kWmmaMinQ && rows >= n_seq * (kWmmaMinQ / 2);
+        /* Never a tree or the shared anchor: a tree's verify blocks are decode-sized and only the
+         * scalar kernel reads one or the anchor. */
+        const bool shaped = !TREE && !SHARED && qmax_w >= kWmmaMinQ &&
+                            rows >= n_seq * (kWmmaMinQ / 2);
         const bool aligned = halo_aligned(q->data, 16) && halo_aligned(o->data, 16) &&
                              (q_rs | q_hs | o_rs | o_hs) % 8 == 0;
         if (shaped && aligned) {
@@ -1163,10 +1348,10 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
      * only: the 31B's full layers at a verify. */
     const bool chain = halo_geti_or(a, "chain", 0) != 0 && rows <= 64;
     if (chain)
-        HALO_KLAUNCH(HALO_KNAME(halo_win_r4dchain_attn<HD, GQA, KV8>),
+        HALO_KLAUNCH(HALO_KNAME(halo_win_r4dchain_attn<HD, GQA, KV8, TREE>),
                      dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
     else
-        HALO_KLAUNCH(HALO_KNAME(attn_kernel<HD, GQA, KV8>),
+        HALO_KLAUNCH(HALO_KNAME(attn_kernel<HD, GQA, KV8, TREE>),
                      dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
     if (ns > 1) {
         if (chain)
@@ -1184,17 +1369,83 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
 /* ------------------------------------------------------------------ the exported entry points */
 extern "C" {
 
+/* Each geometry at the bf16 cache, the E4M3 one and the int8 one (kv_store_i8's layout, KV8 2). */
 #define HALO_WIN_DEF(HD, G)                                                                        \
     int halo_rad_attn_window_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {                \
-        return halo_win::launch_attn<HD, G, false>(a, s);                                          \
+        return halo_win::launch_attn<HD, G, 0>(a, s);                                              \
     }                                                                                              \
     int halo_rad_attn_window_h##HD##_gqa##G##_fp8(const RadArgs* a, RadStream s) {                 \
-        return halo_win::launch_attn<HD, G, true>(a, s);                                           \
+        return halo_win::launch_attn<HD, G, 1>(a, s);                                              \
+    }                                                                                              \
+    int halo_rad_attn_window_h##HD##_gqa##G##_i8(const RadArgs* a, RadStream s) {                  \
+        return halo_win::launch_attn<HD, G, 2>(a, s);                                              \
     }
-HALO_WIN_DEF(128, 1)
+HALO_WIN_DEF(128, 1) HALO_WIN_DEF(128, 4)
 HALO_WIN_DEF(256, 1) HALO_WIN_DEF(256, 2) HALO_WIN_DEF(256, 4) HALO_WIN_DEF(256, 8)
 HALO_WIN_DEF(512, 1) HALO_WIN_DEF(512, 2) HALO_WIN_DEF(512, 4) HALO_WIN_DEF(512, 8)
 #undef HALO_WIN_DEF
+/* h128 gqa16 (Muse Glimmer's sliding layers, 32 query heads over 2 KV heads) and h512 gqa16 (the
+ * Gemma 4 12B's full layers at one rank), bf16 and int8 caches. */
+#define HALO_WIN_DEF2(HD, G)                                                                       \
+    int halo_rad_attn_window_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {                \
+        return halo_win::launch_attn<HD, G, 0>(a, s);                                              \
+    }                                                                                              \
+    int halo_rad_attn_window_h##HD##_gqa##G##_i8(const RadArgs* a, RadStream s) {                  \
+        return halo_win::launch_attn<HD, G, 2>(a, s);                                              \
+    }
+HALO_WIN_DEF2(128, 16) HALO_WIN_DEF2(512, 16)
+#undef HALO_WIN_DEF2
+
+/* attn_paged_ahead and attn_paged_qrow_ahead: a non-causal window that bounds the keys behind only
+ * (FWD), the sliding layers' mask over a picture's rows (docs/OPS.md). */
+#define HALO_WIN_AHEAD_DEF(HD, G)                                                                  \
+    int halo_rad_attn_window_ahead_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {          \
+        return halo_win::launch_attn<HD, G, 0, false, false, true>(a, s);                          \
+    }                                                                                              \
+    int halo_rad_attn_window_ahead_h##HD##_gqa##G##_i8(const RadArgs* a, RadStream s) {            \
+        return halo_win::launch_attn<HD, G, 2, false, false, true>(a, s);                          \
+    }
+HALO_WIN_AHEAD_DEF(256, 1) HALO_WIN_AHEAD_DEF(256, 2) HALO_WIN_AHEAD_DEF(256, 4) HALO_WIN_AHEAD_DEF(256, 8)
+#undef HALO_WIN_AHEAD_DEF
+
+/* attn_paged_qrow_tree: the scalar kernel with a tree verify's mask (TREE). */
+#define HALO_WIN_TREE_DEF(HD, G)                                                                   \
+    int halo_rad_attn_window_tree_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {           \
+        return halo_win::launch_attn<HD, G, 0, true>(a, s);                                        \
+    }                                                                                              \
+    int halo_rad_attn_window_tree_h##HD##_gqa##G##_i8(const RadArgs* a, RadStream s) {             \
+        return halo_win::launch_attn<HD, G, 2, true>(a, s);                                        \
+    }
+HALO_WIN_TREE_DEF(256, 1) HALO_WIN_TREE_DEF(256, 2) HALO_WIN_TREE_DEF(256, 4) HALO_WIN_TREE_DEF(256, 8)
+HALO_WIN_TREE_DEF(512, 1) HALO_WIN_TREE_DEF(512, 2) HALO_WIN_TREE_DEF(512, 4) HALO_WIN_TREE_DEF(512, 8)
+#undef HALO_WIN_TREE_DEF
+
+/* Exact DSpark mask: every query row uses the first query position as the sliding-window anchor.
+ * This is a distinct op name so a library without this semantic cannot silently resolve it. */
+#define HALO_WIN_ANCHOR_DEF(HD, G)                                                                 \
+    int halo_rad_attn_anchor_window_h##HD##_gqa##G##_bf16kv(const RadArgs* a, RadStream s) {       \
+        return halo_win::launch_attn<HD, G, 0, false, true>(a, s);                                 \
+    }                                                                                              \
+    int halo_rad_attn_anchor_window_h##HD##_gqa##G##_i8kv(const RadArgs* a, RadStream s) {         \
+        return halo_win::launch_attn<HD, G, 2, false, true>(a, s);                                 \
+    }
+HALO_WIN_ANCHOR_DEF(128, 1)
+HALO_WIN_ANCHOR_DEF(256, 1) HALO_WIN_ANCHOR_DEF(256, 2) HALO_WIN_ANCHOR_DEF(256, 4) HALO_WIN_ANCHOR_DEF(256, 8)
+HALO_WIN_ANCHOR_DEF(512, 1) HALO_WIN_ANCHOR_DEF(512, 2) HALO_WIN_ANCHOR_DEF(512, 4) HALO_WIN_ANCHOR_DEF(512, 8)
+#undef HALO_WIN_ANCHOR_DEF
+
+/* attn_paged_sink: LiLiCorr's drafter, 32 query heads over 2 KV heads at head_dim 128 (16 over 1
+ * at TP 2: gqa 16 either way; 8 over its replicated head at TP 4: gqa 8), non-causal over its
+ * block, a 1024-token window. */
+#define HALO_WINSINK_DEF(HD, G)                                                                    \
+    int halo_rad_attn_window_sink_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {           \
+        return halo_win::launch_attn<HD, G, 0>(a, s, true);                                        \
+    }                                                                                              \
+    int halo_rad_attn_window_sink_h##HD##_gqa##G##_i8(const RadArgs* a, RadStream s) {             \
+        return halo_win::launch_attn<HD, G, 2>(a, s, true);                                        \
+    }
+HALO_WINSINK_DEF(128, 8) HALO_WINSINK_DEF(128, 16)
+#undef HALO_WINSINK_DEF
 
 /* Called at declare with no tensors. Partials are capped at kPartBudget (tile, head, split)
  * triples for any batch, so the size is a constant. */

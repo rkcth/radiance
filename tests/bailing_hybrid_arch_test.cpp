@@ -99,6 +99,23 @@ void iq8r_encs(RadBuilder* b) {
     b->encs.push_back({ "", rad_enc_plain(RAD_BF16) });
 }
 
+/* data/recipes/ling-3.0-flash-iq8r-w4nl64.recipe's: the IQ8R trunk of iq8r_encs with the routed
+ * experts as rotated four-bit codes into the w4nl codebook, an E4M3 scale a (row, 64 of K) under
+ * one f32. */
+void flash_w4nl64_encs(RadBuilder* b) {
+    iq8r_encs(b);
+    RadEncoding w4{};
+    rad_enc_clear(&w4);
+    rad_enc_copy_str(w4.scheme, "affine");
+    rad_enc_add_plane(&w4, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&w4, "scale", RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&w4, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&w4, "table", RAD_F32, 1, 16);
+    rad_enc_copy_str(w4.transform, "fwht128");
+    for (auto& e : b->encs)
+        if (e.first == "ffn_gate_up_exps" || e.first == "ffn_down_exps") e.second = w4;
+}
+
 /* data/recipes/ling3-w4a8-rtn.recipe's: four-bit routed experts, everything else bf16. */
 void w4_encs(RadBuilder* b) {
     b->encs.clear();
@@ -445,8 +462,8 @@ TEST(bf16_and_four_bit_containers_keep_their_graphs) {
 }
 
 /* What the plugin refuses by name: a rotated trunk over unrotated experts, rotated int8 experts
- * under an unrotated trunk, an IQ8R trunk over a clamped SwiGLU (flash's last layers), and the
- * tiny IQ8R trunk at four ranks, whose 1152-column dense slice cuts a 256-column scale group. */
+ * under an unrotated trunk, and the tiny IQ8R trunk at four ranks, whose 1152-column dense slice
+ * cuts a 256-column scale group. */
 TEST(refuses_mismatched_forms) {
     {
         MetaKV mk = tiny_meta();
@@ -464,14 +481,6 @@ TEST(refuses_mismatched_forms) {
         w4_encs(&b);
         for (auto& e : b.encs)
             if (e.first == "ffn_gate_up_exps" || e.first == "ffn_down_exps") e.second = i8h();
-        RadBuildCtx ctx = build_ctx();
-        CHECK_EQ(stderr_of_rc([&] { return bailing_hybrid::declare(&b, mk.meta(), &ctx); }),
-                 RAD_E_UNSUPPORTED);
-    }
-    {
-        MetaKV mk = flash_meta();
-        RadBuilder b;
-        iq8r_encs(&b);
         RadBuildCtx ctx = build_ctx();
         CHECK_EQ(stderr_of_rc([&] { return bailing_hybrid::declare(&b, mk.meta(), &ctx); }),
                  RAD_E_UNSUPPORTED);
@@ -506,6 +515,84 @@ TEST(flash_iq8r_without_clamps_declares_its_drafter_on_the_int8_trunk) {
         /* 40 routed layers and the drafter's; two norms a layer. */
         CHECK_EQ(count_op(b, "moe_gemm_q"), 2 * 41);
         CHECK_EQ(count_op(b, "rmsnorm_had_quant_i8g"), 2 * 43);
+    }
+}
+
+/* Flash's IQ8R trunk with its clamp lists declares at one, two and four ranks. Each clamped gated
+ * product (routed in layers 35-41, shared in 34-41) is two launches: the clamp into the bf16 plane
+ * (swiglu_step) and the rotating int8 quantiser reading it (had_quant_act_i8g, at the 128-column
+ * group of the int8 down projection that reads the codes). Against the same container without
+ * the clamp lists, those 15 gated_had_quant_i8g become 15 such pairs and no other op changes; no
+ * unrotated int8 and no E4M3 quantiser exists, and the steps run lint-clean. */
+TEST(flash_iq8r_clamps_its_gated_products_then_quantises_them_rotated) {
+    for (int world : { 1, 2, 4 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            MetaKV plain = flash_meta();
+            plain.drop("expert_swiglu_limit_list").drop("share_expert_swiglu_limit_list");
+            RadBuilder b0;
+            iq8r_encs(&b0);
+            RadBuildCtx c0 = build_ctx(rank, world);
+            REQUIRE_EQ(bailing_hybrid::declare(&b0, plain.meta(), &c0), RAD_OK);
+            MetaKV mk = flash_meta();
+            RadBuilder b;
+            iq8r_encs(&b);
+            RadBuildCtx ctx = build_ctx(rank, world);
+            REQUIRE_EQ(bailing_hybrid::declare(&b, mk.meta(), &ctx), RAD_OK);
+            CHECK(bailing_hybrid::g_model[0].trunk_rot);
+            CHECK_EQ(count_op(b, "swiglu_step"), 15);
+            CHECK_EQ(count_op(b, "had_quant_act_i8g") - count_op(b0, "had_quant_act_i8g"), 15);
+            CHECK_EQ(count_op(b0, "gated_had_quant_i8g") - count_op(b, "gated_had_quant_i8g"), 15);
+            CHECK_EQ(b.ops.size(), b0.ops.size() + 15);
+            CHECK_EQ(count_op(b, "quant_act_i8g"), 0);
+            CHECK_EQ(count_op(b, "quant_act_fp8"), 0);
+            CHECK_EQ(count_op(b, "swiglu_clamped"), 0);
+            for (size_t i = 0; i + 1 < b.ops.size(); ++i) {
+                if (b.ops[i].op != "swiglu_step") continue;
+                const RecOp& q = b.ops[i + 1];
+                CHECK_EQ(q.op, std::string("had_quant_act_i8g"));
+                REQUIRE_EQ(b.ops[i].writes.size(), (size_t)1);
+                CHECK(std::find(q.reads.begin(), q.reads.end(), b.ops[i].writes[0]) !=
+                      q.reads.end());
+                const RecParam* g = param(&q, "group");
+                REQUIRE(g != nullptr);
+                CHECK_EQ(g->ival, 128LL);
+            }
+            steps_lint_clean(b, rank, world);
+        }
+    }
+}
+
+/* The flash recipe's own container: the routed experts are the w4nl codebook at 64 of K, read
+ * against the trunk's rotated int8 codes (moe_gemm_q or moe_gemm_q_mod4 at w4nl64a8i8h). The
+ * clamped layers take the same clamp-then-quantise pairs as with int8 experts, at every rank of
+ * one, two and four. */
+TEST(flash_iq8r_with_w4nl64_experts_declares_with_its_clamps) {
+    for (int world : { 1, 2, 4 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            MetaKV mk = flash_meta();
+            RadBuilder b;
+            flash_w4nl64_encs(&b);
+            REQUIRE(rad_enc_valid(&b.encs[0].second));
+            RadBuildCtx ctx = build_ctx(rank, world);
+            REQUIRE_EQ(bailing_hybrid::declare(&b, mk.meta(), &ctx), RAD_OK);
+            CHECK(bailing_hybrid::g_model[0].trunk_rot);
+            int routed = 0;
+            for (const RecOp& o : b.ops) {
+                /* moe_gemm_q, and its four-class form where a rank holds a quarter of K. */
+                if (o.op.rfind("moe_gemm_q", 0) != 0) continue;
+                CHECK_EQ(pstr(&o, "dtype"), std::string("w4nl64a8i8h"));
+                ++routed;
+            }
+            CHECK(routed > 0);
+            CHECK_EQ(count_op(b, "swiglu_step"), 15);
+            CHECK_EQ(count_op(b, "quant_act_i8g"), 0);
+            CHECK_EQ(count_op(b, "quant_act_fp8"), 0);
+            for (size_t i = 0; i + 1 < b.ops.size(); ++i) {
+                if (b.ops[i].op != "swiglu_step") continue;
+                CHECK_EQ(b.ops[i + 1].op, std::string("had_quant_act_i8g"));
+            }
+            steps_lint_clean(b, rank, world);
+        }
     }
 }
 

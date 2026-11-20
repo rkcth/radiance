@@ -14,9 +14,48 @@
 //
 // Every block must reach halo_chain_done exactly once, so a kernel whose blocks return early keeps
 // its body in a __device__ function called from the chained wrapper.
+//
+// The wait's acquire has to cover every read behind it, and an agent-scope fence does not: it
+// invalidates the vector caches, while a load whose address every lane shares is a scalar load,
+// served from the scalar data cache (a GEMM's row scales, the routed kernels' counts and offsets).
+// What that cache holds is what a launch read from the same arena address a layer earlier. The
+// packet processor's acquire empties it when it launches the kernel, which is before the kernels
+// in front have written; halo_chain_wait therefore empties it behind the fence itself
+// (halo_chain_acquire), as libr4d's wait does, where the stale read was measured (gfx1201).
 #pragma once
 #include <hip/hip_runtime.h>
 #include "rad_abi.h"
+
+/* A kernel template's chain parameter, for a kernel that brackets its own body: `r4dchain`
+ * instantiates the chained form and puts the name the backend knows a chained kernel by into the
+ * instantiation's symbol (rad_abi.h: the engine gives a record only to a dispatch whose kernel name
+ * holds "r4dchain", so the tag keeps libr4d's spelling), HaloUnchained the plain form. */
+struct r4dchain      { static constexpr bool on = true; };
+struct HaloUnchained { static constexpr bool on = false; };
+
+/* Host side: whether the launch being made should take its chained form. A row's entry point sets
+ * it from its `chain` parameter for the extent of its (synchronous) launches, so an emit helper
+ * deep inside the entry reads it without the flag threaded through every signature. */
+inline bool& halo_chain_flag() {
+    static thread_local bool on = false;
+    return on;
+}
+/* The chained forms are for decode heights, as libr4d's: in a prefill step a chained kernel's blocks
+ * wait resident on the CUs while the long kernel before them runs, which costs more than the launch
+ * gap saved (on a Radeon 8060S, a Flash-Next prefill 3% slower with them). True where the row
+ * resolved with `chain` and the launch's first operand has at most `rows_max` rows. */
+inline bool halo_chain_small(const RadArgs* a, long long rows_max = 64) {
+    long long on = 0;
+    if (!a || !rad_args_geti(a, "chain", &on) || !on || a->n_t < 1 || !a->t) return false;
+    return a->t[0].rank >= 1 && a->t[0].shape[0] <= rows_max;
+}
+struct HaloChainScope {
+    bool prev;
+    explicit HaloChainScope(bool on) : prev(halo_chain_flag()) { halo_chain_flag() = on; }
+    ~HaloChainScope() { halo_chain_flag() = prev; }
+    HaloChainScope(const HaloChainScope&) = delete;
+    HaloChainScope& operator=(const HaloChainScope&) = delete;
+};
 
 #if !defined(__HIP__)
 /* The host SIMT emulator (tests/halo_emu) compiles some of these sources as C++: no engine record
@@ -57,6 +96,14 @@ __device__ __forceinline__ const HaloChainRec* halo_chain_rec() {
 #ifndef HALO_CHAIN_SLOW
 #define HALO_CHAIN_SLOW 16
 #endif
+// The acquire behind a chained wait: the vector caches by the fence, the scalar data cache by
+// hand, which the fence leaves (see the head of this file). Every wave, for the compute unit it
+// runs on.
+__device__ __forceinline__ void halo_chain_acquire() {
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    asm volatile("s_dcache_inv" ::: "memory");
+}
+
 __device__ __forceinline__ void halo_chain_wait() {
     const HaloChainRec* r = halo_chain_rec();
     if (!r) return;
@@ -74,7 +121,7 @@ __device__ __forceinline__ void halo_chain_wait() {
         }
     }
     __syncthreads();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    halo_chain_acquire();
 }
 
 // After the block's last write: release, then one add a block.

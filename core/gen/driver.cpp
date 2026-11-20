@@ -224,6 +224,12 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
                   " pixels");
     const int64_t tokens = (int64_t)(r->width / d.latent_scale) * (r->height / d.latent_scale);
     const int nb = r->has_neg ? 2 : 1;
+    // Guidance branches must run together. Waiting cannot make an undersized
+    // deployment schedulable; reject it without changing its memory budget.
+    if (nb > max_seqs_)
+        return no("this request needs " + std::to_string(nb) +
+                  " simultaneous image branches (--max-num-seqs must be at least " +
+                  std::to_string(nb) + ")");
     if (tokens > d.max_tokens)
         return no("the image is " + std::to_string(r->width) + "x" + std::to_string(r->height) +
                   "; the largest this model makes is " + std::to_string(d.max_tokens) +

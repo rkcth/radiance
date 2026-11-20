@@ -267,7 +267,7 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(R4D_RN_PARAMS) {
 }
 template <bool WF32, uint32_t THR, typename TX = uint16_t>
 __global__ __launch_bounds__(THR) void r4dchain_rmsnorm(R4D_RN_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     rmsnorm_body<WF32, THR, TX>(x, w, y, n, eps, wadd, mult, x_ld, y_ld, M);
     r4d_chain_done();
 }
@@ -322,7 +322,7 @@ __global__ __launch_bounds__(THR) void add_rmsnorm_kernel(R4D_ARN_PARAMS) {
 }
 template <bool WF32, uint32_t THR>
 __global__ __launch_bounds__(THR) void r4dchain_add_rmsnorm(R4D_ARN_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     add_rmsnorm_body<WF32, THR>(x, a, w, y, n, eps, wadd, mult, x_ld, a_ld, y_ld, M);
     r4d_chain_done();
 }
@@ -375,7 +375,7 @@ __global__ __launch_bounds__(kThreads) void binary_kernel(R4D_BIN_PARAMS) {
     binary_body(a, b, y, n, a_ld, b_ld, y_ld, mul, b_step, div);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_binary(R4D_BIN_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     binary_body(a, b, y, n, a_ld, b_ld, y_ld, mul, b_step, div);
     r4d_chain_done();
 }
@@ -447,7 +447,7 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(R4D_SIG_PARAMS) {
     sigmoid_body(x, y, n, x_ld, y_ld);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_sigmoid(R4D_SIG_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     sigmoid_body(x, y, n, x_ld, y_ld);
     r4d_chain_done();
 }
@@ -485,7 +485,7 @@ __global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
 __global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -496,7 +496,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap(
 __global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap_f32(
     const float* __restrict__ x, float* __restrict__ y,
     uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     const uint32_t m = blockIdx.x;
     const float* __restrict__ xr = x + (size_t)m * x_ld;
     float* __restrict__ yr = y + (size_t)m * y_ld;
@@ -562,7 +562,7 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(R4D_SM_PARAMS) {
     silu_mul_body(gu, y, n, gu_ld, y_ld);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_silu_mul(R4D_SM_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     silu_mul_body(gu, y, n, gu_ld, y_ld);
     r4d_chain_done();
 }
@@ -591,7 +591,7 @@ __global__ __launch_bounds__(kThreads) void gelu_mul_kernel(R4D_GM_PARAMS) {
     gelu_mul_body(gu, y, n, gu_ld, y_ld);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_gelu_mul(R4D_GM_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     gelu_mul_body(gu, y, n, gu_ld, y_ld);
     r4d_chain_done();
 }

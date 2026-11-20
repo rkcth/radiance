@@ -193,7 +193,7 @@ template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4dchain_rowtopk_stage1(
     const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
     int N, int RC, int NCH, int CH) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     r4d_rowtopk_stage1_body<PT>(Y, P, N, RC, NCH, CH);
     r4d_chain_done();
 }
@@ -263,7 +263,7 @@ template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_stage2(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     r4d_rowtopk_stage2_body<PT>(P, OV, OI, OP, off, R, n);
     r4d_chain_done();
 }
@@ -369,7 +369,7 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
 }
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_merge(
     const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     r4d_rowtopk_merge_body(G, OV, OI, R, n);
     r4d_chain_done();
 }
@@ -542,7 +542,7 @@ __device__ __forceinline__ void r4d_logit_rerank_body(R4D_LOGIT_RERANK_PARAMS) {
 template <bool I8, uint32_t TB, class CH>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB)
 void r4d_logit_rerank_kernel(R4D_LOGIT_RERANK_PARAMS) {
-  if (CH::on) r4d_chain_wait();
+  if (CH::on) r4d_chain_wait_vec();
   r4d_logit_rerank_body<I8, TB>(X, IN, W, OI, OV, OP, R, K, voff, nv, w_ld);
   if (CH::on) r4d_chain_done();
 }

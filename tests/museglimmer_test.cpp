@@ -1258,6 +1258,97 @@ MetaKV muse_meta_iq8r() {
     return k;
 }
 
+/* Muse IQ4R-V4's computed trellis: 128-wide FWHT, unsigned codes, the MAD plane, and either
+ * one f32 scale a row plus a shared f32 column factor or a bf16 block scale (the 5-bit o_proj). */
+RadEncoding muse_iqr_v4_enc(uint32_t codes, int64_t tcq_rows, bool row_scale = true) {
+    RadEncoding e{};
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_add_plane(&e, "codes", codes, 1, 1);
+    if (row_scale) {
+        rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+        rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    } else {
+        rad_enc_add_plane(&e, "scale", RAD_BF16, 1, 128);
+    }
+    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, (int64_t)1 << 16, 1);
+    e.plane[t].block[0] = tcq_rows;
+    e.plane[t].block[1] = 1;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+
+std::vector<std::pair<std::string, RadEncoding>> muse_iqr_v4_encs() {
+    return { { "attn_q.", muse_iqr_v4_enc(RAD_U4, 1024) },
+             { "attn_gate.", muse_iqr_v4_enc(RAD_U4, 1024) },
+             { "attn_k.", muse_iqr_v4_enc(RAD_U4, 128) },
+             { "attn_v.", muse_iqr_v4_enc(RAD_U4, 128) },
+             { "attn_output.", muse_iqr_v4_enc(RAD_U5, 256, false) },
+             { "ffn_gate_up.", muse_iqr_v4_enc(RAD_U4, 512) },
+             { "ffn_down.", muse_iqr_v4_enc(RAD_U4, 1024) } };
+}
+
+MetaKV muse_meta_iqr_v4() {
+    MetaKV k = muse_meta();
+    RadModelMeta m = *k.meta();
+    m.n_embd = 256;
+    m.n_head = 2;
+    m.n_head_kv = 2;
+    m.head_dim = 128;
+    m.n_ff = 512;
+    k = MetaKV(m);
+    return k;
+}
+
+MetaKV muse_dflash2_meta() {
+    MetaKV k = muse_meta_iqr_v4();
+    k.set("draft.architectures", "DFlash2DraftModel")
+        .set("draft.num_hidden_layers", "2")
+        .set("draft.head_dim", "128")
+        .set("draft.num_attention_heads", "2")
+        .set("draft.num_key_value_heads", "2")
+        .set("draft.hidden_size", "256")
+        .set("draft.intermediate_size", "512")
+        .set("draft.rms_norm_eps", "1e-5")
+        .set("draft.rope_theta", "500000")
+        .set("draft.vocab_size", "512")
+        .set("draft.use_sliding_window", "1")
+        .set("draft.sliding_window", "4")
+        .set("draft.dflash_config.input_embedding_scale", "1")
+        .set("draft.dflash_config.output_multiplier", "0.19611613513818404")
+        .set("draft.dflash_config.final_logit_softcapping", "20")
+        .set("draft.dflash_config.target_layer_ids", "1 3")
+        .set("draft.dflash_config.block_size", "4")
+        .set("draft.dflash_config.mask_token_id", "511")
+        .set("draft.dflash_config.selector_rank", "64")
+        .set("draft.dflash_config.selector_top_k", "8")
+        .set("draft.dflash_config.conv_kernel_size", "2")
+        .set("draft.dflash_config.conv_group_size", "16");
+    return k;
+}
+
+std::vector<std::pair<std::string, RadEncoding>> muse_dflash2_iqr_encs(bool include_trunk) {
+    std::vector<std::pair<std::string, RadEncoding>> encs;
+    auto add = [&](const std::string& name, uint32_t codes, int64_t rows) {
+        encs.push_back({name, muse_iqr_v4_enc(codes, rows)});
+    };
+    add("dflash.fc.", RAD_U4, 256);
+    encs.push_back({ "dflash.draft_head.", rad_enc_plain(RAD_BF16) });
+    for (int l = 0; l < 2; ++l) {
+        const std::string p = "dflash.blk." + std::to_string(l) + ".";
+        for (const char* n : { "attn_q.", "attn_k.", "attn_v.", "attn_output." })
+            add(p + n, RAD_U4, 256);
+        add(p + "ffn_gate_up.", RAD_U3, 256);
+        add(p + "ffn_down.", RAD_U3, 256);
+    }
+    if (include_trunk) {
+        const auto trunk = muse_iqr_v4_encs();
+        encs.insert(encs.end(), trunk.begin(), trunk.end());
+    }
+    return encs;
+}
+
 /* The op that writes buffer `buf` first among the ops named `name`. */
 const RecOp* writer_of(const RadBuilder& b, const char* name, rad_buf buf) {
     for (const RecOp& o : b.ops)
@@ -1266,6 +1357,46 @@ const RecOp* writer_of(const RadBuilder& b, const char* name, rad_buf buf) {
 }
 
 }  /* namespace */
+
+/* Computed-MAD IQ4R-V4: the full trunk is on the 128-wide rotated activation grid, including
+ * centered norm and gated-product producers; q/k/v/gate share a pair, output and down have their
+ * own. Check decode and prefill graph lint at TP1 and TP2, including the skinny KV shard. */
+TEST(museglimmer_ct_serves_an_iq4r_v4_trunk) {
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.encs = muse_iqr_v4_encs();
+            RadBuildCtx ctx = muse_ctx(rank, world);
+            REQUIRE_EQ(museglimmer_ct::declare(&b, muse_meta_iqr_v4().meta(), &ctx), RAD_OK);
+            const museglimmer_ct::Model& m = museglimmer_ct::g_model[rad_build_slot(&ctx)];
+            CHECK(m.iqr_v4);
+            CHECK(!m.iq8r);
+            CHECK(m.rotated_i8);
+            CHECK_EQ(m.rot_group, 128);
+            CHECK(m.a_h.q8_fed);
+            CHECK(m.a_ffn.q8_fed);
+            CHECK(!m.a_attn.q8_fed);
+            CHECK_EQ(count_op(b, "gemm_nt_q"), 56);
+            CHECK_EQ(count_op(b, "gemm_nt"), 0);
+            for (const RecOp& o : b.ops)
+                if (o.op == "gemm_nt_q") {
+                    CHECK_EQ(pstr(&o, "dtype"), std::string("i8a8h"));
+                    CHECK_EQ(pint(&o, "group"), 128);
+                }
+            for (int pass = 0; pass < 2; ++pass) {
+                auto k = pass == 0 ? kit(b, { 1, 1, 1, 1 }, {}) : kit(b, {}, { 200 });
+                auto v = run_passes(b, museglimmer_ct::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                CHECK_LINT(b, v[0].get());
+                CHECK(v[0]->step_fail.empty());
+                const auto is = issued_ops(b, *v[0]);
+                CHECK_EQ(count_issued(is, "gemm_nt_q"), 56);
+                CHECK_EQ(count_issued(is, "rmsnorm_had_quant_i8g"), 16);
+                CHECK_EQ(count_issued(is, "gated_had_quant_i8g"), 8);
+                CHECK_EQ(count_issued(is, "had_quant_act_i8g"), 8);
+            }
+        }
+}
 
 /* The IQ8R container at one rank and at two: every trunk linear gemm_nt_q at i8a8h, group 256, over
  * the codes view (i8 [N, K]) and one "scale,scale.1" u8 view at the logical [N, K]; both pre-norms
@@ -1639,6 +1770,74 @@ TEST(muse_dflash_reduces_the_sharded_embedding_before_the_block) {
         CHECK_EQ(count_issued(qi, "gather_rows"), 1);
         CHECK_EQ(count_issued(qi, "logits_gemm"), 1);
     }
+}
+
+/* DFlash2 recognizes its own config fields, probes the IQR fc before declaring activation pairs,
+ * and serves its U3/U4 linears on the same 128-wide rotated grid. Its 202048-row production head
+ * is unsupported by tiled 2-bit/int8 head kernels, so retain a BF16 head and apply Muse's own
+ * multiplier and softcap in the draft graph. */
+TEST(muse_dflash2_serves_a_rotated_iqr_drafter) {
+    MetaKV mk = muse_dflash2_meta();
+    RadBuilder b;
+    b.encs = muse_dflash2_iqr_encs(false);
+    RadBuildCtx ctx = spec_ctx(0, 1, 3);
+    REQUIRE_EQ(museglimmer::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const museglimmer::Model& m = museglimmer::g_model[rad_build_slot(&ctx)];
+    CHECK(m.have_df2);
+    CHECK(!m.have_df);
+    CHECK(m.df2.cfg.act_i8);
+    CHECK_EQ(m.df2.cfg.act_g8, 128);
+    CHECK(near(m.df2.cfg.omul, 0.19611613513818404, 1e-12));
+    CHECK_EQ(m.df2.cfg.scap, 20.0);
+    CHECK_EQ(find_b(b, "df_srcq")->d.dtype, (uint32_t)RAD_I8);
+    CHECK_EQ(find_b(b, "df_h2q")->d.dtype, (uint32_t)RAD_I8);
+    CHECK_EQ(find_b(b, "df_ats")->d.shape[1], 2);
+    const RecWeight* fc = find_w(b, "dflash.fc.weight");
+    REQUIRE(fc != nullptr);
+    CHECK_EQ(fc->d.dtype, (uint32_t)RAD_U4);
+    CHECK_EQ(std::string(fc->d.planes), std::string("codes,trellis,trellis.mad"));
+    const RecWeight* gu = find_w(b, "dflash.blk.0.ffn_gate_up.weight");
+    REQUIRE(gu != nullptr);
+    CHECK_EQ(gu->d.dtype, (uint32_t)RAD_U3);
+    const RecWeight* head = find_w(b, "dflash.draft_head.weight");
+    REQUIRE(head != nullptr);
+    CHECK_EQ(head->d.dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ(count_op(b, "logit_softcap"), 2);  /* target head and DFlash2 head */
+    bool bf16_draft_head = false;
+    for (const RecOp& o : b.ops)
+        if (o.op == "gemm_nt" && pint(&o, "N") == 512 &&
+            in(o.w, (rad_weight)w_h(b, "dflash.draft_head.weight")))
+            bf16_draft_head = true;
+    CHECK(bf16_draft_head);
+
+    auto trunk = kit(b, { 1, 1 }, {});
+    auto hp = context_pass(b, *trunk);
+    auto qp = query_pass(b, 1, 4, 3);
+    auto v = run_passes(b, museglimmer::step, { trunk.get(), hp.get(), qp.get() }, 0, 1);
+    CHECK_PASSES(b, v);
+    for (const auto& pass : v) CHECK(pass->step_fail.empty());
+    CHECK_EQ(count_issued(issued_ops(b, *v[1]), "had_quant_act_i8g"), 2);
+    CHECK_EQ(count_issued(issued_ops(b, *v[2]), "had_quant_act_i8g"), 8);
+    CHECK_EQ(count_issued(issued_ops(b, *v[2]), "gemm_nt_q"), 12);
+
+    /* Exercise the same rotated drafter next to the actual compressed-tensors trunk path. */
+    RadBuilder ct;
+    ct.encs = muse_dflash2_iqr_encs(true);
+    RadBuildCtx cctx = spec_ctx(0, 1, 3);
+    REQUIRE_EQ(museglimmer_ct::declare(&ct, mk.meta(), &cctx), RAD_OK);
+    const museglimmer_ct::Model& cm = museglimmer_ct::g_model[rad_build_slot(&cctx)];
+    CHECK(cm.iqr_v4);
+    CHECK(cm.have_df2);
+    CHECK(cm.df2.cfg.act_i8);
+    CHECK_EQ(cm.df2.cfg.act_g8, 128);
+    auto ctrunk = kit(ct, { 1, 1 }, {});
+    auto chp = context_pass(ct, *ctrunk);
+    auto cqp = query_pass(ct, 1, 4, 3);
+    auto cv = run_passes(ct, museglimmer_ct::step, { ctrunk.get(), chp.get(), cqp.get() }, 0, 1);
+    CHECK_PASSES(ct, cv);
+    for (const auto& pass : cv) CHECK(pass->step_fail.empty());
+    CHECK_EQ(count_issued(issued_ops(ct, *cv[0]), "gemm_nt_q"), 56);
+    CHECK_EQ(count_issued(issued_ops(ct, *cv[2]), "gemm_nt_q"), 12);
 }
 
 /* A drafter converted to block fp8 attention and MXFP4 MLPs (the grid of the NVFP4 release's

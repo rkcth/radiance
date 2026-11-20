@@ -90,6 +90,10 @@ struct HaloArgs {
     // "sequence" is a group of query rows, `block_table` its pages' union and `umask` one word a
     // union page, four bits a row of the group: how many of the page's tokens that row attends to.
     const uint32_t* umask;
+    // A tree verify (attn_paged_qrow_tree, docs/OPS.md): RadBatch::spec_parent, one int32 a query
+    // row, -2 for an ordinary causal row, else the row's parent's index within its sequence's rows
+    // (-1 for the block's first). Read only by the O_TREE instances; null elsewhere.
+    const int* spec_parent;
 };
 
 // Rows of q and out. The split-KV scratch is laid out by dense query row, so the host sizing hook
@@ -825,14 +829,15 @@ int  halo_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_fla
                               long loc_pack, long loc_scale_off, long wp = 0);
 int  halo_ar_rmsnorm_quant_fp8_chunk_elems(void);
 // Its rotated int8 form, as halo_rmsnorm_had_quant_i8g: the reduction and the norm unchanged, the
-// norm's pass quantised by had_quant_act_i8g's rule. No post-norm.
+// norm's pass quantised by had_quant_act_i8g's rule. No post-norm. `group` 128, or IQ8R's 256
+// (ar_rmsnorm_had_quant_iq8r: one scale per 256 columns, n a multiple of 256).
 int  halo_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_flags,
                                   long my_flags, long seq_ctrs, long slot_stride16,
                                   long x, long res, long w, long y, long q, long s,
                                   int M, int n, float eps, float wadd, int w_f32,
                                   int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                   int nblocks, int nthreads, int drain, int acq, int wire,
-                                  long loc_pack, long loc_scale_off);
+                                  long loc_pack, long loc_scale_off, int group = 128);
 
 // The same IPC with the sandwich-norm junction after it (halo_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8
@@ -841,7 +846,7 @@ int  halo_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flag
                              long seq_ctrs, long slot_stride16, long x, long res, long w, long wp,
                              long sc, int sc_f32, long y, long q, long s, int M, int n, float eps,
                              float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                             int drain, int acq);
+                             int drain, int acq, int grp = 0);
 // ...and at four ranks, on the wide family's transport: halo_ar_oneshot_4rank_exact's IPC
 // arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, the
 // engine's link gate with the instance's landed counter (0 for none; halo_ar_seq.h), and, with

@@ -38,7 +38,7 @@ __global__ __launch_bounds__(256) void prefetch_kernel(const int4* __restrict__ 
  * between a GEMM and the collective after it (where launches chain), it starts reading as the
  * GEMM's last block ends, with no event between the queues and no barrier bit on the GEMM. */
 __global__ __launch_bounds__(256) void r4dchain_prefetch(const int4* __restrict__ p, size_t n16) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     r4d_chain_done();
     const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t nt  = (size_t)gridDim.x * blockDim.x;
@@ -73,6 +73,16 @@ extern "C" int r4d_rad_prefetch(const RadArgs* a, RadStream stream) {
     if ((uintptr_t)w->data % 16) return R4D_NO(RAD_E_ALIGN);
     int nb = r4d_cfg_prefetch_nb(a);
     if (nb < 1) nb = 64;
+    /* The architecture's own count (`blocks`): the read shares the card with the kernels it runs
+     * beside, whose loads queue behind its own and whose launches wait for the wave slots it
+     * holds, so the best count follows what those kernels are. Qwen3.8-Flash-Next's delta-net
+     * update, a latency-bound kernel of a few loads a block, loses more to 64 blocks of reads in
+     * flight than the projection behind it gains (ms a step at 16 / 24 / 32 / 48 / 64 / 128 / 256
+     * blocks, against 64: +0.77% / +0.14% / -0.31% / -0.24% / 0 / +2.0% / +7.4%). */
+    {
+        const long long blocks = r4d_geti_or(a, "blocks", 0);
+        if (blocks > 0 && blocks <= 1024) nb = (int)blocks;
+    }
     const bool ch = r4d_geti_or(a, "chain", 0) != 0;
     return R4D_EMIT(stream, (ch ? r4dchain_prefetch : prefetch_kernel), dim3((unsigned)nb), dim3(256), 0,
                     (const int4*)w->data, (size_t)(bytes / 16));

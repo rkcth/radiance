@@ -282,6 +282,39 @@ TEST(gptq_with_a_hessian_lowers_the_output_error) {
     CHECK(gc.planes[1] == g.planes[1]);
 }
 
+TEST(w6nl_gptq_and_coordinate_descent_accept_bf16_domain_hessians) {
+    NEED_LIBQUANT();
+    const int64_t R = 16, C = 128, T = 4096;
+    std::vector<float> h((size_t)(C * C), (float)T * 0.25f);
+    for (int64_t i = 0; i < C; ++i) h[(size_t)(i * C + i)] += (float)T;
+    const TempDir td("rad_w6nl_gptq");
+    REQUIRE(!td.path.empty());
+    REQUIRE(write_gram(td.path + "/gram.r0.blk.3.ffn_down_exps.bin", C, T, h));
+    Opts o;
+    o.s("table", "w6nl").i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32")
+     .s("block2", "*x*").f("scale2_value", 0x1p-13).s("transform", "fwht128")
+     .s("rule", "search").i("cd", 3).s("calib", td.path.c_str());
+    const std::vector<float> w = draw(R * C, 770, 1.0f);
+    const Quantised q = quantise(quantizer("gptq"), o, "blk.3.ffn_down_exps.17.weight", R, C, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK_EQ(q.enc.plane[0].dtype, (uint32_t)RAD_U6);
+    CHECK_EQ(q.planes[0].size(), (size_t)(R * C * 6 / 8));
+    CHECK_EQ(q.enc.plane[3].extent[1], 64LL);
+    for (int i = 0; i < 64; ++i) {
+        float value = 0.0f;
+        std::memcpy(&value, q.planes[3].data() + i * sizeof(float), sizeof value);
+        const uint8_t fp8 = rad_f32_to_fp8e4m3(value);
+        CHECK_EQ(rad_load_f32(&fp8, RAD_F8E4M3, 0), value);
+        if (i >= 32) {
+            float positive = 0.0f;
+            std::memcpy(&positive, q.planes[3].data() + (i - 32) * sizeof(float), sizeof positive);
+            CHECK_EQ(value, -positive);
+        }
+    }
+    const std::vector<float> decoded = decode(q, R, C);
+    CHECK(rel_err(w, decoded) < 0.2);
+}
+
 /* ------------------------------------------------------------------ recipes, compiled
  *
  * A rule's options are typed by its quantiser's own table before declare runs, so a misspelt key or
@@ -337,7 +370,10 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
     REQUIRE(!calib.path.empty());
     const char* old = std::getenv("CALIB");
     const std::string saved = old ? old : "";
+    const char* old_mtp = std::getenv("MTP_CALIB");
+    const std::string saved_mtp = old_mtp ? old_mtp : "";
     setenv("CALIB", calib.path.c_str(), 1);
+    setenv("MTP_CALIB", calib.path.c_str(), 1);
 
     int files = 0, rules = 0;
     std::error_code ec;
@@ -391,6 +427,7 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
     CHECK(rules >= 250);
     std::filesystem::current_path(cwd, ec);
     if (old) setenv("CALIB", saved.c_str(), 1); else unsetenv("CALIB");
+    if (old_mtp) setenv("MTP_CALIB", saved_mtp.c_str(), 1); else unsetenv("MTP_CALIB");
 }
 
 /* ------------------------------------------------------------------ GPTQ against the textbook
@@ -660,6 +697,7 @@ TEST(round_to_nearest_stores_the_nearest_code_on_every_grid) {
         "table=iq4nl,group=32,scale=f16",
         "table=w4nl,group=128,scale=bf16,transform=fwht128",
         "table=w5nl,group=64,scale=fp8_e4m3,scale2=f32",
+        "table=w6nl,group=64,scale=fp8_e4m3,scale2=f32,transform=fwht128,rule=search",
         "table=binary,group=32,scale=f16,rule=search",
         "table=ternary,group=32,scale=bf16",
         "table=-1.5;-0.25;0;0.5;2,group=32,scale=f32",
@@ -877,11 +915,10 @@ TEST(a_codebook_indexes_its_table_and_the_scale_multiplies_it) {
     }
 }
 
-/* A vq= codebook file is attacker data, and its loader appended every line to memory before
- * checking any count, while its "# unit" line parsed `inf` through %lf -- and the fallback
- * guard `!(unit > 0.0)` let infinity through, where a NaN falls back to the entries' rms. The
- * count is now checked while appending (the widest code is u12: past 4096 codewords could not
- * be indexed even with the memory), and only a finite positive names the unit. */
+/* A vq= codebook file is supplied data. Its entry count is checked while the loader appends
+ * (the widest code is u12, so codewords past 4096 could not be indexed), and its "# unit" line
+ * names the unit only with a finite positive value: `inf` parses through %lf and passes a
+ * `!(unit > 0.0)` guard, where a NaN falls back to the entries' rms. */
 TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
     NEED_LIBQUANT();
     TempDir dir("vqcap");
@@ -903,8 +940,8 @@ TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
 
     /* vq= is gptq's path -- rtn refuses it ("vq= is quantised by gptq") -- so every case here
      * goes through gptq and every refusal below is the LOADER's, not a quantizer mismatch. */
-    /* One past the cap: refused by name. 4097 entries used to build an encoding whose u12
-     * codes could not index its own last codeword. */
+    /* One past the cap: refused by name. The u12 codes of an encoding with 4097 entries could
+     * not index its own last codeword. */
     {
         Opts o;
         o.s("vq", write_cb("big.txt", "# unit 1.0", 4097).c_str()).i("group", 128).s("scale", "bf16");
@@ -916,8 +953,8 @@ TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
         o.s("vq", write_cb("cap.txt", "# unit 1.0", 4096).c_str()).i("group", 128).s("scale", "bf16");
         CHECK_EQ(quantise(quantizer("gptq"), o, "x", R, C, w).status, RAD_OK);
     }
-    /* "# unit inf" used to multiply every decoded value by infinity; ignored now, the entries'
-     * own rms takes over and the decode stays finite. */
+    /* "# unit inf" would multiply every decoded value by infinity. The line is ignored, the
+     * entries' own rms takes over and the decode stays finite. */
     {
         Opts o;
         o.s("vq", write_cb("inf.txt", "# unit inf", 256).c_str()).i("group", 128).s("scale", "bf16");
@@ -929,8 +966,8 @@ TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
         for (float x : d) bad += !std::isfinite(x);
         CHECK_EQ(bad, 0);
     }
-    /* tcq's sibling flow: a zero tcq_gain used to divide the unit by zero and every code
-     * became inf; the loader refuses it by name now. */
+    /* tcq's sibling flow: a zero tcq_gain would divide the unit by zero and turn every code
+     * into inf; the loader refuses it by name. */
     {
         Opts o;
         o.s("codes", "u2").i("tcq", 10).i("tcq_rows", 256).i("group", 128).s("scale", "bf16")

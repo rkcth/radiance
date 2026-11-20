@@ -230,7 +230,7 @@ __device__ __forceinline__ void r4d_gemm_w2a8_nt_body(R4D_GEMM_W2A8_NT_PARAMS) {
 template <int MT, int NPW, bool NT, class CH>
 __global__ __launch_bounds__(R4D_W2A8_BOUNDS(MT, NPW))
 void r4d_gemm_w2a8_nt_kernel(R4D_GEMM_W2A8_NT_PARAMS) {
-  if (CH::on) r4d_chain_wait();
+  if (CH::on) r4d_chain_wait_vec();
   r4d_gemm_w2a8_nt_body<MT, NPW, NT>(A, Ascale, Wq, Ws, Asum, C, M, K, N, WV, SK);
   if (CH::on) r4d_chain_done();
 }

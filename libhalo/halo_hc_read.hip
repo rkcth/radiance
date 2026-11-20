@@ -21,6 +21,7 @@
 #include "halo.h"
 #include "halo_args.h"
 #include "halo_common.h"
+#include "halo_chain.h"
 #include "halo_gdn_wmma.h"
 #include "halo_fp8_wmma.h"
 #include "halo_hc_fp8.h"
@@ -175,11 +176,14 @@ __global__ __launch_bounds__(128) void hc_mix_kernel(const uint16_t* __restrict_
             __syncthreads();
         }
         const float ramax = lds[0];
-        const float rsc = ramax > 0.0f ? ramax * (1.0f / 448.0f) : 1.0f;
+        /* The rotated twin takes the plain twin's code: int8 (libr4d's hc_rot_group<true>, for an
+         * int8 trunk stored rotated) or E4M3. */
+        const float rsc = ramax > 0.0f ? ramax * (1.0f / (i8 ? 127.0f : 448.0f)) : 1.0f;
         if (j == 0) rs[m * srow + blockIdx.x] = rsc;
         const float inv = 1.0f / rsc;
-        rq[m * qrow + base + j] = (uint8_t)halo_fp8::f32_to_e4m3(
-            fminf(fmaxf(rv * inv, -448.0f), 448.0f));
+        rq[m * qrow + base + j] =
+            i8 ? (uint8_t)(int8_t)(int)rintf(fminf(fmaxf(rv * inv, -127.0f), 127.0f))
+               : (uint8_t)halo_fp8::f32_to_e4m3(fminf(fmaxf(rv * inv, -448.0f), 448.0f));
     }
 }
 
@@ -524,7 +528,7 @@ __global__ __launch_bounds__(256) void hcf_down_dec_kernel(
  * the row's chunks, their gains and inject weights -- is issued before the first barrier. The
  * inject dots are closed here, over the streams in order, and written as the gate. */
 template <int HC>
-__global__ __launch_bounds__(HC * 256) void hcf_normdec_kernel(
+__device__ __forceinline__ void hcf_normdec_kernel_body(
     const uint16_t* __restrict__ h, long hrow, const float* __restrict__ gain, float wadd,
     const uint16_t* __restrict__ injw, float* __restrict__ sc, uint16_t* __restrict__ Nf,
     uint16_t* __restrict__ inj, long irow, int n, float eps) {
@@ -622,8 +626,20 @@ __global__ __launch_bounds__(HC * 256) void hcf_normdec_kernel(
     }
 }
 
+/* hcf_normdec_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int HC, class CH = HaloUnchained>
+__global__ __launch_bounds__(HC * 256)
+void hcf_normdec_kernel(
+    const uint16_t* __restrict__ h, long hrow, const float* __restrict__ gain, float wadd,
+    const uint16_t* __restrict__ injw, float* __restrict__ sc, uint16_t* __restrict__ Nf,
+    uint16_t* __restrict__ inj, long irow, int n, float eps) {
+    if (CH::on) halo_chain_wait();
+    hcf_normdec_kernel_body<HC>(h, hrow, gain, wadd, injw, sc, Nf, inj, irow, n, eps);
+    if (CH::on) halo_chain_done();
+}
+
 template <int SPS>
-__global__ __launch_bounds__(256) void hcf_down_dec1_kernel(
+__device__ __forceinline__ void hcf_down_dec1_kernel_body(
     const uint16_t* __restrict__ Nf, const uint8_t* __restrict__ down, long dld,
     float* __restrict__ P, long pslice, int pw, int rows, int HN) {
     __shared__ __attribute__((aligned(16))) float red[8 * 8 * 32];
@@ -670,6 +686,17 @@ __global__ __launch_bounds__(256) void hcf_down_dec1_kernel(
         const int m = accRow(ln, e);
         if (m < rows) Ps[(long)m * pw + ct * 16 + (ln & 15)] = v;
     }
+}
+
+/* hcf_down_dec1_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int SPS, class CH = HaloUnchained>
+__global__ __launch_bounds__(256)
+void hcf_down_dec1_kernel(
+    const uint16_t* __restrict__ Nf, const uint8_t* __restrict__ down, long dld,
+    float* __restrict__ P, long pslice, int pw, int rows, int HN) {
+    if (CH::on) halo_chain_wait();
+    hcf_down_dec1_kernel_body<SPS>(Nf, down, dld, P, pslice, pw, rows, HN);
+    if (CH::on) halo_chain_done();
 }
 
 /* ---- the down product, prefill form: a block a (64 rows, stream), the stream its K slice ---
@@ -911,7 +938,7 @@ __device__ __forceinline__ void hcf_up_load(halo_u32x4 (&rc)[LPT], float (&rsv)[
 }
 
 template <int RT, int HC, int LR, bool PLANE, int NW = 8, bool DSUM = false>
-__global__ __launch_bounds__(NW * 32) void hcf_upmix_kernel(
+__device__ __forceinline__ void hcf_upmix_kernel_body(
     const uint16_t* __restrict__ D, const float* __restrict__ P, long pslice, int pw, int ns,
     const uint8_t* __restrict__ up,
     long uld, const uint16_t* __restrict__ Up, const uint16_t* __restrict__ h, long hrow, const float* __restrict__ gain,
@@ -1161,16 +1188,35 @@ __global__ __launch_bounds__(NW * 32) void hcf_upmix_kernel(
             float ra = fmaxf(fmaxf(fabsf(r[0]), fabsf(r[1])), fmaxf(fabsf(r[2]), fabsf(r[3])));
 #pragma unroll
             for (int mask = 16; mask; mask >>= 1) ra = fmaxf(ra, __shfl_xor(ra, mask));
-            const float rsc = ra > 0.0f ? ra * (1.0f / 448.0f) : 1.0f;
+            /* the plain twin's code: int8 (libr4d's hc_rot_group<true>) or E4M3 */
+            const float rsc = ra > 0.0f ? ra * (1.0f / (i8 ? 127.0f : 448.0f)) : 1.0f;
             if (lane == 0) rs[(long)m * rsrow + g] = rsc;
             const float rinv = 1.0f / rsc;
             uint32_t rw = 0u;
 #pragma unroll
             for (int e = 0; e < 4; ++e)
-                rw |= halo_fp8::f32_to_e4m3(fminf(fmaxf(r[e] * rinv, -448.0f), 448.0f)) << (8 * e);
+                rw |= (i8 ? (uint32_t)(uint8_t)(int8_t)(int)rintf(fminf(fmaxf(r[e] * rinv, -127.0f), 127.0f))
+                          : halo_fp8::f32_to_e4m3(fminf(fmaxf(r[e] * rinv, -448.0f), 448.0f)))
+                      << (8 * e);
             *(uint32_t*)(rq + (long)m * rqrow + gc) = rw;
         }
     }
+}
+
+/* hcf_upmix_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int RT, int HC, int LR, bool PLANE, int NW = 8, bool DSUM = false, class CH = HaloUnchained>
+__global__ __launch_bounds__(NW * 32)
+void hcf_upmix_kernel(
+    const uint16_t* __restrict__ D, const float* __restrict__ P, long pslice, int pw, int ns,
+    const uint8_t* __restrict__ up,
+    long uld, const uint16_t* __restrict__ Up, const uint16_t* __restrict__ h, long hrow, const float* __restrict__ gain,
+    float wadd, const float* __restrict__ sc, uint16_t* __restrict__ x, long xrow,
+    uint8_t* __restrict__ q, float* __restrict__ qs,
+    long qrow, long srow, uint8_t* __restrict__ rq, float* __restrict__ rs, long rqrow,
+    long rsrow, int rows, int n, int i8) {
+    if (CH::on) halo_chain_wait();
+    hcf_upmix_kernel_body<RT, HC, LR, PLANE, NW, DSUM>(D, P, pslice, pw, ns, up, uld, Up, h, hrow, gain, wadd, sc, x, xrow, q, qs, qrow, srow, rq, rs, rqrow, rsrow, rows, n, i8);
+    if (CH::on) halo_chain_done();
 }
 
 /* Scratch of the fast path at band M: the scale table, then the partials of whichever form a
@@ -1363,11 +1409,21 @@ static int hcf_launch(const RadArgs* a, RadStream s, const HcPlan& p, float eps,
     const bool dec1 = rows <= kHcfDec1Rows && HN / kHcfSub / S == 5 && n / 8 <= 512 &&
                       (ip != nullptr) == (injp != nullptr);
     uint16_t* Nf = (uint16_t*)Wup;
+    /* The decode form's three launches have chained forms (halo_chain.h), where the row resolved
+     * with `chain`. */
+    const bool chain = halo_geti_or(a, "chain", 0) != 0;
     if (dec1) {
-        hcf_normdec_kernel<4><<<dim3((unsigned)rows), 4 * 256, 0, st>>>(
-            hp, hrow, wp, wadd, ip, scs, Nf, injp, irow, (int)n, eps);
-        hcf_down_dec1_kernel<5><<<dim3((unsigned)(lr / 16), (unsigned)S), 256, 0, st>>>(
-            Nf, dp, dld, P, pslice, pw, (int)rows, (int)HN);
+        if (chain) {
+            hcf_normdec_kernel<4, r4dchain><<<dim3((unsigned)rows), 4 * 256, 0, st>>>(
+                hp, hrow, wp, wadd, ip, scs, Nf, injp, irow, (int)n, eps);
+            hcf_down_dec1_kernel<5, r4dchain><<<dim3((unsigned)(lr / 16), (unsigned)S), 256, 0, st>>>(
+                Nf, dp, dld, P, pslice, pw, (int)rows, (int)HN);
+        } else {
+            hcf_normdec_kernel<4><<<dim3((unsigned)rows), 4 * 256, 0, st>>>(
+                hp, hrow, wp, wadd, ip, scs, Nf, injp, irow, (int)n, eps);
+            hcf_down_dec1_kernel<5><<<dim3((unsigned)(lr / 16), (unsigned)S), 256, 0, st>>>(
+                Nf, dp, dld, P, pslice, pw, (int)rows, (int)HN);
+        }
     } else {
     hcf_stats_kernel<<<dim3((unsigned)hc, (unsigned)rows), 256, 0, st>>>(hp, hrow, scs, (int)n, eps);
     {
@@ -1392,9 +1448,14 @@ static int hcf_launch(const RadArgs* a, RadStream s, const HcPlan& p, float eps,
     if (dec1) {
         /* Sixteen waves, two quarters of W_up in flight, d summed from the partials in the
          * kernel: twenty blocks a call, one a WGP, so each block's loads in flight set the pace. */
-        hcf_upmix_kernel<1, 4, 320, false, 16, true><<<ugrid, 512, smem, st>>>(
-            nullptr, P, pslice, pw, S, upp, uld, Wup, hp, hrow, wp, wadd, scs, xp, xrow, qp, qsp,
-            qrow, srow, rqp, rsp, rqrow, rsrow, (int)rows, (int)n, i8);
+        if (chain)
+            hcf_upmix_kernel<1, 4, 320, false, 16, true, r4dchain><<<ugrid, 512, smem, st>>>(
+                nullptr, P, pslice, pw, S, upp, uld, Wup, hp, hrow, wp, wadd, scs, xp, xrow, qp, qsp,
+                qrow, srow, rqp, rsp, rqrow, rsrow, (int)rows, (int)n, i8);
+        else
+            hcf_upmix_kernel<1, 4, 320, false, 16, true><<<ugrid, 512, smem, st>>>(
+                nullptr, P, pslice, pw, S, upp, uld, Wup, hp, hrow, wp, wadd, scs, xp, xrow, qp, qsp,
+                qrow, srow, rqp, rsp, rqrow, rsrow, (int)rows, (int)n, i8);
         return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
     }
     const long nout = rows * (lr + (injp ? hc : 0));
@@ -1434,7 +1495,8 @@ extern "C" int halo_rad_hc_read(const RadArgs* a, RadStream s) {
     if (q && q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
     if (q && qs->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
     if ((rq != nullptr) != (rs != nullptr) || (rq && !q)) return HALO_NO(RAD_E_INVAL);
-    if (rq && (rq->dtype != RAD_F8E4M3 || rs->dtype != RAD_F32)) return HALO_NO(RAD_E_DTYPE);
+    /* The rotated twin is in the plain twin's code (libr4d's hc_read). */
+    if (rq && (rq->dtype != q->dtype || rs->dtype != RAD_F32)) return HALO_NO(RAD_E_DTYPE);
 
     HcPlan p;
     int rc = hc_plan(a, down, &p);

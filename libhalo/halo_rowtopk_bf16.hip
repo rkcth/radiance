@@ -51,6 +51,7 @@
 #include "halo_fp8_wmma.h"
 #include "halo_fp8_lm.h"
 #include "halo_chain.h"
+#include "halo_iqr.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
@@ -207,25 +208,39 @@ __global__ __launch_bounds__(HALO_TOPK_WAVE * HALO_TOPK_WPB) void halo_r4dchain_
 // An empty slot is not token `off`. A chunk that ran out of candidates leaves a zero key; OI gets
 // column 0 for it, without the offset, so a pad cannot look like this rank's first real token. The
 // pair plane writes -1, the sentinel the merge drops (not -INFINITY, a valid masked logit).
-// The body; the plain kernel and its chained form (halo_chain.h) wrap it below.
+// The body; the plain kernel and its chained form (halo_chain.h) wrap it below. PT is a lane's
+// list, at least R (see the header): 32 serves every R, and a launch for R <= 8 or R <= 16 takes
+// the shorter list, whose insert and whose round's shift are that much shorter. The output is the
+// same for any PT >= R.
+template <int PT>
 __device__ __forceinline__ void halo_rowtopk_stage2_body(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
 
-  unsigned long long t[HALO_TOPK_PT2];
+  unsigned long long t[PT];
 #pragma unroll
-  for (int q = 0; q < HALO_TOPK_PT2; q++) t[q] = 0ull;
+  for (int q = 0; q < PT; q++) t[q] = 0ull;
 
   // The key decides, as in stage 1 (see tk_insert). A NaN a chunk handed on displaced a real
   // candidate, so dropping it here can leave the row short of R; the pad filling the gap is what
   // the merge reports as id -1. An empty slot's key is 0 and never places.
+  // UNROLL keys are loaded before the first is placed, as in stage 1: one load a pass would put a
+  // memory latency between consecutive inserts. A lane places its keys in the same order.
   const unsigned long long* p = P + (size_t)m * n;
-  for (int i = lane; i < n; i += HALO_TOPK_WAVE) tk_insert<HALO_TOPK_PT2>(t, p[i]);
+  int i = lane;
+  for (; i + (HALO_TOPK_UNROLL - 1) * HALO_TOPK_WAVE < n; i += HALO_TOPK_UNROLL * HALO_TOPK_WAVE) {
+    unsigned long long k[HALO_TOPK_UNROLL];
+#pragma unroll
+    for (int u = 0; u < HALO_TOPK_UNROLL; u++) k[u] = p[i + u * HALO_TOPK_WAVE];
+#pragma unroll
+    for (int u = 0; u < HALO_TOPK_UNROLL; u++) tk_insert<PT>(t, k[u]);
+  }
+  for (; i < n; i += HALO_TOPK_WAVE) tk_insert<PT>(t, p[i]);
 
   for (int r = 0; r < R; r++) {
-    const unsigned long long w = tk_round<HALO_TOPK_PT2>(t);
+    const unsigned long long w = tk_round<PT>(t);
     if (lane == 0) {
       // A zero key is an empty slot, not a real column.
       const float v = w ? tk_val(w) : -INFINITY;
@@ -240,16 +255,18 @@ __device__ __forceinline__ void halo_rowtopk_stage2_body(
     }
   }
 }
+template <int PT>
 __global__ __launch_bounds__(HALO_TOPK_WAVE) void halo_rowtopk_stage2_kernel(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
-    halo_rowtopk_stage2_body(P, OV, OI, OP, off, R, n);
+    halo_rowtopk_stage2_body<PT>(P, OV, OI, OP, off, R, n);
 }
+template <int PT>
 __global__ __launch_bounds__(HALO_TOPK_WAVE) void halo_r4dchain_rowtopk_stage2(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
     halo_chain_wait();
-    halo_rowtopk_stage2_body(P, OV, OI, OP, off, R, n);
+    halo_rowtopk_stage2_body<PT>(P, OV, OI, OP, off, R, n);
     halo_chain_done();
 }
 
@@ -294,10 +311,14 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
   }
 #undef HALO_TK_S1
   if (emit_rc != RAD_OK) return emit_rc;
-  return HALO_EMIT(stream, (chain ? halo_r4dchain_rowtopk_stage2 : halo_rowtopk_stage2_kernel), dim3(M),
-                  dim3(HALO_TOPK_WAVE), 0,
-                  (const unsigned long long*)partial, (float*)outv, (int*)outi,
-                  (float*)outp, off, R, nch * RC);
+#define HALO_TK_S2(PT) HALO_EMIT(stream, (chain ? halo_r4dchain_rowtopk_stage2<PT>                     \
+                                               : halo_rowtopk_stage2_kernel<PT>), dim3(M),         \
+                               dim3(HALO_TOPK_WAVE), 0,                                             \
+                               (const unsigned long long*)partial, (float*)outv, (int*)outi,      \
+                               (float*)outp, off, R, nch * RC)
+  const int rc2 = R <= 8 ? HALO_TK_S2(8) : R <= 16 ? HALO_TK_S2(16) : HALO_TK_S2(HALO_TOPK_PT2);
+#undef HALO_TK_S2
+  return rc2;
 }
 
 // ============================================================ the vocab-parallel merge
@@ -377,12 +398,16 @@ __global__ __launch_bounds__(HALO_TOPK_WAVE) void halo_r4dchain_rowtopk_merge(
 // row's bf16 scale per 128 columns in its tail) with int8 codes instead of E4M3. The drafter
 // rescores against whichever head the trunk's logits GEMM reads, so an int8 head needs this form.
 #define HALO_RERANK_WPB 8       // waves a block: 256 threads, and R <= 32 so a wave takes <= 4
+#define HALO_RERANK_U   5       // 512-column steps a lane has in flight: all of K = 2560
 
-template <bool I8>
-__global__ __launch_bounds__(HALO_TOPK_WAVE * HALO_RERANK_WPB) void halo_logit_rerank_kernel(
-    const unsigned short* __restrict__ X, const int* __restrict__ IN,
-    const unsigned char* __restrict__ W, int* __restrict__ OI, float* __restrict__ OV,
-    float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld) {
+/* TB > 0: an IQR head (halo_iqr.h's lm form), TB-bit codes then the row's scales, the table of 2^TB
+ * int8 entries after the last row. */
+#define HALO_LOGIT_RERANK_PARAMS                                                                 \
+    const unsigned short* __restrict__ X, const int* __restrict__ IN,                           \
+    const unsigned char* __restrict__ W, int* __restrict__ OI, float* __restrict__ OV,          \
+    float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld
+template <bool I8, uint32_t TB = 0>
+__device__ __forceinline__ void halo_logit_rerank_body(HALO_LOGIT_RERANK_PARAMS) {
   __shared__ float s_sc[HALO_TOPK_PT2];
   __shared__ int   s_id[HALO_TOPK_PT2];
 
@@ -402,9 +427,87 @@ __global__ __launch_bounds__(HALO_TOPK_WAVE * HALO_RERANK_WPB) void halo_logit_r
        * column's block scale locally, so the fold is a plain sum whose order depends only on the
        * lane count. */
       const unsigned char* const wr = W + (size_t)loc * w_ld;
-      const unsigned short* const sr = (const unsigned short*)(wr + K);
-      for (long k = lane; k < K; k += HALO_TOPK_WAVE) {
-        const float c = I8 ? (float)(int8_t)wr[k] : halo_fp8::e4m3((uint32_t)wr[k]);
+      const unsigned short* const sr = (const unsigned short*)(wr + (TB ? K / 8 * TB : K));
+      [[maybe_unused]] const int8_t* const tab =
+          (const int8_t*)(W + ((size_t)nv * w_ld + 255) / 256 * 256);
+      /* At K a multiple of 512 a lane takes sixteen consecutive columns of every 512, all in one
+       * scale block: their products sum from zero in column order and the block's scale multiplies
+       * that partial sum, the same arithmetic for every code form (an IQR head's scores are the
+       * int8 head's to the bit). Byte codes on aligned planes load whole: HALO_RERANK_U steps are
+       * in flight before the first is summed, where a column at a time is 80 loads in series at
+       * K = 2560, each waiting for the last. */
+      const bool ord = (K & 511) == 0;
+      bool vec = false;
+      if constexpr (TB == 0) vec = ord && ((size_t)X & 15) == 0 && ((size_t)W & 7) == 0;
+      if constexpr (TB == 0) {
+        for (long k0 = 16 * lane; vec && k0 < K; k0 += 512 * HALO_RERANK_U) {
+          uint2 c[HALO_RERANK_U][2];
+          uint4 xv[HALO_RERANK_U][2];
+          uint32_t sv[HALO_RERANK_U];
+#pragma unroll
+          for (int u = 0; u < HALO_RERANK_U; u++) {
+            const long k = k0 + 512 * u;
+            if (k < K) {
+              const uint2* const pc = (const uint2*)(wr + k);
+              const uint4* const px = (const uint4*)(xr + k);
+              c[u][0] = pc[0]; c[u][1] = pc[1];
+              xv[u][0] = px[0]; xv[u][1] = px[1];
+              sv[u] = sr[k / 128];
+            }
+          }
+#pragma unroll
+          for (int u = 0; u < HALO_RERANK_U; u++) {
+            if (k0 + 512 * u < K) {
+              const uint32_t cw[4] = { c[u][0].x, c[u][0].y, c[u][1].x, c[u][1].y };
+              const uint32_t xw[8] = { xv[u][0].x, xv[u][0].y, xv[u][0].z, xv[u][0].w,
+                                       xv[u][1].x, xv[u][1].y, xv[u][1].z, xv[u][1].w };
+              float part = 0.0f;
+#pragma unroll
+              for (int d = 0; d < 4; d++) {
+                float f[4];
+                if constexpr (I8) {
+#pragma unroll
+                  for (int q = 0; q < 4; q++) f[q] = (float)((int)(cw[d] << (24 - 8 * q)) >> 24);
+                } else {
+                  const v2f lo = halo_fp8::e4m3_pk<false>(cw[d]), hi = halo_fp8::e4m3_pk<true>(cw[d]);
+                  f[0] = lo.x; f[1] = lo.y; f[2] = hi.x; f[3] = hi.y;
+                }
+                part = fmaf(f[0], __uint_as_float(xw[2 * d] << 16), part);
+                part = fmaf(f[1], __uint_as_float(xw[2 * d] & 0xffff0000u), part);
+                part = fmaf(f[2], __uint_as_float(xw[2 * d + 1] << 16), part);
+                part = fmaf(f[3], __uint_as_float(xw[2 * d + 1] & 0xffff0000u), part);
+              }
+              acc = fmaf(part, halo_fp8::bscale(sv[u]), acc);
+            }
+          }
+        }
+      }
+      for (long k0 = 16 * lane; ord && !vec && k0 < K; k0 += 512) {
+        float part = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 16; q++) {
+          const long k = k0 + q;
+          float c;
+          if constexpr (TB != 0) {
+            const long bit = k * (long)TB;
+            const uint32_t wv = (uint32_t)wr[bit >> 3] | (uint32_t)wr[(bit >> 3) + 1] << 8;
+            c = (float)tab[(wv >> (bit & 7)) & ((1u << TB) - 1u)];
+          } else {
+            c = I8 ? (float)(int8_t)wr[k] : halo_fp8::e4m3((uint32_t)wr[k]);
+          }
+          part = fmaf(c, bf16_to_f32(xr[k]), part);
+        }
+        acc = fmaf(part, halo_fp8::bscale(sr[k0 / 128]), acc);
+      }
+      for (long k = ord ? K : lane; k < K; k += HALO_TOPK_WAVE) {
+        float c;
+        if constexpr (TB != 0) {
+          const long bit = k * (long)TB;
+          const uint32_t wv = (uint32_t)wr[bit >> 3] | (uint32_t)wr[(bit >> 3) + 1] << 8;
+          c = (float)tab[(wv >> (bit & 7)) & ((1u << TB) - 1u)];
+        } else {
+          c = I8 ? (float)(int8_t)wr[k] : halo_fp8::e4m3((uint32_t)wr[k]);
+        }
         acc = fmaf(c * halo_fp8::bscale(sr[k / 128]), bf16_to_f32(xr[k]), acc);
       }
       acc = halo_wave_sum(acc);
@@ -436,20 +539,39 @@ __global__ __launch_bounds__(HALO_TOPK_WAVE * HALO_RERANK_WPB) void halo_logit_r
   }
 }
 
+// The kernel around the body: CH `r4dchain` is the chained form (halo_chain.h), taken at decode
+// heights.
+template <bool I8, uint32_t TB, class CH>
+__global__ __launch_bounds__(HALO_TOPK_WAVE * HALO_RERANK_WPB)
+void halo_logit_rerank_kernel(HALO_LOGIT_RERANK_PARAMS) {
+  if (CH::on) halo_chain_wait();
+  halo_logit_rerank_body<I8, TB>(X, IN, W, OI, OV, OP, R, K, voff, nv, w_ld);
+  if (CH::on) halo_chain_done();
+}
+#undef HALO_LOGIT_RERANK_PARAMS
+
 static int logit_rerank_emit(long x, long idx_in, long head, long outi, long outv, long outp,
                              int M, int R, long K, long voff, long nv, RadStream stream,
-                             bool i8) {
-  const long w_ld = halo_fp8::lm_row_bytes(K);
+                             bool i8, uint32_t tb = 0, bool chain = false) {
+  halo_iqr::Form tf;
+  tf.bits = tb;
+  const long w_ld = tb ? (long)halo_iqr::lm_row(tf, K) : halo_fp8::lm_row_bytes(K);
   // R <= PT2 makes the re-sort exact for any scores (one lane holds the whole answer), so it is
   // checked, not clamped.
   if (M < 1 || R < 1 || K < 1 || nv < 1 || R > HALO_TOPK_PT2) return HALO_NO(RAD_E_SHAPE);
-#define HALO_RERANK_EMIT(I8)                                                                     \
-  HALO_EMIT(stream, halo_logit_rerank_kernel<I8>, dim3(M), dim3(HALO_TOPK_WAVE * HALO_RERANK_WPB), \
-           0, (const unsigned short*)x, (const int*)idx_in, (const unsigned char*)head,          \
-           (int*)outi,                                                                            \
-           (float*)outv, (float*)outp, R, K, voff, nv, w_ld)
-  const int rc = i8 ? HALO_RERANK_EMIT(true) : HALO_RERANK_EMIT(false);
+#define HALO_RERANK_CH(I8, TB, CH_)                                                              \
+  HALO_EMIT(stream, (halo_logit_rerank_kernel<I8, TB, CH_>), dim3(M),                              \
+           dim3(HALO_TOPK_WAVE * HALO_RERANK_WPB), 0, (const unsigned short*)x,                    \
+           (const int*)idx_in, (const unsigned char*)head, (int*)outi, (float*)outv,             \
+           (float*)outp, R, K, voff, nv, w_ld)
+#define HALO_RERANK_EMIT(I8, TB)                                                                 \
+  (chain ? HALO_RERANK_CH(I8, TB, r4dchain) : HALO_RERANK_CH(I8, TB, HaloUnchained))
+  const int rc = tb == 2u ? HALO_RERANK_EMIT(true, 2) : tb == 3u ? HALO_RERANK_EMIT(true, 3)
+               : tb == 4u ? HALO_RERANK_EMIT(true, 4) : tb == 5u ? HALO_RERANK_EMIT(true, 5)
+               : tb == 6u ? HALO_RERANK_EMIT(true, 6)
+               : i8 ? HALO_RERANK_EMIT(true, 0) : HALO_RERANK_EMIT(false, 0);
 #undef HALO_RERANK_EMIT
+#undef HALO_RERANK_CH
   return rc;
 }
 
@@ -574,7 +696,7 @@ extern "C" int halo_rad_rowtopk_merge(const RadArgs* a, RadStream s) {
 
 /* `M` and the candidate count come from the operands, as in rowtopk_merge: `M` is a band ceiling.
  * `n_vocab` is this rank's rows of the head, so the ownership guard is a shard test. */
-static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8) {
+static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8, bool iqr = false) {
     const RadTensor* x   = halo_opt(a, 0);
     const RadTensor* w   = halo_opt(a, 1);
     const RadTensor* in  = halo_opt(a, 2);
@@ -588,7 +710,14 @@ static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8) {
      * hook's rule; the engine's layout-tag check guarantees agreement by refusing a container laid
      * out for another row. So the head is accepted at either spelling and read as r4d.fp8lm.b128,
      * or r4d.i8lm.r128 for the int8 form. */
-    if (w->dtype != (i8 ? RAD_I8 : RAD_F8E4M3) && w->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
+    uint32_t tb = 0;
+    if (iqr) {
+        if (!halo_iqr::is_weight_dtype(w->dtype) || !halo_iqr::lm_built(w->dtype & halo_iqr::kWordMask))
+            return HALO_NO(RAD_E_DTYPE);
+        tb = halo_iqr::form(w->dtype & halo_iqr::kWordMask).bits;
+    } else if (w->dtype != (i8 ? RAD_I8 : RAD_F8E4M3) && w->dtype != RAD_BF16) {
+        return HALO_NO(RAD_E_DTYPE);
+    }
     if (in->dtype != RAD_I32 || idx->dtype != RAD_I32 || val->dtype != RAD_F32)
         return HALO_NO(RAD_E_DTYPE);
     if (pr && pr->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
@@ -610,12 +739,18 @@ static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8) {
 
     return logit_rerank_emit(halo_addr(x), halo_addr(in), halo_addr(w), halo_addr(idx), halo_addr(val),
                              pr ? halo_addr(pr) : 0, (int)M, (int)R, (long)K, (long)voff, (long)NV,
-                             stream, i8);
+                             stream, i8, tb, halo_geti_or(a, "chain", 0) != 0 && M <= 64);
 }
+/* The E4M3 head (logits_gemm_fp8's plane): libhalo keeps the row libr4d dropped, since its selftest
+ * and the fp8 head's layout hooks still serve it. */
 extern "C" int halo_rad_logit_rerank(const RadArgs* a, RadStream stream) {
     return rad_logit_rerank(a, stream, false);
 }
 extern "C" int halo_rad_logit_rerank_i8(const RadArgs* a, RadStream stream) {
     return rad_logit_rerank(a, stream, true);
+}
+/* An IQR head's rows (halo_iqr.h's lm form), as logits_gemm_iqr reads them. */
+extern "C" int halo_rad_logit_rerank_iqr(const RadArgs* a, RadStream stream) {
+    return rad_logit_rerank(a, stream, true, true);
 }
 

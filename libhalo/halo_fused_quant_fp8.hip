@@ -38,6 +38,7 @@
 #include "halo_ar_seq.h"   // the all-reduce sequence step the fused all-reduce + norm takes
 #include "halo_fp8_args.h"
 #include "halo_emit.h"
+#include "halo_chain.h"    // the chained forms of the rotated int8 producers
 #include "halo_common.h"   // halo_act_threads: the workgroup width, shared with the int8 path
 #include "halo_fwht.h"     // the in-register rotation the `_had_` forms put before the absmax
 #include "halo_q8.h"       // the 8-bit codes: E4M3, or int8 for an int8 trunk linear
@@ -99,6 +100,35 @@ __device__ __forceinline__ void quant_group(const float v[4], float* __restrict_
     if (c0 < n) *(uint32_t*)(q + c0) = pk;
 }
 
+// One scale group of SUB 128-column blocks (SUB 2: IQ8R's 256-wide group, int8 only): `v[h]` are
+// the lane's four values of block h, already rotated where the form rotates (the rotation stays 128
+// wide). One amax over the whole group, one scale, then each block's codes at its own `c0[h]`.
+// libr4d's helper, by the rename transform.
+template <bool I8, uint32_t SUB>
+__device__ __forceinline__ void quant_groups(const float (&v)[SUB][4], float* __restrict__ s,
+                                             uint8_t* __restrict__ q, size_t s_at,
+                                             const uint32_t (&c0)[SUB], uint32_t n, uint32_t lane) {
+    static_assert(SUB == 1 || (SUB == 2 && I8), "a 256 group is the int8 quantiser's");
+    if constexpr (SUB == 1) {
+        quant_group<I8>(v[0], s, q, s_at, c0[0], n, lane);
+    } else {
+        float m = 0.0f;
+#pragma unroll
+        for (uint32_t h = 0; h < SUB; ++h)
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(v[h][0]), fabsf(v[h][1])),
+                               fmaxf(fabsf(v[h][2]), fabsf(v[h][3]))));
+        m = wave_max(m);
+        const float sc = m > 0.0f ? m * (1.0f / q8_top<I8>()) : 1.0f;
+        if (lane == 0) s[s_at] = sc;
+        const float inv = 1.0f / sc;
+#pragma unroll
+        for (uint32_t h = 0; h < SUB; ++h) {
+            const uint32_t pk = q8_pack4<I8>(v[h][0], v[h][1], v[h][2], v[h][3], inv);
+            if (c0[h] < n) *(uint32_t*)(q + c0[h]) = pk;
+        }
+    }
+}
+
 // Pass two of every norm kernel here: each wave takes a 128-column group and each lane four
 // consecutive columns, so the group's amax is a wave reduction and the store a single dword. `nr`
 // is the row the norm is taken of, already in memory (see the bit-identity note above). Shared so
@@ -109,46 +139,59 @@ __device__ __forceinline__ void quant_group(const float v[4], float* __restrict_
 // together. halo_quant_act_fp8's kernel has the same mapping, rotation and rounding, so the codes
 // are the norm + had_quant_act_i8g pair's bytes. `y` still receives the unrotated norm output.
 // The launchers require n % 128 == 0, so no rotated group contains padding.
-template <bool WF32, uint32_t THR, bool HI8 = false>
+// SUB 2 (with HI8) is IQ8R's group: a wave takes both 128-column blocks of a 256-wide group and
+// `nkb` counts groups.
+template <bool WF32, uint32_t THR, bool HI8 = false, uint32_t SUB = 1>
 __device__ __forceinline__ void norm_quant_row(
     const uint16_t* __restrict__ nr, const void* __restrict__ w, uint16_t* __restrict__ yr,
     uint8_t* __restrict__ qr, float* __restrict__ s, size_t s_row, uint32_t n, uint32_t nkb,
     float rs, float wadd) {
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     for (uint32_t kb = wave; kb < nkb; kb += THR / kWave) {
-        const uint32_t c0 = kb * kGroup + lane * 4u;
-        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        // One branch for all four columns: every launcher requires n % 4 == 0, so a lane's columns
-        // are all in or all out. Per-column guards would serialise the loads.
-        if (c0 < n) {
-            float g[4];
-            uint16_t x[4];
+        float v[SUB][4];
+        uint32_t c0[SUB];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                g[j] = WF32 ? ((const float*)w)[c0 + j] : bf2f(((const uint16_t*)w)[c0 + j]);
-                x[j] = nr[c0 + j];
-            }
+        for (uint32_t b = 0; b < SUB; ++b) {
+            c0[b] = (kb * SUB + b) * kGroup + lane * 4u;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                // The bf16 round trip is deliberate: the unfused quantiser reads these bytes.
-                const uint16_t h = f2bf(bf2f(x[j]) * rs * (g[j] + wadd));
-                if (yr) yr[c0 + j] = h;
-                v[j] = bf2f(h);
+            for (int j = 0; j < 4; ++j) v[b][j] = 0.0f;
+            // One branch for all four columns: every launcher requires n % 4 == 0, so a lane's
+            // columns are all in or all out. Per-column guards would serialise the loads.
+            if (c0[b] < n) {
+                float g[4];
+                uint16_t x[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    g[j] = WF32 ? ((const float*)w)[c0[b] + j]
+                                : bf2f(((const uint16_t*)w)[c0[b] + j]);
+                    x[j] = nr[c0[b] + j];
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    // The bf16 round trip is deliberate: the unfused quantiser reads these bytes.
+                    const uint16_t h = f2bf(bf2f(x[j]) * rs * (g[j] + wadd));
+                    if (yr) yr[c0[b] + j] = h;
+                    v[b][j] = bf2f(h);
+                }
             }
+            if constexpr (HI8) halo_fwht_wave<(int)kGroup>(v[b], (int)lane);
         }
-        if constexpr (HI8) halo_fwht_wave<(int)kGroup>(v, (int)lane);
-        quant_group<HI8>(v, s, qr, s_row + kb, c0, n, lane);
+        quant_groups<HI8, SUB>(v, s, qr, s_row + kb, c0, n, lane);
     }
 }
 
 // ---------------------------------------------------------------------------- rmsnorm -> quant
 // One block per row. Pass one is the block-wide sum of squares; pass two is norm_quant_row.
-template <bool WF32, bool RES, uint32_t THR, bool HI8 = false>
+// CH r4dchain is the chained form (halo_chain.h) the rotated int8 rows take at decode heights;
+// no block returns early, so the body is bracketed in place.
+template <bool WF32, bool RES, uint32_t THR, bool HI8 = false, uint32_t SUB = 1,
+          class CH = HaloUnchained>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n,
     uint32_t nkb, float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld,
     uint32_t q_ld, uint32_t s_ld) {
+    if constexpr (CH::on) halo_chain_wait();
     __shared__ float lds[THR / kWave];
     const uint32_t row = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
@@ -187,8 +230,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     }
     const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
 
-    norm_quant_row<WF32, THR, HI8>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
-                                   q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs, wadd);
+    norm_quant_row<WF32, THR, HI8, SUB>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
+                                        q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs,
+                                        wadd);
+    if constexpr (CH::on) halo_chain_done();
 }
 
 // ---------------------------------------------------------------------------- gate -> quant
@@ -202,11 +247,13 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
 //
 // The launcher sizes the workgroup to the row's groups (capped at halo_act_threads' width) and the
 // kernel reads the width from blockDim, so a narrow row does not leave most waves idle.
-template <int ACT, bool ROT = false, bool I8 = false>
+// SUB 2 (rotated int8 only) is IQ8R's 256-wide group, as in norm_quant_row.
+template <int ACT, bool ROT = false, bool I8 = false, uint32_t SUB = 1, class CH = HaloUnchained>
 __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
     float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
     uint32_t q_ld, uint32_t s_ld) {
+    if constexpr (CH::on) halo_chain_wait();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const uint16_t* __restrict__ gr = gu + (size_t)row * gu_ld;
@@ -214,29 +261,36 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
     uint8_t*  __restrict__ qr = q + (size_t)row * q_ld;
 
     for (uint32_t kb = wave; kb < nkb; kb += blockDim.x / kWave) {
-        const uint32_t c0 = kb * kGroup + lane * 4u;
-        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        // One branch for all four columns; see norm_quant_row.
-        if (c0 < n) {
-            uint16_t gb[4], ub[4];
+        float v[SUB][4];
+        uint32_t c0[SUB];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                gb[j] = gr[c0 + j];
-                ub[j] = gr[n + c0 + j];
-            }
+        for (uint32_t b = 0; b < SUB; ++b) {
+            c0[b] = (kb * SUB + b) * kGroup + lane * 4u;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float g = bf2f(gb[j]);
-                const float a = ACT == 0 ? g / (1.0f + expf(-g)) : 1.0f / (1.0f + expf(-g));
-                const uint16_t h = f2bf(a * bf2f(ub[j]));
-                if (yr) yr[c0 + j] = h;
-                v[j] = bf2f(h);
+            for (int j = 0; j < 4; ++j) v[b][j] = 0.0f;
+            // One branch for all four columns; see norm_quant_row.
+            if (c0[b] < n) {
+                uint16_t gb[4], ub[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    gb[j] = gr[c0[b] + j];
+                    ub[j] = gr[n + c0[b] + j];
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float g = bf2f(gb[j]);
+                    const float a = ACT == 0 ? g / (1.0f + expf(-g)) : 1.0f / (1.0f + expf(-g));
+                    const uint16_t h = f2bf(a * bf2f(ub[j]));
+                    if (yr) yr[c0[b] + j] = h;
+                    v[b][j] = bf2f(h);
+                }
             }
+            // The rotated launcher requires n % 128 == 0, so no rotated group contains padding.
+            if constexpr (ROT) halo_fwht_wave<(int)kGroup>(v[b], (int)lane);
         }
-        // The rotated launcher requires n % 128 == 0, so no rotated group contains padding.
-        if constexpr (ROT) halo_fwht_wave<(int)kGroup>(v, (int)lane);
-        quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
+        quant_groups<I8, SUB>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
     }
+    if constexpr (CH::on) halo_chain_done();
 }
 
 // -------------------------------------------------- gate . x -> quant, two source buffers
@@ -247,11 +301,17 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
 // then contiguous, the gate a fixed stride apart, and the scale plane [T * n_head, head_dim / 128]
 // is byte-identical to the [T, n_head * head_dim / 128] the out projection reads. Replaces three
 // launches (sigmoid, multiply, quantise) per attention layer.
-template <int ACT, bool I8 = false>
+//
+// ROT (with I8: gate_had_quant_i8g) puts the width-128 Hadamard between the bf16-rounded product
+// and the absmax, as gated_quant_fp8_kernel's ROT, for an out projection stored rotated: the codes
+// are had_quant_act_i8g's over `y`. SUB 2 (rotated int8 only) is IQ8R's 256-wide group, as in
+// norm_quant_row; a row (one head) is then whole 256s. libr4d's form, by the rename transform.
+template <int ACT, bool I8 = false, bool ROT = false, uint32_t SUB = 1, class CH = HaloUnchained>
 __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
     const uint16_t* __restrict__ g, const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t g_ld,
     uint32_t x_ld, uint32_t y_ld, uint32_t q_ld, uint32_t s_ld) {
+    if constexpr (CH::on) halo_chain_wait();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const uint16_t* __restrict__ gr = g + (size_t)row * g_ld;
@@ -260,31 +320,41 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
     uint8_t*  __restrict__ qr = q + (size_t)row * q_ld;
 
     for (uint32_t kb = wave; kb < nkb; kb += blockDim.x / kWave) {
-        const uint32_t c0 = kb * kGroup + lane * 4u;
-        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        // One branch for all four columns; see norm_quant_row.
-        if (c0 < n) {
-            uint16_t gb[4], xb[4];
+        float v[SUB][4];
+        uint32_t c0[SUB];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                gb[j] = gr[c0 + j];
-                xb[j] = xr[c0 + j];
-            }
+        for (uint32_t b = 0; b < SUB; ++b) {
+            c0[b] = (kb * SUB + b) * kGroup + lane * 4u;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float gv = bf2f(gb[j]);
-                // The activation is rounded to bf16 before the multiply, unlike gated_quant_fp8:
-                // the unfused reference here is `sigmoid` then `mul` with a bf16 buffer between
-                // them (silu_mul_bf16 keeps f32). Skipping the round trip changes the output.
-                const uint16_t ab =
-                    f2bf(ACT == 0 ? gv / (1.0f + expf(-gv)) : 1.0f / (1.0f + expf(-gv)));
-                const uint16_t h = f2bf(bf2f(ab) * bf2f(xb[j]));
-                if (yr) yr[c0 + j] = h;
-                v[j] = bf2f(h);
+            for (int j = 0; j < 4; ++j) v[b][j] = 0.0f;
+            // One branch for all four columns; see norm_quant_row.
+            if (c0[b] < n) {
+                uint16_t gb[4], xb[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    gb[j] = gr[c0[b] + j];
+                    xb[j] = xr[c0[b] + j];
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float gv = bf2f(gb[j]);
+                    // The activation is rounded to bf16 before the multiply, unlike
+                    // gated_quant_fp8: the unfused reference here is `sigmoid` then `mul` with a
+                    // bf16 buffer between them (silu_mul_bf16 keeps f32). Skipping the round trip
+                    // changes the output.
+                    const uint16_t ab =
+                        f2bf(ACT == 0 ? gv / (1.0f + expf(-gv)) : 1.0f / (1.0f + expf(-gv)));
+                    const uint16_t h = f2bf(bf2f(ab) * bf2f(xb[j]));
+                    if (yr) yr[c0[b] + j] = h;
+                    v[b][j] = bf2f(h);
+                }
             }
+            // The rotated launcher requires n % 128 == 0, so no rotated group contains padding.
+            if constexpr (ROT) halo_fwht_wave<(int)kGroup>(v[b], (int)lane);
         }
-        quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
+        quant_groups<I8, SUB>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
     }
+    if constexpr (CH::on) halo_chain_done();
 }
 
 // -------------------------------------------------------- all-reduce -> rmsnorm -> quant
@@ -377,8 +447,10 @@ __device__ __forceinline__ unsigned int arq_load_acq(const unsigned int* p) {
 // POST computes it. `x` still receives the reduced sum. Exact wire and a residual only.
 //
 // HI8: ar_rmsnorm_had_quant_i8g, pass two in norm_quant_row's rotated int8 form. The reduction and
-// the norm are untouched, so `x`, the residual and `y` are ar_rmsnorm_quant_fp8's bytes.
-template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false, bool HI8 = false>
+// the norm are untouched, so `x`, the residual and `y` are ar_rmsnorm_quant_fp8's bytes. SUB 2
+// (with HI8) is IQ8R's 256-wide scale group, as norm_quant_row's; `nkb` then counts groups.
+template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false, bool HI8 = false,
+          uint32_t SUB = 1>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp,
@@ -646,9 +718,9 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
         }
         /* block_sum's barrier is also what publishes pass one's stores to pass two's reads. */
         const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
-        norm_quant_row<WF32, THR, HI8>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
-                                       q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs,
-                                       wadd);
+        norm_quant_row<WF32, THR, HI8, SUB>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
+                                            q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb,
+                                            rs, wadd);
         /* lds is reused by this block's next row; without the barrier a thread still reading it
          * would race the next row's write. */
         __syncthreads();
@@ -673,19 +745,23 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
 //                            up to 4
 //   s    [M][ceil(n/128)]    f32,  `s_ld` elements a row (0 = ceil(n/128))
 //
-// `hi8` additionally requires n % 128 == 0, as gated_quant_fp8_launch's `rot`.
+// `hi8` additionally requires n % 128 == 0, as gated_quant_fp8_launch's `rot`. `wide` (with hi8):
+// IQ8R's scale per 256 columns, n % 256 == 0 and `s` [M][n/256].
 static int rmsnorm_quant_launch(long x, long res, long w, long y, long q, long s, int M, int n,
                                 float eps, float wadd, int w_f32, int x_ld, int r_ld, int y_ld,
-                                int q_ld, int s_ld, long stream, bool hi8) {
+                                int q_ld, int s_ld, long stream, bool hi8, bool wide = false,
+                                bool chain = false) {
     if (!x || !w || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;              // a lane owns four columns; see the kernel
     if (hi8 && (n % (int)kGroup)) return -6;
+    if (wide && (!hi8 || n % (2 * (int)kGroup))) return -6;
     if (!x_ld) x_ld = n;
     if (!r_ld) r_ld = n;
     if (!y_ld) y_ld = n;
     if (!q_ld) q_ld = n;
-    const int nkb = (n + (int)kGroup - 1) / (int)kGroup;
+    const int grp = wide ? 2 * (int)kGroup : (int)kGroup;
+    const int nkb = (n + grp - 1) / grp;
     if (!s_ld) s_ld = nkb;
 
     // One workgroup per row, so a decode batch is 8-72 workgroups and the kernel is latency bound;
@@ -694,14 +770,22 @@ static int rmsnorm_quant_launch(long x, long res, long w, long y, long q, long s
     // rmsnorm_bf16 must pick the same width from the same function: the width decides which
     // columns a thread sums, so a different width changes the last bits and breaks bit identity.
     const int thr = halo_act_threads(M, n);
-#define HALO_RQ_H(wf, rs, T, H)                                                                  \
-    hipLaunchKernelGGL((rmsnorm_quant_fp8_kernel<wf, rs, T, H>), dim3((uint32_t)M), dim3(T), 0, \
+    /* The chained form at decode heights, the rotated int8 forms only (libr4d's rule). */
+    const bool ch = chain && hi8 && M <= 64;
+#define HALO_RQ_HS(wf, rs, T, H, SUB)                                                            \
+    do { if (ch) HALO_RQ_HSC(wf, rs, T, H, SUB, r4dchain);                                      \
+         else    HALO_RQ_HSC(wf, rs, T, H, SUB, HaloUnchained); } while (0)
+#define HALO_RQ_HSC(wf, rs, T, H, SUB, CH_)                                                      \
+    hipLaunchKernelGGL((rmsnorm_quant_fp8_kernel<wf, rs, T, H, SUB, CH_>), dim3((uint32_t)M),    \
+                       dim3(T), 0, \
                        (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)res, (const void*)w,  \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)nkb, eps,    \
                        wadd, (uint32_t)x_ld, (uint32_t)r_ld, (uint32_t)y_ld, (uint32_t)q_ld,     \
                        (uint32_t)s_ld)
 #define HALO_RQ_T(wf, rs, T)                                                                     \
-    do { if (hi8) HALO_RQ_H(wf, rs, T, true); else HALO_RQ_H(wf, rs, T, false); } while (0)
+    do { if (wide) HALO_RQ_HS(wf, rs, T, true, 2u);                                              \
+         else if (hi8) HALO_RQ_HS(wf, rs, T, true, 1u);                                          \
+         else HALO_RQ_HS(wf, rs, T, false, 1u); } while (0)
 #define HALO_RQ(wf, rs)                                                                          \
     do { if (thr == 1024)     HALO_RQ_T(wf, rs, 1024);                                           \
          else if (thr == 512) HALO_RQ_T(wf, rs, 512);                                            \
@@ -710,7 +794,8 @@ static int rmsnorm_quant_launch(long x, long res, long w, long y, long q, long s
     else       { if (res) HALO_RQ(false, true); else HALO_RQ(false, false); }
 #undef HALO_RQ
 #undef HALO_RQ_T
-#undef HALO_RQ_H
+#undef HALO_RQ_HS
+#undef HALO_RQ_HSC
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -742,30 +827,42 @@ extern "C" int halo_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long
 // masked by the GEMM) but a butterfly mixing real values with padding has no matching weight block.
 // `rot` with `i8` is had_quant_act_i8g's form (gated_had_quant_i8g), for a rotated int8 down
 // projection; `rot` alone pairs with a rotated four-bit expert, which reads E4M3.
+// `wide` (with rot and i8): IQ8R's scale per 256 columns, as rmsnorm_quant_launch's.
 static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n, int mode,
                                   int gu_ld, int y_ld, int q_ld, int s_ld, RadStream stream,
-                                  bool rot, bool i8 = false) {
+                                  bool rot, bool i8 = false, bool wide = false,
+                                  bool chain = false) {
     int emit_rc = RAD_OK;
     if (!gu || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;
     if (mode != 0 && mode != 1) return -5;
     if (rot && (n % (int)kGroup)) return -6;
+    if (wide && (!rot || !i8 || n % (2 * (int)kGroup))) return -6;
     if (!gu_ld) gu_ld = 2 * n;
     if (!y_ld) y_ld = n;
     if (!q_ld) q_ld = n;
-    const int nkb = (n + (int)kGroup - 1) / (int)kGroup;
+    const int grp = wide ? 2 * (int)kGroup : (int)kGroup;
+    const int nkb = (n + grp - 1) / grp;
     if (!s_ld) s_ld = nkb;
     // One wave per group, capped at halo_act_threads' width. The width does not affect the numerics:
     // there is no cross-row reduction and the rotation is wave-local (halo_fwht.h).
     const int thr = std::min(nkb, halo_act_threads(M, n) / (int)kWave) * (int)kWave;
-#define HALO_GQ_R(a, R, I)                                                                       \
-    emit_rc = HALO_EMIT(stream, (gated_quant_fp8_kernel<a, R, I>), dim3((uint32_t)M), dim3(thr),  \
+    /* The chained form at decode heights, the rotated forms only (libr4d's rule). */
+    const bool ch = chain && rot && M <= (wide ? 64 : 64 * 16);
+#define HALO_GQ_R(a, R, I) HALO_GQ_RS(a, R, I, 1u)
+#define HALO_GQ_RS(a, R, I, SUB)                                                                 \
+    do { if (ch) HALO_GQ_RSC(a, R, I, SUB, r4dchain);                                           \
+         else    HALO_GQ_RSC(a, R, I, SUB, HaloUnchained); } while (0)
+#define HALO_GQ_RSC(a, R, I, SUB, CH_)                                                           \
+    emit_rc = HALO_EMIT(stream, (gated_quant_fp8_kernel<a, R, I, SUB, CH_>), dim3((uint32_t)M),  \
+                       dim3(thr), \
                        0, (const uint16_t*)gu, (uint16_t*)y, (uint8_t*)q,                      \
                        (float*)s, (uint32_t)n, (uint32_t)nkb, (uint32_t)gu_ld, (uint32_t)y_ld,  \
                        (uint32_t)q_ld, (uint32_t)s_ld)
 #define HALO_GQ(a)                                                                               \
-    do { if (rot && i8) HALO_GQ_R(a, true, true);                                                \
+    do { if (wide) HALO_GQ_RS(a, true, true, 2u);                                                \
+         else if (rot && i8) HALO_GQ_R(a, true, true);                                           \
          else if (rot) HALO_GQ_R(a, true, false);                                                \
          else if (i8) HALO_GQ_R(a, false, true);                                                 \
          else HALO_GQ_R(a, false, false); } while (0)
@@ -773,6 +870,8 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
     else           HALO_GQ(1);
 #undef HALO_GQ
 #undef HALO_GQ_R
+#undef HALO_GQ_RS
+#undef HALO_GQ_RSC
     if (emit_rc != RAD_OK) return -4;
     return (hipGetLastError() != hipSuccess) ? -4 : 0;
 }
@@ -806,33 +905,54 @@ extern "C" int halo_gated_had_quant_i8g(long gu, long y, long q, long s, int M, 
 //   y  [M][n]              bf16, `y_ld` elements a row (0 = n), optional
 //   q  [M][n]              E4M3 (int8 when `i8`), `q_ld` bytes a row (0 = n), rounded up to 4
 //   s  [M][ceil(n/128)]    f32,  `s_ld` elements a row (0 = ceil(n/128))
+//
+// `rot` (int8 only): gate_had_quant_i8g, the 128-wide Hadamard before the absmax, n % 128 == 0;
+// `wide` (with rot): IQ8R's scale per 256 columns, n % 256 == 0.
 static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, int n, int mode,
                                int g_ld, int x_ld, int y_ld, int q_ld, int s_ld,
-                               RadStream stream, bool i8 = false) {
+                               RadStream stream, bool i8 = false, bool rot = false,
+                               bool wide = false, bool chain = false) {
     int emit_rc = RAD_OK;
     if (!g || !x || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;
+    if (rot && (!i8 || n % (int)kGroup)) return -3;
+    if (wide && (!rot || n % (2 * (int)kGroup))) return -3;
     if (mode != 0 && mode != 1) return -5;
     if (!g_ld) g_ld = n;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
     if (!q_ld) q_ld = n;
-    const int nkb = (n + (int)kGroup - 1) / (int)kGroup;
+    const int grp = wide ? 2 * (int)kGroup : (int)kGroup;
+    const int nkb = (n + grp - 1) / grp;
     if (!s_ld) s_ld = nkb;
     // A wave a group, capped at halo_act_threads' width, as gated_quant_fp8 above.
     const int thr = std::min(nkb, halo_act_threads(M, n) / (int)kWave) * (int)kWave;
-#define HALO_GTQ_I(a, I)                                                                         \
-    emit_rc = HALO_EMIT(stream, (gate_quant_fp8_kernel<a, I>), dim3((uint32_t)M), dim3(thr), 0,  \
+    /* A row is a (token, head) pair: decode heights are 64 tokens of up to 32 heads. The chained
+     * form for the rotated forms only (libr4d's rule). */
+    const bool ch = chain && rot && M <= 64 * 32;
+#define HALO_GTQ_I(a, I) HALO_GTQ_K(a, I, false, 1u)
+#define HALO_GTQ_K(a, I, R, SUB)                                                                 \
+    do { if (ch) HALO_GTQ_KC(a, I, R, SUB, r4dchain);                                           \
+         else    HALO_GTQ_KC(a, I, R, SUB, HaloUnchained); } while (0)
+#define HALO_GTQ_KC(a, I, R, SUB, CH_)                                                           \
+    emit_rc = HALO_EMIT(stream, (gate_quant_fp8_kernel<a, I, R, SUB, CH_>), dim3((uint32_t)M),   \
+                       dim3(thr), 0, \
                        (const uint16_t*)g, (const uint16_t*)x,                                 \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)nkb,        \
                        (uint32_t)g_ld, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)q_ld,          \
                        (uint32_t)s_ld)
-#define HALO_GTQ(a) do { if (i8) HALO_GTQ_I(a, true); else HALO_GTQ_I(a, false); } while (0)
+#define HALO_GTQ(a)                                                                              \
+    do { if (wide) HALO_GTQ_K(a, true, true, 2u);                                                \
+         else if (rot) HALO_GTQ_K(a, true, true, 1u);                                            \
+         else if (i8) HALO_GTQ_I(a, true);                                                       \
+         else HALO_GTQ_I(a, false); } while (0)
     if (mode == 0) HALO_GTQ(0);
     else           HALO_GTQ(1);
 #undef HALO_GTQ
 #undef HALO_GTQ_I
+#undef HALO_GTQ_K
+#undef HALO_GTQ_KC
     if (emit_rc != RAD_OK) return -4;
     return (hipGetLastError() != hipSuccess) ? -4 : 0;
 }
@@ -862,11 +982,13 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
                                    int M, int n, float eps, float wadd, int w_f32,
                                    int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                    int nblocks, int nthreads, int drain, int acq, int wire,
-                                   long loc_pack, long loc_scale_off, long wp, bool hi8) {
+                                   long loc_pack, long loc_scale_off, long wp, bool hi8,
+                                   bool wide = false) {
     if (!x || !w || !q || !s) return -1;
     if (wp && (!res || wire != 0)) return -10;   // a post-norm needs the stream and the exact wire
     if (hi8 && wp) return -11;
     if (hi8 && (n % (int)kGroup)) return -12;
+    if (wide && (!hi8 || n % (2 * (int)kGroup))) return -12;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
     // n % 8: n bf16 is a whole number of 16B words (see the push), which also gives every lane its
@@ -879,7 +1001,8 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
     if (!r_ld) r_ld = n;
     if (!y_ld) y_ld = n;
     if (!q_ld) q_ld = n;
-    const int nkb = (n + (int)kGroup - 1) / (int)kGroup;
+    const int grp = wide ? 2 * (int)kGroup : (int)kGroup;
+    const int nkb = (n + grp - 1) / grp;
     if (!s_ld) s_ld = nkb;
 
     int nb = nblocks < 1 ? 1 : nblocks;
@@ -889,8 +1012,10 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
     // The width must be halo_act_threads', as for the standalone norm (it fixes the summation order).
     const int thr = nthreads ? nthreads : halo_act_threads(M, n);
     if (thr != 256 && thr != 512 && thr != 1024) return -6;
-#define HALO_ARQ_H(wf, rs, T, W, PO, H)                                                           \
-    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W, PO, H>), dim3((uint32_t)nb),   \
+#define HALO_ARQ_H(wf, rs, T, W, PO, H) HALO_ARQ_HS(wf, rs, T, W, PO, H, 1u)
+#define HALO_ARQ_HS(wf, rs, T, W, PO, H, SUB)                                                    \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W, PO, H, SUB>),                  \
+                       dim3((uint32_t)nb), \
                        dim3(T), 0,                                                               \
                        (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res, (const void*)w,        \
                        (const void*)wp,                                                          \
@@ -902,7 +1027,8 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
                        (uint32_t)s_ld, (int)slot_stride16, drain, acq, (unsigned)nbw)
 #define HALO_ARQ_P(wf, rs, T, W, PO) HALO_ARQ_H(wf, rs, T, W, PO, false)
 #define HALO_ARQ_T(wf, rs, T, W)                                                                  \
-    do { if (hi8) HALO_ARQ_H(wf, rs, T, W, false, true);                                          \
+    do { if (wide) HALO_ARQ_HS(wf, rs, T, W, false, true, 2u);                                    \
+         else if (hi8) HALO_ARQ_H(wf, rs, T, W, false, true);                                     \
          else HALO_ARQ_P(wf, rs, T, W, false); } while (0)
 #define HALO_ARQ_W(wf, rs, T)                                                                     \
     do { if (wire == 6) HALO_ARQ_T(wf, rs, T, 6);                                                 \
@@ -919,6 +1045,7 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
 #undef HALO_ARQ_T
 #undef HALO_ARQ_P
 #undef HALO_ARQ_H
+#undef HALO_ARQ_HS
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -942,11 +1069,14 @@ extern "C" int halo_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch,
                                             int M, int n, float eps, float wadd, int w_f32,
                                             int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                             int nblocks, int nthreads, int drain, int acq,
-                                            int wire, long loc_pack, long loc_scale_off) {
+                                            int wire, long loc_pack, long loc_scale_off,
+                                            int group) {
+    if (group != (int)kGroup && group != 2 * (int)kGroup) return -12;
     return ar_rmsnorm_quant_launch(peer_scratch, my_scratch, peer_flags, my_flags, seq_ctrs,
                                    slot_stride16, x, res, w, y, q, s, M, n, eps, wadd, w_f32,
                                    r_ld, y_ld, q_ld, s_ld, stream, nblocks, nthreads, drain, acq,
-                                   wire, loc_pack, loc_scale_off, 0, true);
+                                   wire, loc_pack, loc_scale_off, 0, true,
+                                   group == 2 * (int)kGroup);
 }
 
 // ============================================================== the plugin ABI entry points
@@ -973,9 +1103,12 @@ static int rad_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     if (x->rank != 2 || q->rank != 2 || sc->rank != 2) return HALO_NO(RAD_E_SHAPE);
     if (y && y->rank != 2) return HALO_NO(RAD_E_SHAPE);
     const long long M = x->shape[0], K = x->shape[1];
-    const long long grp = halo_quant_act_fp8_group();
+    /* 128, or IQ8R's 256 for the rotated int8 form. */
+    const long long g0 = halo_quant_act_fp8_group();
+    const long long grp = halo_geti_or(a, "group", g0);
+    const bool wide = hi8 && grp == HALO_I8_GROUP_WIDE;
+    if (grp != g0 && !wide) return HALO_NO(RAD_E_SHAPE);
     const long long nkb = (K + grp - 1) / grp;
-    if (halo_geti_or(a, "group", grp) != grp) return HALO_NO(RAD_E_SHAPE);
     if (halo_numel(w) != K) return HALO_NO(RAD_E_SHAPE);
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
     if (q->shape[0] != M || q->shape[1] != K) return HALO_NO(RAD_E_SHAPE);
@@ -993,7 +1126,8 @@ static int rad_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
                                        (int)M, (int)K,
                                        (float)halo_getf(a, "eps", 1e-6), (float)halo_getf(a, "wadd", 0.0),
                                        w->dtype == RAD_F32, (int)xp, (int)rp, (int)yp, (int)qp,
-                                       (int)sp, (long)(uintptr_t)s, hi8);
+                                       (int)sp, (long)(uintptr_t)s, hi8, wide,
+                                       halo_geti_or(a, "chain", 0) != 0 && M <= 64);   /* decode heights */
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1029,9 +1163,12 @@ static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot, boo
     if (gu->rank != 2 || q->rank != 2 || sc->rank != 2) return HALO_NO(RAD_E_SHAPE);
     if (y && y->rank != 2) return HALO_NO(RAD_E_SHAPE);
     const long long M = gu->shape[0], K = q->shape[1];
-    const long long grp = halo_quant_act_fp8_group();
+    /* 128, or IQ8R's 256 for the rotated int8 form. */
+    const long long g0 = halo_quant_act_fp8_group();
+    const long long grp = halo_geti_or(a, "group", g0);
+    const bool wide = rot && hi8 && grp == HALO_I8_GROUP_WIDE;
+    if (grp != g0 && !wide) return HALO_NO(RAD_E_SHAPE);
     const long long nkb = (K + grp - 1) / grp;
-    if (halo_geti_or(a, "group", grp) != grp) return HALO_NO(RAD_E_SHAPE);
     /* The gated operand is [M][2K], gate then up, as the fused gate_up projection writes it. */
     if (gu->shape[1] != 2 * K) return HALO_NO(RAD_E_SHAPE);
     if (q->shape[0] != M) return HALO_NO(RAD_E_SHAPE);
@@ -1044,7 +1181,8 @@ static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot, boo
     if (mode < 0) return HALO_NO(RAD_E_UNSUPPORTED);
     const int e = gated_quant_fp8_launch(halo_addr(gu), y ? halo_addr(y) : 0, halo_addr(q),
                                          halo_addr(sc), (int)M, (int)K, mode, (int)gp, (int)yp,
-                                         (int)qp, (int)sp, stream, rot, q->dtype == RAD_I8);
+                                         (int)qp, (int)sp, stream, rot, q->dtype == RAD_I8, wide,
+                                         halo_geti_or(a, "chain", 0) != 0 && M <= 64);   /* decode heights */
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1083,7 +1221,7 @@ static long long tq_pitch(const RadTensor* t, long long width) {
 /* Two-operand form of gated_quant_fp8 for gated attention: `x` is the attention output and the
  * gate a column view of the [q|gate] projection. The gate offset comes from the view, so there is
  * no `gate_offset` parameter. */
-extern "C" int halo_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
+static int rad_gate_quant(const RadArgs* a, RadStream stream, bool rot) {
     const RadTensor* g  = halo_opt(a, TQ_G);
     const RadTensor* x  = halo_opt(a, TQ_X);
     const RadTensor* q  = halo_opt(a, TQ_Q);
@@ -1091,15 +1229,19 @@ extern "C" int halo_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
     const RadTensor* y  = halo_opt(a, TQ_Y);
     if (!g || !x || !q || !sc) return HALO_NO(RAD_E_INVAL);
     if (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
+    if (rot && q->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
     /* M is numel(x) / n. The `M` parameter is the band's declared maximum, not this issue's, and
      * shape[0] counts tokens while a row here is a (token, head) pair. */
     const long long K = halo_geti_or(a, "n", 0);
-    const long long grp = halo_quant_act_fp8_group();
+    /* 128, or IQ8R's 256 for the rotated form. */
+    const long long g0 = halo_quant_act_fp8_group();
+    const long long grp = halo_geti_or(a, "group", g0);
+    const bool wide = rot && grp == HALO_I8_GROUP_WIDE;
+    if (grp != g0 && !wide) return HALO_NO(RAD_E_SHAPE);
     if (K <= 0 || halo_numel(x) % K) return HALO_NO(RAD_E_SHAPE);
     const long long M = halo_numel(x) / K;
     if (M <= 0) return HALO_NO(RAD_E_SHAPE);
     const long long nkb = (K + grp - 1) / grp;
-    if (halo_geti_or(a, "group", grp) != grp) return HALO_NO(RAD_E_SHAPE);
     if (halo_numel(g) < M * K) return HALO_NO(RAD_E_SHAPE);
     if (halo_numel(q) < M * K || halo_numel(sc) < M * nkb) return HALO_NO(RAD_E_SHAPE);
     if (y && halo_numel(y) < M * K) return HALO_NO(RAD_E_SHAPE);
@@ -1112,7 +1254,17 @@ extern "C" int halo_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
     const int e = gate_quant_fp8_emit(halo_addr(g), halo_addr(x), y ? halo_addr(y) : 0,
                                       halo_addr(q), halo_addr(sc), (int)M, (int)K, mode,
                                       (int)gp, (int)xp, (int)yp, (int)qp, (int)sp, stream,
-                                      q->dtype == RAD_I8);
+                                      q->dtype == RAD_I8, rot, wide,
+                                      halo_geti_or(a, "chain", 0) != 0 && M <= 64);   /* decode heights */
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int halo_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
+    return rad_gate_quant(a, stream, false);
+}
+
+/* gate_quant_fp8 at had_quant_act_i8g's codes, for an out projection stored rotated (i8a8h). */
+extern "C" int halo_rad_gate_had_quant_i8g(const RadArgs* a, RadStream stream) {
+    return rad_gate_quant(a, stream, true);
 }
 

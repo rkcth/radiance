@@ -51,12 +51,10 @@ const Replaced kReplaced[] = {
 };
 
 /* Flags given more than once on a command line; a YAML sequence repeats them. */
-const char* const kRepeatable[] = {
-    "lora", "allow-host", "trusted-proxy", "image-model-reserve", "device-ordinal",
-};
+const char* const kRepeatable[] = { "lora", "allow-host", "trusted-proxy" };
 
 /* The fleet's own keys on a model. `defaults:` may carry every one but aliases (read_model_keys). */
-const char* const kModelFleetKeys[] = { "aliases", "priority", "pin", "ttl", "flex", "park" };
+const char* const kModelFleetKeys[] = { "aliases", "priority", "pin", "ttl", "flex", "park", "cards" };
 
 const char* const kTopKeys[] = { "server", "cards", "memory", "scheduler", "defaults", "models", "groups" };
 
@@ -311,7 +309,7 @@ private:
         if (level != "server" && (in(kServerKeys, key) || key == "log")) return key + " belongs under server:";
         if (level != "memory" && level != "model" && in(kMemoryFlagKeys, key))
             return key + " belongs under memory: or a model";
-        if (level != "memory" && (key == "host-mib" || key == "disk-tier"))
+        if (level != "memory" && (key == "host-mib" || key == "disk-tier" || key == "card-headroom-mib"))
             return key + " belongs under memory:";
         if (level != "model" && flags_.count(key))
             return key + " is a per-model key; put it under the model or defaults:";
@@ -384,10 +382,27 @@ int Reader::read_memory(const Item& sec, FleetConfig* out) {
             if (int s = scalar_text(it, &out->disk_tier); s < 0) return s;
             continue;
         }
+        if (k == "card-headroom-mib") {
+            if (!it.node.is_map())
+                return fail(it.node, it.path + " takes a map of card ordinal to MiB, as {0: 4096}");
+            std::vector<Item> cards;
+            if (int s = children(it.node, it.path, &cards); s < 0) return s;
+            for (const Item& c : cards) {
+                char* end = nullptr;
+                const long card = std::strtol(c.key.c_str(), &end, 10);
+                if (c.key.empty() || *end || card < 0 || card > 255)
+                    return fail(c.node, c.path + ": a card is named by its ordinal, 0 or above");
+                int64_t mib = 0;
+                if (int s = integer(c, 0, INT64_MAX / (1 << 20), &mib); s < 0) return s;
+                out->card_headroom_mib[(int)card] = mib;
+            }
+            continue;
+        }
         if (!in(kMemoryFlagKeys, k)) {
             std::vector<std::string> valid = as_vector(kMemoryFlagKeys);
             valid.push_back("host-mib");
             valid.push_back("disk-tier");
+            valid.push_back("card-headroom-mib");
             return refuse_key(it, "memory", "memory", valid);
         }
         if (int s = flag_args(it, &memory_args_); s < 0) return s;
@@ -468,6 +483,9 @@ int Reader::read_model_keys(const Item& sec, bool is_defaults, std::vector<Item>
         const std::string& k = it.key;
         if (in(kModelFleetKeys, k)) {
             if (is_defaults && k == "aliases") return fail(it.node, "aliases name one model; they cannot be a default");
+            if (is_defaults && k == "cards")
+                return fail(it.node, "cards under defaults would pin every model; the top-level "
+                                     "cards: names the cards the fleet uses");
             continue;
         }
         std::string m = misplaced(k, "model");
@@ -497,6 +515,20 @@ int Reader::read_fleet_key(const Item& it, ModelEntry* e) {
         return RAD_OK;
     }
     if (k == "pin") return boolean(it, &e->pin);
+    if (k == "cards") {
+        e->cards.clear();
+        if (scalar(it.node) && str(it.node.val()) == "all") return RAD_OK;
+        if (!it.node.is_seq() || it.node.num_children() == 0)
+            return fail(it.node, it.path + " takes all or a list of card indices");
+        for (Node c : it.node.children()) {
+            int64_t idx = 0;
+            if (int s = integer({ c, it.path, "cards" }, 0, 63, &idx); s < 0) return s;
+            if (std::find(e->cards.begin(), e->cards.end(), (int)idx) != e->cards.end())
+                return fail(c, "card " + std::to_string(idx) + " is listed twice");
+            e->cards.push_back((int)idx);
+        }
+        return RAD_OK;
+    }
     if (k == "ttl") return duration(it, &e->ttl_ms);
     if (k == "flex") {
         std::vector<Item> parts;
@@ -692,6 +724,20 @@ int Reader::run(FleetConfig* out) {
         out->models.push_back(std::move(e));
     }
 
+    /* A model's own cards are among the fleet's and are enough for its ranks. */
+    for (const ModelEntry& e : out->models) {
+        if (e.cards.empty()) continue;
+        for (int c : e.cards)
+            if (!out->cards.empty() &&
+                std::find(out->cards.begin(), out->cards.end(), c) == out->cards.end())
+                return fail(doc, "models." + e.name + ".cards lists " + std::to_string(c) +
+                                 ", which the top-level cards: leaves out");
+        if (std::max(e.cfg.tp, 1) > (int)e.cards.size())
+            return fail(doc, "models." + e.name + ": tp " + std::to_string(std::max(e.cfg.tp, 1)) +
+                             " needs that many cards and its cards: lists " +
+                             std::to_string(e.cards.size()));
+    }
+
     std::map<std::pair<std::string, std::string>, Group::Kind> pairs;
     for (const Group& g : out->groups) {
         for (const std::string& m : g.members)
@@ -846,6 +892,7 @@ void print_reference(FILE* to) {
         "    aliases: [NAME, ...]               more ids for this model\n"
         "    priority: N                        higher keeps VRAM and takes flex from lower\n"
         "    pin: true|false                    never leaves VRAM\n"
+        "    cards: all | [N, ...]              the cards this model may be placed on (all)\n"
         "    ttl: DURATION                      park after this long without requests\n"
         "    flex: {kv: {min-tokens, max-tokens, weight}, experts: {min-mib, max-mib}}\n"
         "    park: {vram: none|statics|MIB, ram: required|allowed|never, restore: auto|full|live}\n");
@@ -954,7 +1001,19 @@ std::string yaml_from_args(int argc, char** argv) {
                 y += std::string(indent) + e.key + ": " + rad::Json::parse(e.vals[0]).dump() + "\n";
                 continue;
             }
-            if (e.vals.size() == 1) { y += std::string(indent) + e.key + ": " + yaml_scalar(e.vals[0]) + "\n"; continue; }
+            if (e.vals.size() == 1) {
+                y += std::string(indent) + e.key + ": " + yaml_scalar(e.vals[0]);
+                /* A value an earlier release took and this one refuses is written as given, so
+                 * the file says what the command line said, with what replaces it beside it. */
+                if (e.key == "kv-cache-dtype") {
+                    if (e.vals[0] == "fp8_v4" || e.vals[0] == "k6_v4")
+                        y += "   # not served: i8 is the 8-bit cache, bf16 the other";
+                    else if (e.vals[0] == "fp8")
+                        y += "   # served for few models: i8 is the 8-bit cache of the others";
+                }
+                y += "\n";
+                continue;
+            }
             y += std::string(indent) + e.key + ":\n";
             for (const std::string& v : e.vals) y += std::string(indent) + "  - " + yaml_scalar(v) + "\n";
         }

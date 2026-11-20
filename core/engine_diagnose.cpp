@@ -653,18 +653,20 @@ int Engine::run_diagnose() {
 
     bool parity_ok = true;
     if (!cfg_.diagnose_baseline.empty()) {
-        /* A baseline is a report written by another run -- often on another machine, pasted
-         * between people: read it like a supplied file (capped read, bounded parse), and treat
-         * structure the comparison does not expect as a refusal, not as a crash. compare_outputs
-         * reads its baseline with throwing accessors, and nothing between here and main catches:
-         * a structurally hostile baseline used to abort a run that had already done its work. */
+        /* A baseline is a report another run wrote, possibly on another machine: it is read as
+         * a supplied file (a capped read and a bounded parse), and a baseline that is not shaped
+         * like a report is a refusal of the comparison, said in the report, with the run's own
+         * measurements kept. */
         std::string why;
         json cmp;
         std::string base_text;
-        const json base = read_text_file(cfg_.diagnose_baseline, base_text, kMaxContainerFile) == RAD_OK
-                              ? json::parse_container(base_text)
-                              : json();
-        if (base.is_discarded()) {
+        bool over = false, deep = false;
+        const bool base_read =
+            read_text_file(cfg_.diagnose_baseline, base_text, kMaxContainerFile) == RAD_OK;
+        const json base = base_read ? json::parse_container(base_text, &over, &deep) : json();
+        if (!base_read) {
+            why = "the baseline file cannot be read";
+        } else if (over || deep || base.is_discarded()) {
             why = "the baseline file is not readable JSON";
         } else {
             int cmp_rc = RAD_E_FORMAT;

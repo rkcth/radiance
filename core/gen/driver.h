@@ -64,7 +64,7 @@ public:
     /* A decode pass's pixels: `image_out` into the pinned image buffer. */
     const std::vector<Readback>& readbacks() const override { return rb_; }
     int  done() override;
-    bool busy() const override;
+    bool busy() const;
 
     int64_t queued() const override;
     int64_t running() const override;

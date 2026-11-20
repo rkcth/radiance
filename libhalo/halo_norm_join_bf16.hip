@@ -28,6 +28,8 @@
  * the bf16-rounded norm, a scale of amax * (1 / 448) per 128 columns (1 for an all-zero group),
  * value times reciprocal clamped to +-448, one v_cvt_pk_fp8_f32. Element i is thread i % 256 at
  * slot i / 256, so a group is four waves at one slot: a wave max, then the four.
+ * norm_add_norm_route_i8g writes the experts' input as rmsnorm_had_quant_i8g does instead: int8
+ * codes of the bf16-rounded norm rotated by a 128-wide Hadamard, a scale of amax * (1 / 127).
  *
  * One 256-thread block per row: a decode step is a handful of rows, so the row is latency bound
  * and three block reductions beat seven launches. Values a later stage reuses stay in registers
@@ -45,6 +47,7 @@
 #include "halo_plugin.h"
 #include "halo_fp8_wmma.h"   // halo_fp8::cvt_pk_fp8_f32 (no fp8-conversion-insts on gfx1151)
 #include "halo_launch.h"
+#include "halo_q8.h"       // norm_add_norm_route_i8g's rotated int8 codes
 #include "rad_plugin.h"
 
 namespace halo_join {
@@ -117,11 +120,15 @@ struct NormArgs {
 };
 
 /* t = norm(a) * w_a;  x += t;  y = norm(x) * w_y -- and with ROUTE, from the same norm of x, the
- * router's input norm(x) * w_r * mult and the experts' norm(x) * w_e as E4M3 codes and scales */
-template <int PER, bool ROUTE>
+ * router's input norm(x) * w_r * mult and the experts' norm(x) * w_e as codes and scales: E4M3
+ * (ROUTE 1), or at ROUTE 2 had_quant_act_i8g's rotated int8. The rotation's butterfly wants a
+ * group in one wave, four columns a lane, where this kernel holds a column a thread, so the
+ * experts' bf16 row goes through LDS to that mapping (halo_q8.h, q8_row_had_i8g). */
+template <int PER, int ROUTE>
 __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
     __shared__ float lds[kWaves];
-    __shared__ float gmax[ROUTE ? PER * kWaves : 1];
+    __shared__ float gmax[ROUTE == 1 ? PER * kWaves : 1];
+    __shared__ uint16_t erow[ROUTE == 2 ? PER * kThreads : 1];
     const int tid = (int)threadIdx.x, n = A.n;
     const long long m = (long long)blockIdx.x;
     const uint16_t* ar = A.a + m * A.a_ld;
@@ -167,13 +174,20 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
             yr[i] = f2bf((xv[k] * sx) * wy[k]);
             if constexpr (ROUTE) {
                 rr[i] = f2bf(((xv[k] * sx) * wr[k]) * A.mult);
-                av[k] = rbf((xv[k] * sx) * we[k]);   /* the experts' row, as quantised */
+                const uint16_t he = f2bf((xv[k] * sx) * we[k]);
+                av[k] = bf2f(he);                    /* the experts' row, as quantised */
+                if constexpr (ROUTE == 2) erow[i] = he;
             }
         } else if constexpr (ROUTE) {
             av[k] = 0.0f;
         }
     }
-    if constexpr (ROUTE) {
+    if constexpr (ROUTE == 2) {
+        __syncthreads();
+        q8_row_had_i8g<kThreads>(erow, (signed char*)(A.q + m * A.q_ld), A.qs + m * A.qs_ld,
+                                 (uint32_t)n);
+    }
+    if constexpr (ROUTE == 1) {
         /* group 2k + tid / 128 at slot k is waves 0..3 or 4..7: each wave's max, then its four */
         const int wave = tid >> 5, half = tid >> 7;
 #pragma unroll
@@ -329,16 +343,19 @@ int halo_rad_norm_add_norm_bf16(const RadArgs* a, RadStream stream) {
     P.w0 = (const float*)Wa->data;   P.w1 = (const float*)Wy->data;
     P.n = (int)n; P.eps = eps;
     if (n <= (int64_t)kThreads * 12)
-        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<12, false>), dim3((unsigned)M), dim3(kThreads),
+        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<12, 0>), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
     else
-        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<kMaxPer, false>), dim3((unsigned)M),
+        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<kMaxPer, 0>), dim3((unsigned)M),
                    dim3(kThreads), (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* operands: a, w_a, x (inout), w_y, y, w_r, r, w_e, q, qs */
-int halo_rad_norm_add_norm_route_bf16(const RadArgs* a, RadStream stream) {
+}  /* extern "C" */
+
+/* operands: a, w_a, x (inout), w_y, y, w_r, r, w_e, q, qs; `i8` is norm_add_norm_route_i8g, whose
+ * q is int8 */
+static int norm_add_norm_route(const RadArgs* a, RadStream stream, bool i8) {
     using namespace halo_join;
     if (!a || a->n_t < 10) return RAD_E_INVAL;
     int64_t n = 0;
@@ -354,7 +371,7 @@ int halo_rad_norm_add_norm_route_bf16(const RadArgs* a, RadStream stream) {
     int64_t ra = 0, la = 0, rx = 0, lx = 0, ry = 0, ly = 0, rr = 0, lr = 0, rq = 0, lq = 0,
             rs = 0, ls = 0;
     if (!rows_of(A_, n, &ra, &la) || !rows_of(X, n, &rx, &lx) || !rows_of(Y, n, &ry, &ly) ||
-        !rows_of(R, n, &rr, &lr) || !rows_as(Q, RAD_F8E4M3, n, &rq, &lq) ||
+        !rows_of(R, n, &rr, &lr) || !rows_as(Q, i8 ? RAD_I8 : RAD_F8E4M3, n, &rq, &lq) ||
         !rows_as(S, RAD_F32, n / 128, &rs, &ls))
         return RAD_E_SHAPE;
     const int64_t M = rx;                            /* the step's rows: the stream's view */
@@ -371,13 +388,29 @@ int halo_rad_norm_add_norm_route_bf16(const RadArgs* a, RadStream stream) {
     P.w2 = (const float*)Wr->data;   P.w3 = (const float*)We->data;
     P.mult = (float)rad_args_getf_or(a, "mult", 1.0);
     P.n = (int)n; P.eps = eps;
-    if (n <= (int64_t)kThreads * 12)
-        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<12, true>), dim3((unsigned)M), dim3(kThreads),
+    const bool narrow = n <= (int64_t)kThreads * 12;
+    if (narrow && i8)
+        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<12, 2>), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
+    else if (narrow)
+        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<12, 1>), dim3((unsigned)M), dim3(kThreads),
+                   (hipStream_t)stream, P);
+    else if (i8)
+        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<kMaxPer, 2>), dim3((unsigned)M),
+                   dim3(kThreads), (hipStream_t)stream, P);
     else
-        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<kMaxPer, true>), dim3((unsigned)M),
+        HALO_KLAUNCH(HALO_KNAME(norm_add_norm_kernel<kMaxPer, 1>), dim3((unsigned)M),
                    dim3(kThreads), (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" {
+
+int halo_rad_norm_add_norm_route_bf16(const RadArgs* a, RadStream stream) {
+    return norm_add_norm_route(a, stream, false);
+}
+int halo_rad_norm_add_norm_route_i8g_bf16(const RadArgs* a, RadStream stream) {
+    return norm_add_norm_route(a, stream, true);
 }
 
 /* operands: d, w_d, r, w_r, w_j, x (inout), s, w_n?, y? -- the last two both or neither */

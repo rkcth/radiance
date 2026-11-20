@@ -501,7 +501,24 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
      * after the step's (`tok` reaches A tokens past the step); the window left behind is the
      * step's alone. */
     const int64_t A = P > 0 ? ahead_rows(batch) : 0;
-    if (P > 0)
+    /* A checkpoint inside the step (RadBatch::ckpt_cut): the rows before it, the window's
+     * snapshot, then the rest with the ahead rows, each as a chunk of those rows hashes them. */
+    const int64_t ck = batch->ckpt_cut;
+    if (P == 1 && D == 0 && ck > 0 && ck < T && batch->ckpt_cu) {
+        for (int64_t p = 0; p < 2; ++p) {
+            const int64_t r0 = p == 0 ? 0 : ck, n = p == 0 ? ck : T - ck;
+            RAD_ISSUE_N(c_, op_ids, n,
+                        praw(batch->token_ids, RAD_I32, T + A), kv_cache(kv_tok, layer_),
+                        praw(batch->ckpt_cu + p, RAD_I32, 2),
+                        RAD_W(w_mult), RAD_W(w_vsz), RAD_W(w_off),
+                        praw(tk_idx, RAD_I32, 1),
+                        praw(p == 0 ? batch->ctx_lens : batch->positions + r0, RAD_I32, 1),
+                        RAD_NONE,
+                        brows(b_ids, T),
+                        p == 1 && A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
+            if (p == 0) rad_ckpt_snap(c_, kv_tok, layer_);
+        }
+    } else if (P > 0)
         RAD_ISSUE_N(c_, op_ids, T,
                     praw(batch->token_ids, RAD_I32, T + A), kv_cache(kv_tok, layer_),
                     praw(batch->cu_seqlens + D, RAD_I32, P + 1),
@@ -577,7 +594,21 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                     praw(batch->ctx_lens, RAD_I32, D),
                     praw(batch->num_accepted, RAD_I32, D),
                     brows(b_out, DT));
-    if (P > 0)
+    const int64_t ck = batch->ckpt_cut;
+    if (P == 1 && D == 0 && ck > 0 && ck < T && batch->ckpt_cu) {
+        /* A checkpoint inside the step: the window over the rows before it, its snapshot, then
+         * the rest (as ids()). */
+        for (int64_t p = 0; p < 2; ++p) {
+            RAD_ISSUE_N(c_, op_conv, p == 0 ? ck : T - ck,
+                        brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
+                        praw(batch->ckpt_cu + p, RAD_I32, 2), brows(b_gv, T),
+                        praw(cv_idx, RAD_I32, 1),
+                        praw(p == 0 ? batch->ctx_lens : batch->positions + ck, RAD_I32, 1),
+                        RAD_NONE,
+                        brows(b_out, T));
+            if (p == 0) rad_ckpt_snap(c_, kv_conv, layer_);
+        }
+    } else if (P > 0)
         RAD_ISSUE_N(c_, op_conv, T,
                     brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
                     praw(batch->cu_seqlens + D, RAD_I32, P + 1), brows(b_gv, T),

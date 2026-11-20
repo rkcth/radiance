@@ -158,6 +158,7 @@ private:
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
     Counter c_draft_refills_, c_draft_refill_tokens_;
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
+    Counter c_suffix_steps_, c_suffix_rows_, c_suffix_accepted_, c_suffix_held_ahead_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_queries_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;

@@ -1976,11 +1976,6 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
                        OaiRequest* out, ApiError* err) {
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
-    return parse_chat_object(std::move(b), d, lim, out, err);
-}
-
-int parse_chat_object(json b, const OaiDeps& d, const OaiLimits& lim,
-                      OaiRequest* out, ApiError* err) {
     RAD_TRY(vet_keys(b, Endpoint::Chat, err));
 
     out->endpoint = Endpoint::Chat;
@@ -2383,11 +2378,6 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
                              OaiRequest* out, ApiError* err, bool native) {
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
-    return parse_completion_object(b, d, lim, out, err, native);
-}
-
-int parse_completion_object(const json& b, const OaiDeps& d, const OaiLimits& lim,
-                            OaiRequest* out, ApiError* err, bool native) {
     RAD_TRY(vet_keys(b, Endpoint::Completion, err, native));
     if (native && !get_bool(b, "return_tokens", &out->return_tokens, err)) return RAD_E_INVAL;
 

@@ -114,6 +114,10 @@
 // int6 K one).
 #define O_V4    33554432
 #define O_K6    67108864
+// O_I8 (with O_V4 | O_K6): the int8 cache (see halo_attn_decode_h256_gqa6.hip).
+#define O_I8    1073741824
+// The int8 cache's bits together, for a launcher's option set.
+#define O_KVI8  (O_V4 | O_K6 | O_I8)
 
 // One f32 through an e4m3 round trip: the value an e4m3 code holds after pk_fp8x4's rounding.
 __device__ __forceinline__ float halo_e4m3_rt(float x) {
@@ -253,11 +257,14 @@ void halo_attn_prefill_kernel(const HaloArgs a)
     constexpr int BTS   = (OPT & O_BTS)   ? 1 : 0;
     constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
     constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    constexpr int I8    = ((OPT & O_I8) && K6) ? 1 : 0;
+    static_assert(!I8 || !(OPT & (O_QK8 | O_PV8)), "the i8 cache has no e4m3 legs");
     // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
-    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
-    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
-    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
-    constexpr int KSOFF = HEAD_DIM * 5 / 4;
+    constexpr int ROWB  = I8 ? 2 * HEAD_DIM + 4
+                        : K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int VOFF  = I8 ? HEAD_DIM : K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
+    constexpr int VSOFF = I8 ? 2 * HEAD_DIM + 2 : K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = I8 ? 2 * HEAD_DIM : HEAD_DIM * 5 / 4;
     constexpr int GPREV = (OPT & O_GPREV) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
@@ -297,7 +304,7 @@ void halo_attn_prefill_kernel(const HaloArgs a)
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = PV8 ? 8.0f : D::GROW;   // e4m3 max is 448 = 2^8.8
     static_assert(!KWIDE || KPASS == 1, "the wide K fetch is one straight-line pass");
-    static_assert(!K6 || KWIDE, "k6_v4 K is staged sixteen dims a thread");
+    static_assert(!K6 || I8 || KWIDE, "k6_v4 K is staged sixteen dims a thread");
 
     __shared__ __align__(16) uint16_t sK[TILE * KSTR];
     __shared__ __align__(16) uint16_t sV16[HEAD_DIM * VSTR];
@@ -417,6 +424,8 @@ void halo_attn_prefill_kernel(const HaloArgs a)
     // The split lets GPREV move the fetch out from between the barriers.
     const int vg = lane >> 3, vj = lane & 7;
     uint4 kreg[KREGS], vreg[VREGS];
+    // i8: the K scale of the key a pass stages.
+    uint32_t ksc8[I8 ? KPASS : 1];
 
     // ---- fp8_v4 / k6_v4: V is int4 in groups of 32 with an f16 scale (absmax / 7): 16 bytes of
     // codes a group at VOFF (dim d at bits 4*(d%8) of word d/8), the group scales at VSOFF. A thread
@@ -430,7 +439,9 @@ void halo_attn_prefill_kernel(const HaloArgs a)
     constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
     // The pair's two scales stay apart until storeV4 packs them: packed here, the prefetch a tile
     // ahead would be waited on right after it is issued (fp8_v4 packs here, see KLATE).
-    uint32_t v4c[U4][2], v4s[U4][2];
+    // i8: V's codes are bytes, two words a key's 8 dims, and a key has one scale; the rest is the
+    // same with u = code ^ 0x80 and (x - 1152) * s.
+    uint32_t v4c[U4][I8 ? 4 : 2], v4s[U4][2];
     auto fetchV4 = [&](int k0, const int* blks) {
         #pragma unroll
         for (int r = 0; r < U4; ++r) {
@@ -444,8 +455,15 @@ void halo_attn_prefill_kernel(const HaloArgs a)
                     const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
                                         + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
-                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
-                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                    if constexpr (I8) {
+                        const uint2 cw = *(const uint2*)(base + VOFF + o * 8);
+                        v4c[r][2 * j]     = cw.x;
+                        v4c[r][2 * j + 1] = cw.y;
+                        sc[j]             = *(const uint16_t*)(base + VSOFF);
+                    } else {
+                        v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
+                        sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                    }
                 }
                 if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
                 else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
@@ -459,13 +477,18 @@ void halo_attn_prefill_kernel(const HaloArgs a)
             const int u = tid + r * NTHR;
             if (NP4 % NTHR == 0 || u < NP4) {
                 const int kp = u % (TILE / 2), o = u / (TILE / 2);
-                // Codes are two's complement nibbles; ^ 8 makes them offset binary (value + 8).
-                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                // Codes are two's complement nibbles; ^ 8 makes them offset binary (value + 8). i8:
+                // bytes, ^ 0x80; `n` is a key's dims 0-3 of the octet and `m` its dims 4-7.
+                const uint32_t n0 = I8 ? v4c[r][0] ^ 0x80808080u
+                                       : (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m0 = I8 ? v4c[r][1] ^ 0x80808080u
+                                       : ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t n1 = I8 ? v4c[r][I8 ? 2 : 1] ^ 0x80808080u
+                                       : (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m1 = I8 ? v4c[r][I8 ? 3 : 1] ^ 0x80808080u
+                                       : ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
-                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+                const h2 bias = { (_Float16)(I8 ? 1152.0f : 1032.0f), (_Float16)(I8 ? 1152.0f : 1032.0f) };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
                 #pragma unroll
                 for (int b = 0; b < 4; ++b) {
@@ -484,8 +507,9 @@ void halo_attn_prefill_kernel(const HaloArgs a)
                         *(uint32_t*)(dst + (2 * b + 1) * VSTR) =
                             D::pk(halo_e4m3_rt((float)vh[0]), halo_e4m3_rt((float)vh[1]));
                     } else {
-                        *(uint32_t*)(dst + (2 * b) * VSTR)     = __builtin_bit_cast(uint32_t, vl);
-                        *(uint32_t*)(dst + (2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
+                        // The octet's rows: nibbles interleave the dims (2b, 2b+1), bytes run b, 4+b.
+                        *(uint32_t*)(dst + (I8 ? b : 2 * b) * VSTR)         = __builtin_bit_cast(uint32_t, vl);
+                        *(uint32_t*)(dst + (I8 ? 4 + b : 2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
                     }
                 }
             }
@@ -509,6 +533,17 @@ void halo_attn_prefill_kernel(const HaloArgs a)
                     #pragma unroll
                     for (int q = 0; q < (KVP ? (KEL / 8) : 1); ++q)
                         kreg[p * (KEL / 8) + q] = *(const uint4*)(g + 8 * q);
+                } else if (I8) {
+                    // i8: the chunk's codes (sixteen, or eight without the wide fetch) and the
+                    // key's scale.
+                    const uint8_t* rp = (const uint8_t*)a.kv + o;
+                    if constexpr (KWIDE) {
+                        kreg[p] = *(const uint4*)(rp + ch * 16);
+                    } else {
+                        const uint2 r = *(const uint2*)(rp + ch * 8);
+                        kreg[p] = make_uint4(r.x, r.y, 0, 0);
+                    }
+                    ksc8[p] = *(const uint16_t*)(rp + KSOFF);
                 } else if (K6) {
                     // k6_v4: the chunk's sixteen low nibbles, its high-bit word, its group's scale.
                     const uint8_t* rp = (const uint8_t*)a.kv + o;
@@ -563,7 +598,10 @@ void halo_attn_prefill_kernel(const HaloArgs a)
                         w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
                     } else {
                         const uint4 r = kreg[p];
-                        if constexpr (K6) {
+                        if constexpr (I8) {
+                            i8x8_to_f16x4w(q ? make_uint2(r.z, r.w) : make_uint2(r.x, r.y),
+                                           ksc8[p] | (ksc8[p] << 16), w4);
+                        } else if constexpr (K6) {
                             k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
                             // QK8 over k6_v4: the byte staging rounds the widened int6 to e4m3
                             if constexpr (QK8) halo_e4m3_rt4<D>(w4);

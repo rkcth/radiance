@@ -264,7 +264,10 @@ enum {
     R4D_DT_MOEW5      = RAD_DT_PLUGIN_BASE + 8,
     /* The M2XFP4 GEMMs' stored weight: R4D_DT_MXFP4_FRAG's fragment-order e2m1 codes, then the
      * [K/32][N] meta plane the kernel reads beside the E8M0 exponents (r4d_layout.cpp, m2xfp4). */
-    R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9
+    R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9,
+    /* Six-bit expert codes: row-major permuted low nibbles followed by the transposed fifth
+     * magnitude bit and sign bit, one dword per 32 elements in each bit plane. */
+    R4D_DT_MOEW6      = RAD_DT_PLUGIN_BASE + 10
 };
 
 /* The grouped MoE GEMM's code tables, as the four dwords w4_e4m3's byte permutes read
@@ -307,12 +310,26 @@ static constexpr float kW5nlTable[32] = {
     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
     -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f };
 
-/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`: it multiplies a
- * weight's per-(row, 64 or 32 of K) E4M3 scale. A container states it (libquant's scale2_value=),
- * and the layout hook compares it with this before serving. Fixed rather than per row because the
- * experts' scales (with the rotation's 1/128 folded in) lie between 2^-15 and 2^-10.6 on
- * Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl). Under
- * 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
+/* W6NL's 32 E4M3-exact positive magnitudes, ordered by the low five code bits; bit 5 is sign.
+ * The first and second 16 magnitudes are each expanded by w4_expand, then selected by bit 4. */
+static constexpr uint32_t kW6nlMagPerm[8] = { 0x4C494336u, 0x504F4E4Du, 0x54535251u, 0x58575655u,
+                                              0x5C5B5A59u, 0x605F5E5Du, 0x64636261u, 0x68676665u };
+static constexpr float kW6nlTable[64] = {
+    0.875f, 2.75f, 4.5f, 6.0f, 6.5f, 7.0f, 7.5f, 8.0f,
+    9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f,
+    18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f,
+    36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f, 64.0f,
+    -0.875f, -2.75f, -4.5f, -6.0f, -6.5f, -7.0f, -7.5f, -8.0f,
+    -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f, -16.0f,
+    -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f, -32.0f,
+    -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f, -64.0f };
+
+/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h` and `w6nl64a8h`: it
+ * multiplies a weight's per-(row, 64 or 32 of K) E4M3 scale. A container states it (libquant's
+ * scale2_value=), and the layout hook compares it with this before serving. Fixed rather than per
+ * row because the experts' scales (with the rotation's 1/128 folded in) lie between 2^-15 and
+ * 2^-10.6 on Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl).
+ * Under 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
 static constexpr float kW4G64Scale = 0x1p-13f;
 
 

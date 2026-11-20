@@ -21,6 +21,15 @@ int rad_ref_mtp_couple_verify(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* The traversal walk, one request at a time: the definition the device kernel runs per root. */
+int rad_ref_mtp_trav_verify(const RadArgs* a, RadStream) {
+    RadMtpTravCall c{};
+    const int rc = rad_mtp_trav_verify_args(a, &c);
+    if (rc != RAD_OK) return rc;
+    for (int64_t row = 0; row < c.v.M; ++row) rad_mtp_trav_verify_root(c, row);
+    return RAD_OK;
+}
+
 /* One sequence at a time through rad_dflash_couple_walk, the definition the device kernel matches
  * bit for bit. */
 int rad_ref_dflash_couple(const RadArgs* a, RadStream) {

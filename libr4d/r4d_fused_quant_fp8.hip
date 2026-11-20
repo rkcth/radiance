@@ -250,7 +250,7 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(R4D_RQ_PARAMS) {
 }
 template <bool WF32, bool RES, uint32_t THR, bool HI8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(THR) void r4dchain_rmsnorm_quant(R4D_RQ_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     rmsnorm_quant_fp8_body<WF32, RES, THR, HI8, SUB>(R4D_RQ_ARGS);
     r4d_chain_done();
 }
@@ -319,7 +319,7 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(R4D_GQ_PARAMS) {
 }
 template <int ACT, bool ROT = false, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(1024) void r4dchain_gated_quant(R4D_GQ_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     gated_quant_fp8_body<ACT, ROT, I8, SUB>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld);
     r4d_chain_done();
 }
@@ -403,7 +403,7 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(R4D_GTQ_PARAMS) {
 }
 template <int ACT, bool I8 = false, bool ROT = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(1024) void r4dchain_gate_quant(R4D_GTQ_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     gate_quant_fp8_body<ACT, I8, ROT, SUB>(g, x, y, q, s, n, nkb, g_ld, x_ld, y_ld, q_ld, s_ld);
     r4d_chain_done();
 }

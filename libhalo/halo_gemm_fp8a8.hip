@@ -16,6 +16,7 @@
  * narrow row declares is not used and its size query answers 0. libr4d splits over the caller's
  * scratch instead; the summation order is fixed either way, and a run repeats exactly.
  */
+#include "halo_chain.h"
 #include "halo.h"
 #include "halo_launch.h"   // HALO_DYN_LDS: tests/halo_emu runs this unit on the host
 #include "halo_fp8_args.h"
@@ -25,6 +26,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 
 typedef int int4v __attribute__((ext_vector_type(4)));
 using halo::deq16_e4m3;
@@ -707,12 +709,18 @@ int halo_gemm_fp8a8_block(void) { return 128; }
  * per 128-wide group. The
  * weight scale is tile-major ([N/16][K/128][16], halo_fp8_layout.cpp's i8 hooks), so a lane's
  * scale is one bf16 at its column; the activation scale is per (row, group) and folds per
- * accumulator slot, exactly as in the fp8 kernel above. */
+ * accumulator slot, exactly as in the fp8 kernel above.
+ *
+ * SB is the scale group along K: 128, or 256 for IQ8R (gemm_iq8r_nt_m16), where both scales are
+ * per 256 of K ([N/16][K/256][16] and [M][K/256]) and the int32 sums run over two 128-K units
+ * before their one fold, as libr4d's SB 256 tile folds once a 256-byte staged tile. */
 typedef int v4i_ __attribute__((ext_vector_type(4)));
 typedef int v8i_ __attribute__((ext_vector_type(8)));
 
-template <int MT, int BW = 16>
-__global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
+/* The body of halo_gemm_i8a8_kernel; its lanes return early, so the chained form (CH r4dchain:
+ * gemm_i8a8_nt_m16 and gemm_iq8r_nt_m16 at `chain`) brackets the call instead (halo_chain.h). */
+template <int MT, int BW, int SB>
+__device__ __forceinline__ void halo_gemm_i8a8_body(
         const uint8_t* __restrict__ A, const float* __restrict__ Ascale,
         const uint8_t* __restrict__ W, const uint16_t* __restrict__ Ws,
         __hip_bfloat16* __restrict__ C,
@@ -726,8 +734,9 @@ __global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
     const bool nlive = n < N;
     const int ns = nlive ? n : 0;
 
+    constexpr int UG = SB / 128;                       // 128-K units a scale group
     const int Kb = K / SK, kbase = ks * Kb;
-    const int ngroups = Kb / 128, nkb = K / 128;
+    const int ngroups = Kb / 128, nkb = K / SB;
     const float wsc0 = nlive ? 1.0f : 0.0f;
 
     const uint8_t* Ap[MT];
@@ -752,7 +761,7 @@ __global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
      * registers would cost them occupancy. */
     struct Grp { uint4 lo2[4], hi2[4], av[8]; float wsc, asc[8]; };
     auto load = [&](Grp& q, int g) {
-        const int k0 = g * 128, gabs = kbase / 128 + g;
+        const int k0 = g * 128, gabs = (kbase / 128 + g) / UG;
         q.wsc = wsc0 * __uint_as_float(
             (uint32_t)Ws[((size_t)(ns >> 4) * nkb + gabs) * 16 + slot] << 16);
 #pragma unroll
@@ -775,10 +784,10 @@ __global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
     };
     Grp cur, nxt;
     load(cur, 0);
+    v8i_ tmp = (v8i_)0;
     for (int g = 0; g < ngroups; ++g) {
         /* Unconditional (the last group reloads itself), so the waitcnt pass can count them. */
         load(nxt, g + 1 < ngroups ? g + 1 : g);
-        v8i_ tmp = (v8i_)0;
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const uint4 l = cur.lo2[u >> 1], h = cur.hi2[u >> 1];
@@ -789,22 +798,23 @@ __global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
             af[2] = (int)cur.av[u].z; af[3] = (int)cur.av[u].w;
             tmp = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af, true, bf, tmp, false);
         }
+        if (UG == 1 || (g % UG) == UG - 1) {
 #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const float sc = cur.asc[e] * cur.wsc;
-            acc[0][e] = fmaf((float)tmp[e], sc, acc[0][e]);
+            for (int e = 0; e < 8; ++e) {
+                const float sc = cur.asc[e] * cur.wsc;
+                acc[0][e] = fmaf((float)tmp[e], sc, acc[0][e]);
+            }
+            tmp = (v8i_)0;
         }
         cur = nxt;
     }
     } else {
+    v8i_ tmp[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) tmp[t] = (v8i_)0;
     for (int g = 0; g < ngroups; ++g) {
         const int k0 = g * 128;
-        const int gabs = kbase / 128 + g;
-        const float wsc = wsc0 * __uint_as_float(
-            (uint32_t)Ws[((size_t)(ns >> 4) * nkb + gabs) * 16 + slot] << 16);
-        v8i_ tmp[MT];
-#pragma unroll
-        for (int t = 0; t < MT; ++t) tmp[t] = (v8i_)0;
+        const int gabs = (kbase / 128 + g) / UG;
         /* A lane's fragments of one 64-wide chunk are two contiguous 32-byte runs (low and high
          * halves, 512 bytes apart): four 16-byte loads serve the chunk's four k steps. */
         uint4 lo2[4], hi2[4];
@@ -836,8 +846,11 @@ __global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
                 tmp[t] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af, true, bf, tmp[t], false);
             }
         }
+        if (UG > 1 && (g % UG) != UG - 1) continue;
+        const float wsc = wsc0 * __uint_as_float(
+            (uint32_t)Ws[((size_t)(ns >> 4) * nkb + gabs) * 16 + slot] << 16);
 #pragma unroll
-        for (int t = 0; t < MT; ++t)
+        for (int t = 0; t < MT; ++t) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 int mr = blockIdx.y * (MT * 16) + t * 16 + 2 * e + (lane >> 4);
@@ -845,6 +858,8 @@ __global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
                 const float sc = Ascale[(size_t)mr * sa_ld + gabs] * wsc;
                 acc[t][e] = fmaf((float)tmp[t][e], sc, acc[t][e]);
             }
+            tmp[t] = (v8i_)0;
+        }
     }
 
     }
@@ -877,10 +892,249 @@ __global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
         }
 }
 
-template <int MT>
+template <int MT, int BW = 16, int SB = 128, class CH = HaloUnchained>
+__global__ __launch_bounds__(BW * 32) void halo_gemm_i8a8_kernel(
+        const uint8_t* __restrict__ A, const float* __restrict__ Ascale,
+        const uint8_t* __restrict__ W, const uint16_t* __restrict__ Ws,
+        __hip_bfloat16* __restrict__ C,
+        int M, int K, int N, int a_ld, int sa_ld, int c_ld, int SK) {
+    if constexpr (CH::on) halo_chain_wait();
+    halo_gemm_i8a8_body<MT, BW, SB>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, SK);
+    if constexpr (CH::on) halo_chain_done();
+}
+
+/* ---- the int8 GEMV (gemm_i8a8_nt_m16 / gemm_iq8r_nt_m16 at M <= I8V_MAX_M) -------------------
+ *
+ * At a few rows the WMMA tile above wastes half of what a wave holds: the B fragment's two halves
+ * of the wave carry the same sixteen bytes, and the activation fragment is fifteen copies of one
+ * row. Here every lane loads its own bytes. A wave owns one 16-column tile over a K range (its
+ * split): lane (c = lane & 15, p = lane >> 4) reads, from each 64-K chunk of the fragment-order
+ * weight, the 16 bytes of column c's low run at 16 p and the 16 of its high run at 16 p -- k
+ * 32 p .. 32 p + 31 of the chunk, so one load instruction covers 512 contiguous bytes -- and dots
+ * them with sudot4 against the activation's same 32 bytes, which the block stages in LDS once.
+ * The two halves' int32 partials meet at the end of each scale group (one xor-16 shuffle), so a
+ * group's sum is the exact int32 the WMMA kernel's iu8 product gives, and it folds with the same
+ * fmaf((float)sum, as * ws, acc), the splits summed in split order through LDS. A wave walks its
+ * split's groups starting at group (tile mod groups) and wrapping (ROT): tiles sit K x 16 bytes
+ * apart, a multiple of the DRAM channel interleave at Flash-Next's K, so waves walking in lockstep
+ * from the same offset load a few channels at a time (M 1, 2560 x 2560: 38.5 -> 31.0 us with the
+ * rotation). The fold order is therefore a rotation of the WMMA kernel's: the product within f32
+ * rounding (unrotated, ROT 0, the bytes were checked equal to halo_gemm_i8a8_body's at one split
+ * count). The weight is issued I8V_D groups ahead of the dot, a ring of 16 VGPRs a group (the
+ * tile's prefetch ring is 73).
+ *
+ * Measured on gfx1151 (halo_selftest --perfi8, weights streamed from DRAM, back to back), M 4,
+ * the WMMA tile -> this: 2560 x 6144 95.9 -> 75.4 us, 1280 x 2560 20.1 -> 17.1, 2560 x 640 12.8
+ * -> 9.9, 512 x 2560 12.1 -> 8.9, 10240 x 2560 135 -> 124, 2560 x 2560 38.5 -> 31.0; M 1 and 8
+ * ahead at every shape too, M 16 level (the tile keeps it). A deeper ring (3, 4 groups) and more
+ * waves (finer splits) both measured slower. */
+#define I8V_MAX_M 8
+#define I8V_MAX_K 8192
+#define I8V_D 2               /* groups the weight is issued ahead */
+#define I8V_WAVES 320         /* the split law's target: tiles x splits */
+#define I8V_BLOCK_WAVES 4     /* a block's waves before the staging rule widens it */
+
+__device__ __forceinline__ int i8v_dot4(int a, int b, int c) {
+#if defined(__HIP__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    for (int i = 0; i < 4; ++i) c += (int)(int8_t)(a >> (8 * i)) * (int)(int8_t)(b >> (8 * i));
+    return c;
+#endif
+}
+
+template <int MR, int D, int SB>
+__device__ __forceinline__ void halo_gemm_i8v_body(
+        const uint8_t* __restrict__ A, const float* __restrict__ Ascale,
+        const uint8_t* __restrict__ W, const uint16_t* __restrict__ Ws,
+        __hip_bfloat16* __restrict__ C,
+        int M, int K, int N, int a_ld, int sa_ld, int c_ld, int SK, int TPB, int ROT) {
+    HALO_DYN_LDS(uint4, lds4);
+    uint8_t* xs = (uint8_t*)lds4;                                  // [M][K] activation codes
+    float* red = (float*)(xs + (size_t)M * K);                     // [waves][16][MR] split partials
+    const int lane = threadIdx.x & (WAVE - 1), wave = threadIdx.x / WAVE;
+    const int c = lane & 15, p = lane >> 4;
+    const int tile = blockIdx.x * TPB + wave / SK, ks = wave % SK;
+    const bool live = tile < N / 16;
+    const int ts = live ? tile : 0;
+    constexpr int UG = SB / 128;
+    const int Kb = K / SK, kbase = ks * Kb, ng = Kb / 128, nkb = K / SB;
+
+    struct Slot { uint4 w[4]; float wsc, as[MR]; };
+    const uint8_t* wt = W + (size_t)ts * (K >> 6) * 1024 + c * 32 + p * 16;
+    const uint16_t* wst = Ws + (size_t)ts * nkb * 16 + c;
+    const int rot = ROT && SK > 1 ? (ts % (ng / UG)) * UG : 0;
+    auto gmap = [&](int g) { return g + rot < ng ? g + rot : g + rot - ng; };
+    auto load = [&](Slot& s, int g) {
+        const int k0 = kbase + gmap(g) * 128, gabs = k0 / SB;
+        const uint8_t* ch = wt + (size_t)(k0 >> 6) * 1024;
+        s.w[0] = *(const uint4*)ch;
+        s.w[1] = *(const uint4*)(ch + 512);
+        s.w[2] = *(const uint4*)(ch + 1024);
+        s.w[3] = *(const uint4*)(ch + 1536);
+        s.wsc = __uint_as_float((uint32_t)wst[(size_t)gabs * 16] << 16);
+#pragma unroll
+        for (int m = 0; m < MR; ++m) s.as[m] = Ascale[(size_t)(m < M ? m : M - 1) * sa_ld + gabs];
+    };
+    /* The block's activation rows (M x K bytes) are read into registers first and stored to LDS
+     * after the weight's first groups are issued: loads retire in order, so a staging load issued
+     * behind the weight would wait for it. The barrier fences LDS only, for the same reason.
+     * Every thread issues STG loads (indices clamped; the launcher sizes the block so they cover
+     * M x K). */
+    constexpr int STG = MR > 4 ? 16 : 8;
+    const int total = M * (K / 16), per_row = K / 16;
+    uint4 stg[STG];
+#pragma unroll
+    for (int j = 0; j < STG; ++j) {
+        int i = threadIdx.x + j * blockDim.x;
+        i = i < total ? i : total - 1;
+        const int m = i / per_row, q = i - m * per_row;
+        stg[j] = *(const uint4*)(A + (size_t)m * a_ld + q * 16);
+    }
+    Slot r[D];
+#pragma unroll
+    for (int d = 0; d < D; ++d) load(r[d], d < ng ? d : ng - 1);
+#pragma unroll
+    for (int j = 0; j < STG; ++j) {
+        int i = threadIdx.x + j * blockDim.x;
+        i = i < total ? i : total - 1;
+        lds4[i] = stg[j];
+    }
+#if defined(__HIP__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+    __syncthreads();
+#endif
+
+    float acc[MR];
+    int part[MR];
+#pragma unroll
+    for (int m = 0; m < MR; ++m) { acc[m] = 0.f; part[m] = 0; }
+    for (int g0 = 0; g0 < ng; g0 += D) {
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+            const int g = g0 + d;
+            if (g < ng) {
+                const int k0 = kbase + gmap(g) * 128;
+#pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    const uint8_t* xr = xs + (size_t)(m < M ? m : M - 1) * K + k0 + p * 32;
+#pragma unroll
+                    for (int c2 = 0; c2 < 2; ++c2) {
+                        const uint4 a0 = *(const uint4*)(xr + c2 * 64);
+                        const uint4 a1 = *(const uint4*)(xr + c2 * 64 + 16);
+                        const uint4 lo = r[d].w[2 * c2], hi = r[d].w[2 * c2 + 1];
+                        int t = part[m];
+                        t = i8v_dot4((int)lo.x, (int)a0.x, t);
+                        t = i8v_dot4((int)lo.y, (int)a0.y, t);
+                        t = i8v_dot4((int)hi.x, (int)a0.z, t);
+                        t = i8v_dot4((int)hi.y, (int)a0.w, t);
+                        t = i8v_dot4((int)lo.z, (int)a1.x, t);
+                        t = i8v_dot4((int)lo.w, (int)a1.y, t);
+                        t = i8v_dot4((int)hi.z, (int)a1.z, t);
+                        t = i8v_dot4((int)hi.w, (int)a1.w, t);
+                        part[m] = t;
+                    }
+                }
+                if (UG == 1 || ((kbase / 128 + gmap(g)) % UG) == UG - 1) {
+#pragma unroll
+                    for (int m = 0; m < MR; ++m) {
+                        const int sum = part[m] + __shfl_xor(part[m], 16, 32);
+                        acc[m] = fmaf((float)sum, r[d].as[m] * r[d].wsc, acc[m]);
+                        part[m] = 0;
+                    }
+                }
+            }
+            /* Unconditional (the tail reloads the last group), so the waitcnt pass can count. */
+            load(r[d], g + D < ng ? g + D : ng - 1);
+        }
+    }
+
+    if (SK > 1) {
+        if (p == 0) {
+#pragma unroll
+            for (int m = 0; m < MR; ++m) red[((size_t)wave * 16 + c) * MR + m] = acc[m];
+        }
+        __syncthreads();
+        if (ks == 0) {
+            for (int s2 = 1; s2 < SK; ++s2) {
+#pragma unroll
+                for (int m = 0; m < MR; ++m) acc[m] += red[((size_t)(wave + s2) * 16 + c) * MR + m];
+            }
+        }
+    }
+    if (!live || ks != 0 || p != 0) return;
+    const int n = tile * 16 + c;
+#pragma unroll
+    for (int m = 0; m < MR; ++m)
+        if (m < M) C[(size_t)m * c_ld + n] = (__hip_bfloat16)acc[m];
+}
+
+template <int MR, int D, int SB, class CH>
+__global__ __launch_bounds__(512) void halo_gemm_i8v_kernel(
+        const uint8_t* __restrict__ A, const float* __restrict__ Ascale,
+        const uint8_t* __restrict__ W, const uint16_t* __restrict__ Ws,
+        __hip_bfloat16* __restrict__ C,
+        int M, int K, int N, int a_ld, int sa_ld, int c_ld, int SK, int TPB, int ROT) {
+    if constexpr (CH::on) halo_chain_wait();
+    halo_gemm_i8v_body<MR, D, SB>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, SK, TPB, ROT);
+    if constexpr (CH::on) halo_chain_done();
+}
+
+/* Whether the GEMV serves a launch: a few rows, the activation small enough to stage (eight waves
+ * of STG loads cover it), 16-byte rows. */
+static bool i8v_takes(int M, int K, int a_ld, const void* A) {
+    return M <= I8V_MAX_M && K <= I8V_MAX_K && (a_ld % 16) == 0 && ((uintptr_t)A % 16) == 0;
+}
+
+template <int SB>
+static int i8v_launch(const uint8_t* A, const float* As, const uint8_t* W, const uint16_t* Ws,
+                      __hip_bfloat16* C, int M, int K, int N, int a_ld, int sa_ld, int c_ld,
+                      int SK, hipStream_t stream, bool chain) {
+    if (SK < 1 || SK > 16 || (K / SB) % SK) return -1;
+    const int MR = M <= 4 ? M : 8, stg = MR > 4 ? 16 : 8;
+    /* At least I8V_BLOCK_WAVES waves, and enough that the staging loads cover M x K (at most
+     * eight waves' worth by i8v_takes, so the block stays within 16 waves). */
+    const int need = (M * (K / 16) + WAVE * stg - 1) / (WAVE * stg);
+    const int want = need > I8V_BLOCK_WAVES ? need : I8V_BLOCK_WAVES;
+    const int tpb = (want + SK - 1) / SK, waves = tpb * SK;
+    if (waves > 16) return -1;
+    const int nblocks = (N / 16 + tpb - 1) / tpb;
+    const size_t smem = (size_t)M * K + (SK > 1 ? (size_t)waves * 16 * MR * 4 : 0);
+    const int rotf = 1;
+#define I8VG(MR_, CH_) hipLaunchKernelGGL((halo_gemm_i8v_kernel<MR_, I8V_D, SB, CH_>), dim3(nblocks), \
+                                          dim3(waves * 32), smem, stream, A, As, W, Ws, C, M, K, N,   \
+                                          a_ld, sa_ld, c_ld, SK, tpb, rotf)
+#define I8VM(CH_) do { switch (MR) { case 1: I8VG(1, CH_); break; case 2: I8VG(2, CH_); break;  \
+                                     case 3: I8VG(3, CH_); break; case 4: I8VG(4, CH_); break;  \
+                                     default: I8VG(8, CH_); break; } } while (0)
+    if (chain) I8VM(r4dchain); else I8VM(HaloUnchained);
+#undef I8VM
+#undef I8VG
+    return hipGetLastError() == hipSuccess ? 0 : -5;
+}
+
+/* The GEMV's split when the caller does not pin one: the fewest splits (whole scale groups each)
+ * that give the card I8V_WAVES waves, at most 16 a tile. */
+static int i8v_sk(int K, int N, int sb) {
+    const int tiles = N / 16, nu = K / sb;
+    const int want = I8V_WAVES;
+    int best = 1;
+    if (tiles >= 256) return 1;   /* fills the card unsplit; an unsplit call keeps the prefill tile's bytes */
+    for (int s = 1; s <= 16 && 2 * s <= nu; ++s) {
+        if (nu % s) continue;
+        best = s;
+        if ((long)tiles * s >= want) break;
+    }
+    return best;
+}
+
+template <int MT, int SB = 128>
 static int i8_launch(const uint8_t* A, const float* As, const uint8_t* W, const uint16_t* Ws,
                      __hip_bfloat16* C, int M, int K, int N, int a_ld, int sa_ld, int c_ld,
-                     int SK, hipStream_t stream) {
+                     int SK, hipStream_t stream, bool chain = false) {
     if (SK < 1 || (16 % SK) != 0) SK = 1;
     const int mtiles = (M + MT * 16 - 1) / (MT * 16);
     /* The fp8 kernel's block rule (fp8_launch): narrow the block on a small grid. */
@@ -891,23 +1145,41 @@ static int i8_launch(const uint8_t* A, const float* As, const uint8_t* W, const 
     const int wpb = bw / SK;
     const int nblocks = (N / 16 + wpb - 1) / wpb;
     const size_t smem = SK > 1 ? (size_t)bw * WAVE * 8 * sizeof(float) : 0;
-#define I8BW(V) hipLaunchKernelGGL((halo_gemm_i8a8_kernel<MT, V>), dim3(nblocks, mtiles), dim3(V * 32), \
-                                   smem, stream, A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, SK)
+#define I8BWC(V, CH_) hipLaunchKernelGGL((halo_gemm_i8a8_kernel<MT, V, SB, CH_>), dim3(nblocks, mtiles), \
+                                   dim3(V * 32), smem, stream, A, As, W, Ws, C, M, K, N, a_ld, sa_ld, \
+                                   c_ld, SK)
+#define I8BW(V) do { if (chain) I8BWC(V, r4dchain); else I8BWC(V, HaloUnchained); } while (0)
     switch (bw) { case 4: I8BW(4); break; case 8: I8BW(8); break; default: I8BW(16); break; }
 #undef I8BW
+#undef I8BWC
     return hipGetLastError() == hipSuccess ? 0 : -5;
 }
 
 static int i8_gemm(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
-                   int a_ld, int sa_ld, int c_ld, int sk_want, hipStream_t stream) {
-    if (M < 1 || K < 128 || (K % 128) || N < 16 || (N % 16)) return -1;
+                   int a_ld, int sa_ld, int c_ld, int sk_want, hipStream_t stream, int sb = 128,
+                   bool chain = false) {
+    if (sb != 128 && sb != 256) return -1;
+    if (M < 1 || K < sb || (K % sb) || N < 16 || (N % 16)) return -1;
     auto A = (const uint8_t*)a; auto As = (const float*)ascale;
     auto W = (const uint8_t*)wq; auto Ws = (const uint16_t*)ws;
     auto C = (__hip_bfloat16*)c;
     if (c_ld <= 0) c_ld = N;
     if (a_ld <= 0) a_ld = K;
-    if (sa_ld <= 0) sa_ld = K / 128;
+    if (sa_ld <= 0) sa_ld = K / sb;
     const int MT = M <= 16 ? 1 : M <= 32 ? 2 : M <= 48 ? 3 : 4;
+    /* At a few rows the GEMV (its own split law unless the caller pins one; a pinned split
+     * capped as the tile's below, so a split_n slice still sums as the whole GEMM does). */
+    if (MT == 1 && i8v_takes(M, K, a_ld, A)) {
+        int sv = sk_want > 0 ? sk_want : i8v_sk(K, N, sb);
+        if (sk_want > 0) {
+            if (16 % sv) sv = 1;
+            while (sv > 1 && (K / sb) % sv) sv /= 2;
+        }
+        const int rc = sb == 256
+            ? i8v_launch<256>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sv, stream, chain)
+            : i8v_launch<128>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sv, stream, chain);
+        if (rc != -1) return rc;
+    }
     int sk = sk_want > 0 ? sk_want
                          : fp8_sk(M, K, N);
     /* One row tile at K up to 4096 takes four waves a column tile, each a quarter of K, whenever
@@ -916,22 +1188,35 @@ static int i8_gemm(long a, long ascale, long wq, long ws, long c, int M, int K, 
      * streamed from DRAM (K 2560, four rows): N 16384 291 -> 214 us, 12288 191 -> 160, 1280
      * 27.6 -> 21.4 (the occupancy rule's two), 512 at its rule's four. Two ways measured slower
      * at wide N; K 6144 (48 groups, N 2560) is fastest unsplit. */
-    if (sk_want <= 0 && MT == 1 && sk < 4 && K <= 4096 && (K / 128) % 4 == 0) sk = 4;
-    switch (MT) {
-      case 1: return i8_launch<1>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream);
-      case 2: return i8_launch<2>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream);
-      case 3: return i8_launch<3>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream);
-      default: return i8_launch<4>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream);
+    if (sk_want <= 0 && MT == 1 && sk < 4 && K <= 4096 && (K / sb) % 4 == 0) sk = 4;
+    /* Whole scale groups a split: at SB 256 a split the 128-unit law allows may halve a group.
+     * The same cap on the law's count for a split_n slice, so the slice still agrees. */
+    while (sk > 1 && (K / sb) % sk) sk /= 2;
+#define I8MT(SB_)                                                                              \
+    switch (MT) {                                                                              \
+      case 1: return i8_launch<1, SB_>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream,  \
+                                       chain);                                                 \
+      case 2: return i8_launch<2, SB_>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream,  \
+                                       chain);                                                 \
+      case 3: return i8_launch<3, SB_>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream,  \
+                                       chain);                                                 \
+      default: return i8_launch<4, SB_>(A, As, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, sk, stream, \
+                                        chain);                                                \
     }
+    if (sb == 256) I8MT(256)
+    I8MT(128)
+#undef I8MT
 }
 
 /* The narrow int8 launch with the split it must take; halo_gemm_i8a8_nt_m16 below is libr4d's
  * raw signature over it (its weight pitches and scratch are not read: the plane's geometry is K,
  * the split in-block). */
 static int i8_nt_m16(long a, long ascale, long wq, long ws, long c,
-                     int M, int K, int N, int a_ld, int sa_ld, long stream, int sk_want) {
+                     int M, int K, int N, int a_ld, int sa_ld, long stream, int sk_want,
+                     int sb = 128, bool chain = false) {
     if (M > HALO_GEMM_FP8_MAX_M) return -2;
-    return i8_gemm(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, N, sk_want, (hipStream_t)stream);
+    return i8_gemm(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, N, sk_want, (hipStream_t)stream,
+                   sb, chain);
 }
 
 int halo_gemm_i8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
@@ -951,8 +1236,10 @@ int halo_gemm_i8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
  * LDS. */
 #define IT_PITCH 80             // bytes a staged row: 64 + 16, so every row starts 16-aligned
 
-/* The body; OWN and PART as in fp8_tiled_block (padding fragments' WMMAs and folds skipped). */
-template <int TM, int TN, bool PART, bool OWN>
+/* The body; OWN and PART as in fp8_tiled_block (padding fragments' WMMAs and folds skipped). SB
+ * the scale group along K, 128 or IQ8R's 256 (gemm_iq8r_tiled): a fold every SB / 64 staged
+ * tiles, both scales at K / SB columns. */
+template <int TM, int TN, bool PART, bool OWN, int SB = 128>
 __device__ __forceinline__ void i8_tiled_block(
         const uint8_t* __restrict__ A, const float* __restrict__ Ascale,
         const uint8_t* __restrict__ W, const uint16_t* __restrict__ Ws,
@@ -995,7 +1282,8 @@ __device__ __forceinline__ void i8_tiled_block(
     }
     const int srow = tid < BM ? (m0 + tid < M ? m0 + tid : M - 1) : 0;
     const float* sp = Ascale + (size_t)srow * sa_ld;
-    const int nkb = K / 128;
+    constexpr int TPG = SB / FT_BK;                     // staged tiles a scale group
+    const int nkb = K / SB;
     const uint16_t* wsp[TN];
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
@@ -1020,7 +1308,7 @@ __device__ __forceinline__ void i8_tiled_block(
         for (int i = 0; i < AL; ++i) ra[i] = *(const halo_u32x4*)(asrc[i] + kt * FT_BK);
 #pragma unroll
         for (int i = 0; i < WL; ++i) rw[i] = *(const halo_u32x4*)(wsrc[i] + (size_t)kt * 1024);
-        if (!(kt & 1) && tid < BM) rs = sp[kt >> 1];
+        if ((kt % TPG) == 0 && tid < BM) rs = sp[kt / TPG];
     };
     fetch(0);
 
@@ -1034,7 +1322,7 @@ __device__ __forceinline__ void i8_tiled_block(
             *(uint2*)wdst[i] = make_uint2(rw[i][0], rw[i][1]);          // k run t*16 + h*8
             *(uint2*)(wdst[i] + 16) = make_uint2(rw[i][2], rw[i][3]);   // fragment t + 1's
         }
-        if (!(kt & 1) && tid < BM) sS[tid] = rs;
+        if ((kt % TPG) == 0 && tid < BM) sS[tid] = rs;
         __syncthreads();
         if (kt + 1 < nk) fetch(kt + 1);
 #pragma unroll
@@ -1057,8 +1345,8 @@ __device__ __forceinline__ void i8_tiled_block(
                 __builtin_amdgcn_sched_group_barrier(0x008, TM * TN, 0);    /* WMMA */
             }
         }
-        if (kt & 1) {
-            const int g = kt >> 1;
+        if ((kt % TPG) == TPG - 1) {
+            const int g = kt / TPG;
             float wsc[TN];
 #pragma unroll
             for (int j = 0; j < TN; ++j) wsc[j] = __uint_as_float((uint32_t)wsp[j][g * 16] << 16);
@@ -1094,7 +1382,7 @@ __device__ __forceinline__ void i8_tiled_block(
 
 /* PART: the two-body form for a partial last band of rows, as halo_gemm_fp8a8_tiled_part_kernel;
  * otherwise the plain kernel over the body's own LDS. */
-template <int TM, int TN, bool PART>
+template <int TM, int TN, bool PART, int SB = 128>
 __global__ __launch_bounds__(256) void halo_gemm_i8a8_tiled_kernel(
         const uint8_t* __restrict__ A, const float* __restrict__ Ascale,
         const uint8_t* __restrict__ W, const uint16_t* __restrict__ Ws,
@@ -1103,30 +1391,30 @@ __global__ __launch_bounds__(256) void halo_gemm_i8a8_tiled_kernel(
     int m0, n0;
     fp8_tiled_origin(BM, BN, &m0, &n0);
     if constexpr (!PART) {
-        i8_tiled_block<TM, TN, false, true>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld, m0,
-                                            n0, nullptr, nullptr, nullptr);
+        i8_tiled_block<TM, TN, false, true, SB>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld,
+                                                m0, n0, nullptr, nullptr, nullptr);
     } else {
         __shared__ __attribute__((aligned(16))) uint8_t sA[BM * IT_PITCH];
         __shared__ __attribute__((aligned(16))) uint8_t sW[BN * IT_PITCH];
         __shared__ float sS[BM];
         if (m0 + BM > M)
-            i8_tiled_block<TM, TN, true, false>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld,
-                                                m0, n0, sA, sW, sS);
+            i8_tiled_block<TM, TN, true, false, SB>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld,
+                                                    c_ld, m0, n0, sA, sW, sS);
         else
-            i8_tiled_block<TM, TN, false, false>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld, c_ld,
-                                                 m0, n0, sA, sW, sS);
+            i8_tiled_block<TM, TN, false, false, SB>(A, Ascale, W, Ws, C, M, K, N, a_ld, sa_ld,
+                                                     c_ld, m0, n0, sA, sW, sS);
     }
 }
 
-int halo_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c,
-                         int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
-                         long stream) {
-    (void)w_ld; (void)sw_ld;
-    if (M <= HALO_GEMM_FP8_MAX_M || (N % 128) || K < 128 || (K % 128))
-        return i8_gemm(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, N, 1, (hipStream_t)stream);
+/* `sb`: the scale group along K, 128 or IQ8R's 256 (gemm_iq8r_tiled). */
+static int i8_tiled(long a, long ascale, long wq, long ws, long c, int M, int K, int N, int a_ld,
+                    int sa_ld, long stream, int sb) {
+    if (sb != 128 && sb != 256) return -1;
+    if (M <= HALO_GEMM_FP8_MAX_M || (N % 128) || K < sb || (K % sb))
+        return i8_gemm(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, N, 1, (hipStream_t)stream, sb);
     /* Past one 64-row band, the LDS-tiled kernel: the same bytes (see its contract). */
     if (a_ld <= 0) a_ld = K;
-    if (sa_ld <= 0) sa_ld = K / 128;
+    if (sa_ld <= 0) sa_ld = K / sb;
     const long long g128 = (long long)(N / 128) * ((M + 127) / 128);
     const bool big = g128 >= 32;
     const int bt = big ? 128 : 64;
@@ -1136,12 +1424,24 @@ int halo_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c,
     auto C = (__hip_bfloat16*)c;
     hipStream_t st = (hipStream_t)stream;
     const bool part = M % bt != 0;
-#define IT_GO(TM, TN, P) hipLaunchKernelGGL((halo_gemm_i8a8_tiled_kernel<TM, TN, P>), grid, \
-        dim3(256), 0, st, A, As, W, Ws, C, M, K, N, a_ld, sa_ld, N)
-    if (big) { if (part) IT_GO(4, 2, true); else IT_GO(4, 2, false); }
-    else     { if (part) IT_GO(2, 1, true); else IT_GO(2, 1, false); }
+#define IT_GO(TM, TN, P, SB) hipLaunchKernelGGL((halo_gemm_i8a8_tiled_kernel<TM, TN, P, SB>), \
+        grid, dim3(256), 0, st, A, As, W, Ws, C, M, K, N, a_ld, sa_ld, N)
+    if (sb == 256) {
+        if (big) { if (part) IT_GO(4, 2, true, 256); else IT_GO(4, 2, false, 256); }
+        else     { if (part) IT_GO(2, 1, true, 256); else IT_GO(2, 1, false, 256); }
+    } else {
+        if (big) { if (part) IT_GO(4, 2, true, 128); else IT_GO(4, 2, false, 128); }
+        else     { if (part) IT_GO(2, 1, true, 128); else IT_GO(2, 1, false, 128); }
+    }
 #undef IT_GO
     return hipGetLastError() == hipSuccess ? 0 : -5;
+}
+
+int halo_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c,
+                         int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
+                         long stream) {
+    (void)w_ld; (void)sw_ld;
+    return i8_tiled(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, stream, 128);
 }
 
 /* ---- the gated narrow row (gemm_fp8a8_gated_nt_m16) ----------------------------------------
@@ -1346,10 +1646,12 @@ extern "C" int halo_rad_gemm_i8a8_m16(const RadArgs* a, RadStream s) {
     int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
     if (rc != RAD_OK) return rc;
     if (g.M > HALO_GEMM_FP8_MAX_M) return HALO_NO(RAD_E_SHAPE);
-    if ((g.K % 128) || (g.N % 16)) return HALO_NO(RAD_E_SHAPE);
+    if ((g.K % g.group) || (g.N % 16)) return HALO_NO(RAD_E_SHAPE);
+    if (g.a->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
     rc = i8_nt_m16(halo_addr(g.a), halo_addr(g.ascale), halo_addr(g.b), halo_addr(g.bscale),
                    halo_addr(g.y), (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld,
-                   (long)(uintptr_t)s, law_sk(a, g.M, g.K, g.N));
+                   (long)(uintptr_t)s, law_sk(a, g.M, g.K, g.N), (int)g.group,
+                   halo_geti_or(a, "chain", 0) != 0 && g.M <= 64);   /* decode heights */
     return rc ? HALO_NO(RAD_E_DEVICE) : RAD_OK;
 }
 
@@ -1363,12 +1665,27 @@ extern "C" int halo_rad_gemm_i8a8_tiled(const RadArgs* a, RadStream s) {
     Fp8Ops g;
     int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
     if (rc != RAD_OK) return rc;
-    if ((g.K % 128) || (g.N % 16)) return HALO_NO(RAD_E_SHAPE);
-    rc = halo_gemm_i8a8_tiled(halo_addr(g.a), halo_addr(g.ascale), halo_addr(g.b),
-                              halo_addr(g.bscale), halo_addr(g.y), (int)g.M, (int)g.K,
-                              (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
-                              (long)(uintptr_t)s);
+    if ((g.K % g.group) || (g.N % 16)) return HALO_NO(RAD_E_SHAPE);
+    if (g.a->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
+    rc = i8_tiled(halo_addr(g.a), halo_addr(g.ascale), halo_addr(g.b), halo_addr(g.bscale),
+                  halo_addr(g.y), (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld,
+                  (long)(uintptr_t)s, (int)g.group);
     return rc ? HALO_NO(RAD_E_DEVICE) : RAD_OK;
+}
+
+/* gemm_i8a8_rb8_tiled / gemm_i8a8_rb32_tiled: the int8 tile at a weight scale constant over 8 or
+ * 32 rows. The plane is the per-row one with each row holding its block's value (the same layout
+ * hooks), so gemm_i8a8_tiled's launch reads it as it is and computes the same product; libr4d's
+ * rows fold one scale a lane or a wave to save registers on gfx1201, which this tile does not
+ * need. The row's band (`w_rb`) is checked by selection, not here. */
+extern "C" int halo_rad_gemm_i8a8_rb8_tiled(const RadArgs* a, RadStream s) {
+    if (halo_geti_or(a, "group", 128) != 128) return HALO_NO(RAD_E_SHAPE);
+    return halo_rad_gemm_i8a8_tiled(a, s);
+}
+
+extern "C" int halo_rad_gemm_i8a8_rb32_tiled(const RadArgs* a, RadStream s) {
+    if (halo_geti_or(a, "group", 128) != 128) return HALO_NO(RAD_E_SHAPE);
+    return halo_rad_gemm_i8a8_tiled(a, s);
 }
 
 extern "C" int halo_rad_gemm_fp8a8_gated_m16(const RadArgs* a, RadStream s) {

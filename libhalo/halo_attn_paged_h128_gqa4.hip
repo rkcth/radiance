@@ -47,6 +47,11 @@ extern "C" int halo_attn_decode_h128_gqa4_fp8kv(const HaloArgs* a, hipStream_t s
 extern "C" int halo_attn_decode_h128_gqa4_bf16kv(const HaloArgs* a, hipStream_t s) {
     return decode_launch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1, 1>(a, s);
 }
+// The int8 cache (int8 K and V, an f16 scale each per token and head): K is widened from the paged
+// cache a fragment at a time.
+extern "C" int halo_attn_decode_h128_gqa4_i8kv(const HaloArgs* a, hipStream_t s) {
+    return decode_launch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT | O_KVI8, 0, 1>(a, s);
+}
 // The same over a cache holding each kv head once for kv_rep query groups (O_KVREP), q at
 // HaloArgs::q_ld (O_QLD): gqa 8 on this gqa-4 kernel, under attn_paged_qrow.
 extern "C" int halo_attn_decode_h128_gqa4_rep_fp8kv(const HaloArgs* a, hipStream_t s) {
@@ -54,6 +59,10 @@ extern "C" int halo_attn_decode_h128_gqa4_rep_fp8kv(const HaloArgs* a, hipStream
 }
 extern "C" int halo_attn_decode_h128_gqa4_rep_bf16kv(const HaloArgs* a, hipStream_t s) {
     return decode_launch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT | O_QLD | O_KVREP, 1, 1>(a, s);
+}
+extern "C" int halo_attn_decode_h128_gqa4_rep_i8kv(const HaloArgs* a, hipStream_t s) {
+    return decode_launch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT | O_KVI8 | O_QLD | O_KVREP, 0, 1>(a,
+                                                                                               s);
 }
 
 // ============================================================== the plugin ABI entry points
@@ -91,4 +100,25 @@ extern "C" int halo_rad_attn_qrow_h128_gqa8_bf16(const RadArgs* a, RadStream s) 
     int rc = decode_common<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, &r, 0, 2, true);
     if (rc != RAD_OK) return rc;
     return halo_attn_decode_h128_gqa4_rep_bf16kv(&r, (hipStream_t)s);
+}
+
+/* The int8 cache at this geometry: a token's row is 2 * 128 + 4 = 260 bytes. */
+extern "C" int64_t halo_rad_attn_decode_h128_i8_scratch(const RadArgs* a) {
+    return decode_scratch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, 2 * B_HEAD_DIM + 4);
+}
+extern "C" int halo_rad_attn_decode_h128_i8(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    int rc = decode_common<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, &r, 2 * B_HEAD_DIM + 4);
+    if (rc != RAD_OK) return rc;
+    return halo_attn_decode_h128_gqa4_i8kv(&r, (hipStream_t)s);
+}
+extern "C" int64_t halo_rad_attn_qrow_h128_gqa8_i8_scratch(const RadArgs* a) {
+    return decode_scratch<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, 2 * B_HEAD_DIM + 4, 2, true);
+}
+extern "C" int halo_rad_attn_qrow_h128_gqa8_i8(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    int rc = decode_common<B_HEAD_DIM, B_GQA, B_BLOCK_SIZE, B_OPT, 1>(a, &r, 2 * B_HEAD_DIM + 4, 2,
+                                                                       true);
+    if (rc != RAD_OK) return rc;
+    return halo_attn_decode_h128_gqa4_rep_i8kv(&r, (hipStream_t)s);
 }

@@ -50,6 +50,13 @@
 
 using namespace rad;
 
+namespace rad {
+int rad_add_gemma4_vision(const std::string& base_path, const std::string& input,
+                         const std::string& config_dir, const std::string& out,
+                         const std::string& home, const std::vector<std::string>& hierarchy,
+                         bool plan_only);
+}
+
 namespace {
 
 bool file_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
@@ -356,6 +363,10 @@ void usage() {
         "                       the first is searched first). A weight\n"
         "                       it holds with the same encoding, quantiser, options and shape is\n"
         "                       copied from it instead of quantised again\n"
+        "      --add-vision BASE.rad   add a Gemma 4 MoE vision tower to a text-only container.\n"
+        "                       Input is the vision safetensors with its source config. Copy all\n"
+        "                       base weight planes, vocab and metadata to a new output.\n"
+        "                       Supports --config, --home, --kernels and --plan-only.\n"
         "      --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from\n"
         "                       the checkpoint the --reuse container was converted from. Every\n"
         "                       weight that reads one is converted; the rest are copied\n"
@@ -437,7 +448,7 @@ int main(int argc, char** argv) {
     bool     max_spec_given = false;
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
-    std::string reuse_path, changed_path;
+    std::string reuse_path, changed_path, vision_base;
     std::vector<std::string> reuse_more;   /* --reuse given again: more containers to copy from */
     std::vector<std::string> defer;        /* --defer: globs of the weights this run leaves out */
     std::vector<std::string> replace;      /* --replace: globs of the weights --in-place may rewrite */
@@ -487,6 +498,14 @@ int main(int argc, char** argv) {
         else if (a == "--max-spec")  { max_spec = (int)num("--max-spec", 0, INT32_MAX);
                                        max_spec_given = true; }
         else if (a == "--draft-model") draft_dir = next("--draft-model");
+        else if (a == "--add-vision") {
+            const char* path = next("--add-vision");
+            if (!*path || !vision_base.empty()) {
+                RAD_ERR("--add-vision takes one nonempty base container path");
+                return 2;
+            }
+            vision_base = path;
+        }
         else if (a == "--plan-only") plan_only = true;
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
         else if (a == "--reuse") {
@@ -529,6 +548,24 @@ int main(int argc, char** argv) {
             return 2;
         } else if (in.empty()) in = a;
         else { std::fprintf(stderr, "rad-convert: more than one input given\n"); return 2; }
+    }
+
+    if (!vision_base.empty()) {
+        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() ||
+            !recipe_files.empty() || !quant_flags.empty() || !set_kv.empty() ||
+            !arch_override.empty() || !tokjson.empty() || !tokjson2.empty() || !chat_tmpl.empty() ||
+            !add_files.empty() || !draft_dir.empty() || !imat_path.empty() || !lora_paths.empty() ||
+            !lora_map.empty() || lora_strength != 1.0 || !changed_path.empty() || !gpus.empty() ||
+            max_tok_given || max_ctx != 0 || max_spec_given || kv_dtype != RAD_DT_INVALID ||
+            report_n != 20) {
+            RAD_ERR("--add-vision needs an input, a new -o path, and only its supported options "
+                    "(see --help)");
+            return 2;
+        }
+        const int rc = rad_add_gemma4_vision(vision_base, in, config_dir, out, home, hierarchy,
+                                             plan_only);
+        if (rc < 0) RAD_ERR("--add-vision: %s", rad_strerror(rc));
+        return rc < 0 ? 1 : 0;
     }
 
     /* ---------------------------------------------------------------- --list-quantizers */

@@ -423,8 +423,10 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         t.checked = true;
     } else {
         /* Entries that may have moved: resolve each (which also orders the stream behind an
-         * in-flight transfer) and patch only those whose pointer differs. */
-        WtabPatch pt;
+         * in-flight transfer) and patch only those whose pointer differs. Into the op's gather
+         * when there is one (wtab_flush), else a dispatch of this table's own. */
+        WtabPatch own;
+        WtabPatch& pt = wtab_gather_ ? wtab_acc_ : own;
         auto one = [&](int64_t e) -> int {
             void* p = nullptr;
             RAD_TRY(resolve(e, &p));
@@ -435,6 +437,7 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
             pt.val[pt.n] = p;
             if (++pt.n == (uint32_t)kWtabPatch) {
                 RAD_TRY(wtab_patch(pt, cur_stream()));
+                ++n_wtab_patches_;
                 pt.n = 0;
             }
             return RAD_OK;
@@ -444,10 +447,14 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         } else {
             for (int32_t e : t.pend) RAD_TRY(one(e));
         }
-        const int rc = wtab_patch(pt, cur_stream());
-        if (rc < 0)
-            return abort_step_msg(h, rc,
-                                  fmt("operand %d: the weight table could not be patched", operand));
+        if (!wtab_gather_) {
+            if (pt.n > 0) ++n_wtab_patches_;
+            const int rc = wtab_patch(pt, cur_stream());
+            if (rc < 0)
+                return abort_step_msg(h, rc,
+                                      fmt("operand %d: the weight table could not be patched",
+                                          operand));
+        }
     }
     t.full = false;
     t.pend.clear();
@@ -457,6 +464,15 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         g_wtab_e  += walked;
     }
     return RAD_OK;
+}
+
+/* Dispatches what the op's tables gathered (ctx.h, wtab_acc_) on the current stream. */
+int Ctx::wtab_flush() {
+    if (wtab_acc_.n == 0) return RAD_OK;
+    ++n_wtab_patches_;
+    const int rc = wtab_patch(wtab_acc_, cur_stream());
+    wtab_acc_.n = 0;
+    return rc;
 }
 
 /* Queues the residency table's changes against every table holding each weight. A weight also
@@ -784,6 +800,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * never after it. Loop-invariant, so computed once here rather than per buffer operand. */
     const int32_t at_op = p.info && p.info->anchor >= 0 ? p.info->anchor : (int32_t)h;
 
+    /* The op's tables patch into one gather (ctx.h, wtab_acc_), dispatched below once every
+     * operand is resolved; a refusal on the way dispatches what was gathered (abort_step_msg), so
+     * the device arrays hold what `cur` says they do. */
+    wtab_gather_ = rec_ == nullptr;
     for (int i = 0; i < n_opd; ++i) {
         const RadOperand& o = opd[i];
         RadTensor&        tt = t[i];
@@ -915,7 +935,11 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "a column slice; neither has a meaning for a table -- "
                                           "slice the entries at declare instead", i));
             const int rc = resolve_weight_table(h, i, (rad_weight)w0, cnt, &tt);
-            if (rc < 0) return rc;
+            if (rc < 0) {
+                wtab_gather_ = false;
+                (void)wtab_flush();   /* what the tables gathered still goes out (wtab_acc_) */
+                return rc;
+            }
             break;
         }
 
@@ -997,6 +1021,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             break;
         }
     }
+
+    wtab_gather_ = false;
+    if (const int ws = wtab_flush(); ws < 0)
+        return abort_step_msg(h, ws, "the op's weight tables could not be patched");
 
     /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. There is one
      * entry per schema operand, the trailing optional ones the issue left out null. */
@@ -1273,7 +1301,12 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     o.rec1 = rec1;
     o.op = (uint32_t)(&p - plans_.data());
     const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
-    o.opaque = p.collective || !sc || sc->n_operands != n_opd || !ip.row || !ip.row->concurrent;
+    /* The operand counts issue_body accepts: trailing optional operands may be left out, and an
+     * absent one is a null tensor that reaches nothing (skipped below). Requiring the full schema
+     * count here made every issue that omits one opaque, which orders it behind its neighbours in
+     * a recorded pass (the routed MoE GEMMs without their prefill-only `split`, for example). */
+    const bool count_ok = sc && n_opd <= sc->n_operands && n_opd >= p.n_opd_required;
+    o.opaque = p.collective || !count_ok || !ip.row || !ip.row->concurrent;
     std::pair<uintptr_t, uintptr_t> rd[MAX_OPERANDS + 1], wr[MAX_OPERANDS + 1];
     int n_rd = 0, n_wr = 0;
     for (int i = 0; i < n_opd && !o.opaque; ++i) {
@@ -1346,6 +1379,9 @@ int Ctx::host_join_wait(bool drain) {
 /* ================================================================== the cold paths */
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
+    /* What the op's tables gathered before the refusal still goes out (ctx.h, wtab_acc_). */
+    wtab_gather_ = false;
+    (void)wtab_flush();
     const OpInfo&   o     = *plans_[h].info;
     const char*     kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
     const char*     pname = ip.row ? ip.row->plugin.c_str() : "<unknown plugin>";
@@ -1378,6 +1414,9 @@ int Ctx::step_fail(const char* what) {
 }
 
 int Ctx::abort_step_msg(rad_op h, int status, std::string what) {
+    /* What the op's tables gathered before the refusal still goes out (ctx.h, wtab_acc_). */
+    wtab_gather_ = false;
+    (void)wtab_flush();
     const OpInfo* o = (h != RAD_NULL_HANDLE && (size_t)h < plans_.size()) ? plans_[h].info : nullptr;
     step_fail_ = o ? fmt("op '%s' {%s}: %s", o->op.c_str(), o->base.str().c_str(), what.c_str())
                    : fmt("op handle %u: %s", h, what.c_str());
@@ -1438,6 +1477,42 @@ int64_t rad::Ctx::kv_layer_index(rad_kvgroup g, int layer) const {
     const std::vector<int32_t>& ls = kv_[g].layer_slot;
     if ((size_t)layer >= ls.size()) return -1;
     return ls[(size_t)layer];
+}
+
+/* rad_ckpt_snap: one layer of a stateful group, the sequence's slot to the stage's row for that
+ * layer, on the current lane. The stage is laid out as KVManager::checkpoint_copy lays a slot out
+ * (group by group in plan order, a layer's state after another), so the engine moves it to the
+ * host slot in one copy (Engine::save_checkpoints). */
+int rad::Ctx::ckpt_snap(rad_kvgroup g, int layer) {
+    if (!snap_stage_ || !batch_ || batch_->ckpt_cut <= 0) return RAD_OK;
+    if (g >= kv_.size() || g >= snap_slot_.size() || snap_slot_[g] < 0 || snap_off_[g] < 0 ||
+        !kv_[g].base) {
+        step_fail_ = fmt("rank %d: rad_ckpt_snap names KV group %u, which holds no state the "
+                         "checkpoint stage carries", rank_, (unsigned)g);
+        step_status_ = RAD_E_STATE;
+        return RAD_E_STATE;
+    }
+    const KVPoolBinding& b = kv_[g];
+    const int64_t li = kv_layer_index(g, layer);
+    const int64_t lb = snap_lb_[g];
+    if (li < 0 || lb <= 0) {
+        step_fail_ = fmt("rank %d: rad_ckpt_snap: KV group %u holds no layer %d", rank_,
+                         (unsigned)g, layer);
+        step_status_ = RAD_E_STATE;
+        return RAD_E_STATE;
+    }
+    const char* src = static_cast<const char*>(b.base) + kv_binding_offset(b, li) +
+                      (int64_t)snap_slot_[g] * lb;
+    char* dst = static_cast<char*>(snap_stage_) + snap_off_[g] + li * lb;
+    const int rc = rad_memcpy_async(dst, src, lb, cur_stream());
+    if (rc < 0 && step_status_ >= 0) step_status_ = rc;
+    if (rc >= 0 && g < snap_done_.size() && (size_t)layer < snap_done_[g].size())
+        snap_done_[g][(size_t)layer] = 1;
+    return rc;
+}
+
+int rad_ckpt_snap(RadCtx* c, rad_kvgroup group, int layer) {
+    return c ? static_cast<rad::Ctx*>(c)->ckpt_snap(group, layer) : RAD_E_INVAL;
 }
 
 int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {

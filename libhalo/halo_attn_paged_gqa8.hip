@@ -84,7 +84,11 @@ using std::max;
 #define G8_BLOCK_SIZE 16
 #endif
 
+/* Prefill warps a workgroup; a unit whose ratio does not divide 384 rows lowers it (the gqa7
+ * unit: 21 warps, 48 query positions). */
+#ifndef G8_P_NWARPS
 #define G8_P_NWARPS 24
+#endif
 #define G8_P_TILE   48
 // K prefetch 2 at head_dim 256, as in the h256/gqa6 prefill (P_OPT there): 4 spills the m-tile
 // loop. The head_dim-128 set keeps prefetch 4, which fits.
@@ -199,15 +203,19 @@ G8_V4_ENTRIES(k6v4, 352, O_V4 | O_K6)
 // O_KRAW, a gfx12 K round the port does not instantiate, and its GPREV turns itself off at head_dim
 // 128 anyway (a V prefetch there is past the three registers it fits in).
 #define G8_D_OPT    HALO_D_OPT
-#define G8_MAX_DECODE_ROWS 64       // q_len * gqa a single decode workgroup can hold
+/* q_len * gqa a single decode workgroup can hold: 64 unless the including unit raises it to 128
+ * (eight row tiles: gqa 16 verifies seven drafts in the decode kernel) or lowers it (gqa 7: 63). */
+#ifndef G8_MAX_DECODE_ROWS
+#define G8_MAX_DECODE_ROWS 64
+#endif
 
 template <int HEAD_DIM, int KVP, int XOPT = 0>
 /* The attention kernel and the merge; `gq` non-null adds the output gate and the quantiser to the
  * merge's epilogue (attn_paged_gate_quant). XOPT adds the cache-layout bits (O_V4, O_K6). */
 static int g8_decode_launch(const HaloArgs* a, RadStream stream,
                             const HaloGateQuant* gq = nullptr) {
-    return decode_launch<HEAD_DIM, G8_GQA, G8_BLOCK_SIZE, G8_D_OPT | XOPT, KVP, 0>(
-        a, (hipStream_t)stream, gq);
+    return decode_launch<HEAD_DIM, G8_GQA, G8_BLOCK_SIZE, G8_D_OPT | XOPT, KVP, 0,
+                         G8_MAX_DECODE_ROWS>(a, (hipStream_t)stream, gq);
 }
 
 /* Split-KV partial buffer size at declare time, from the band's upper bound (decode_scratch in the
@@ -248,7 +256,7 @@ static int g8_decode_common(const RadArgs* a, HaloArgs* r, int head_dim, long lo
 #endif
 }
 
-#if HALO_ATTN_GQ && HALO_ATTN_H256
+#if HALO_ATTN_H256
 /* ---- attn_paged_gate_quant: attn_paged's eight operands, then the gate, the codes and their
  * per-128-column scales. A gated row's merge row is one (token, head) pair, so the gate is a
  * [T, n_head, head_dim] view of the [q|gate] projection whose (token, head) rows are one pitch
@@ -256,7 +264,7 @@ static int g8_decode_common(const RadArgs* a, HaloArgs* r, int head_dim, long lo
  * this unit cannot link that unit). */
 enum { AP_GQ_G = AP_OUT + 1, AP_GQ_Q, AP_GQ_S };
 
-static long long g8_gq_row_pitch(const RadTensor* t, long long width) {
+[[maybe_unused]] static long long g8_gq_row_pitch(const RadTensor* t, long long width) {
     if (!t || t->rank < 1) return -1;
     if (t->shape[t->rank - 1] != width) return halo_contig(t) ? width : -1;
     if (t->stride[t->rank - 1] != 1) return -1;
@@ -268,7 +276,9 @@ static long long g8_gq_row_pitch(const RadTensor* t, long long width) {
 
 /* The gate/codes/scales operands, validated as gate_quant_fp8 validates them: a bf16 gate, E4M3 (or
  * int8, for an int8 out projection) codes, f32 scales, act sigmoid, a scale group of 128. */
-static int g8_gate_quant_args(const RadArgs* a, const HaloArgs& r, HaloGateQuant* gq) {
+/* `rot`: attn_paged_gate_had_quant, whose codes are int8 in the rotated domain. */
+[[maybe_unused]] static int g8_gate_quant_args(const RadArgs* a, const HaloArgs& r,
+                                               HaloGateQuant* gq, bool rot = false) {
     const RadTensor* g = halo_opt(a, AP_GQ_G);
     const RadTensor* q = halo_opt(a, AP_GQ_Q);
     const RadTensor* s = halo_opt(a, AP_GQ_S);
@@ -276,6 +286,7 @@ static int g8_gate_quant_args(const RadArgs* a, const HaloArgs& r, HaloGateQuant
     if (g->dtype != RAD_BF16 || (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) ||
         s->dtype != RAD_F32)
         return HALO_NO(RAD_E_DTYPE);
+    if (rot && q->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
     const char* act = halo_gets(a, "act");
     if (!act || std::strcmp(act, "sigmoid")) return HALO_NO(RAD_E_UNSUPPORTED);
     if (halo_geti_or(a, "group", kHaloGqGroup) != kHaloGqGroup) return HALO_NO(RAD_E_SHAPE);
@@ -299,9 +310,10 @@ static int g8_gate_quant_args(const RadArgs* a, const HaloArgs& r, HaloGateQuant
     gq->q_ld = (unsigned)qp;
     gq->s_ld = (unsigned)sp;
     gq->i8   = q->dtype == RAD_I8 ? 1 : 0;
+    gq->rot  = rot ? 1 : 0;
     return RAD_OK;
 }
-#endif  /* HALO_ATTN_GQ && HALO_ATTN_H256 */
+#endif  /* HALO_ATTN_H256 */
 
 
 #if G8_UNION && HALO_ATTN_GQ && HALO_ATTN_H256
@@ -538,6 +550,17 @@ extern "C" int GQ_SYM(halo_rad_attn_decode_gq_h256_gqa, _bf16)(const RadArgs* a,
     if (gc != RAD_OK) return gc;
     return g8_decode_launch<256, 1>(&r, s, &gq);
 }
+/* The same with the rotated int8 quantiser in the merge (attn_paged_gate_had_quant), for an out
+ * projection stored rotated. */
+extern "C" int GQ_SYM(halo_rad_attn_decode_ghq_h256_gqa, _bf16)(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    const int rc = g8_decode_common(a, &r, 256);
+    if (rc != RAD_OK) return rc;
+    HaloGateQuant gq{};
+    const int gc = g8_gate_quant_args(a, r, &gq, true);
+    if (gc != RAD_OK) return gc;
+    return g8_decode_launch<256, 1>(&r, s, &gq);
+}
 #endif  /* HALO_ATTN_GQ */
 #endif  /* HALO_ATTN_H256 */
 
@@ -585,3 +608,91 @@ G8_V4_DECODE(fp8v4, 400, O_V4)
 G8_V4_DECODE(k6v4, 352, O_V4 | O_K6)
 #undef G8_V4_DECODE
 #endif  /* HALO_ATTN_H256 && HALO_ATTN_V4 */
+
+// ============================================================== the int8 cache
+//
+// K and V as int8 codes with one f16 scale each per token and head (kv_store_i8): a token's row is
+// 2 * head_dim + 4 bytes. The kernels are the templates' O_KVI8 forms, as libr4d's: the codes widen
+// to f16 times their scale where the fp8_v4 / k6_v4 forms widen theirs (halo_dt16.h,
+// i8x8_to_f16x4w), so the prefill (K staged eight dims a thread at head_dim 128 and 64, having no
+// wide fetch there) and the split-KV decode serve every ratio this body is instantiated at.
+#if HALO_ATTN_H64
+/* The int8 cache at this width: a token's row is 2 * 64 + 4 = 132 bytes. */
+extern "C" int GQ_SYM(halo_rad_attn_prefill_h64_gqa, _i8)(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    const int rc = fill_paged_row(a, &r, 64, 2 * 64 + 4);
+    if (rc != RAD_OK) return rc;
+    G8_SPLIT(64, a, &r);
+    return g8_prefill_launch<64, G8_P_OPT_64 | O_KVI8, 0>(&r, (hipStream_t)s);
+}
+extern "C" int64_t GQ_SYM(halo_rad_attn_prefill_h64_gqa, _i8_scratch)(const RadArgs* a) {
+    return halo_prefill_scratch<G8_P_NWARPS, G8_P_TILE, 64, G8_GQA>(a, 2 * 64 + 4);
+}
+#endif
+#if HALO_ATTN_H128
+/* ---- head_dim 128: a token's row is 2 * 128 + 4 = 260 bytes. Prefill, and the decode that also
+ * serves a drafter's non-causal block. */
+extern "C" int GQ_SYM(halo_rad_attn_prefill_h128_gqa, _i8)(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    const int rc = fill_paged_row(a, &r, 128, 2 * 128 + 4);
+    if (rc != RAD_OK) return rc;
+    G8_SPLIT(128, a, &r);
+    return g8_prefill_launch<128, G8_P_OPT_128 | O_KVI8, 0>(&r, (hipStream_t)s);
+}
+extern "C" int64_t GQ_SYM(halo_rad_attn_prefill_h128_gqa, _i8_scratch)(const RadArgs* a) {
+    return halo_prefill_scratch<G8_P_NWARPS, G8_P_TILE, 128, G8_GQA>(a, 2 * 128 + 4);
+}
+extern "C" int64_t GQ_SYM(halo_rad_attn_decode_h128_gqa, _i8_scratch)(const RadArgs* a) {
+    return g8_decode_scratch(a, 128, 2 * 128 + 4);
+}
+extern "C" int GQ_SYM(halo_rad_attn_decode_h128_gqa, _i8)(const RadArgs* a, RadStream s) {
+    HaloArgs r;
+    const int rc = g8_decode_common(a, &r, 128, 2 * 128 + 4);
+    if (rc != RAD_OK) return rc;
+    return g8_decode_launch<128, 0, O_KVI8>(&r, s);
+}
+#endif  /* HALO_ATTN_H128 */
+#if HALO_ATTN_H256
+/* ---- head_dim 256 (a token's row 2 * 256 + 4 = 516 bytes): prefill, decode and decode with the
+ * gate and quantiser in the merge. */
+#define G8_I8_ENTRIES(TAG, ROWB, XOPT)                                                         \
+extern "C" int64_t GQ_SYM(halo_rad_attn_prefill_h256_gqa, _##TAG##_scratch)(const RadArgs* a) {\
+    return halo_prefill_scratch<G8_P_NWARPS, G8_P_TILE, 256, G8_GQA>(a, ROWB);                 \
+}                                                                                              \
+extern "C" int GQ_SYM(halo_rad_attn_prefill_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) { \
+    HaloArgs r;                                                                                \
+    const int rc = fill_paged_row(a, &r, 256, ROWB);                                           \
+    if (rc != RAD_OK) return rc;                                                               \
+    G8_SPLIT(256, a, &r);                                                                      \
+    return g8_prefill_launch<256, G8_P_OPT_256 | (XOPT), 0>(&r, (hipStream_t)s);               \
+}                                                                                              \
+extern "C" int64_t GQ_SYM(halo_rad_attn_decode_h256_gqa, _##TAG##_scratch)(const RadArgs* a) { \
+    return g8_decode_scratch(a, 256, ROWB);                                                    \
+}                                                                                              \
+extern "C" int GQ_SYM(halo_rad_attn_decode_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) {  \
+    HaloArgs r;                                                                                \
+    const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
+    if (rc != RAD_OK) return rc;                                                               \
+    return g8_decode_launch<256, 0, (XOPT)>(&r, s);                                            \
+}                                                                                              \
+extern "C" int GQ_SYM(halo_rad_attn_decode_gq_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) { \
+    HaloArgs r;                                                                                \
+    const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
+    if (rc != RAD_OK) return rc;                                                               \
+    HaloGateQuant gq{};                                                                        \
+    const int gc = g8_gate_quant_args(a, r, &gq);                                              \
+    if (gc != RAD_OK) return gc;                                                               \
+    return g8_decode_launch<256, 0, (XOPT)>(&r, s, &gq);                                       \
+}                                                                                              \
+extern "C" int GQ_SYM(halo_rad_attn_decode_ghq_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) { \
+    HaloArgs r;                                                                                \
+    const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
+    if (rc != RAD_OK) return rc;                                                               \
+    HaloGateQuant gq{};                                                                        \
+    const int gc = g8_gate_quant_args(a, r, &gq, true);                                        \
+    if (gc != RAD_OK) return gc;                                                               \
+    return g8_decode_launch<256, 0, (XOPT)>(&r, s, &gq);                                       \
+}
+G8_I8_ENTRIES(i8, 516, O_KVI8)
+#undef G8_I8_ENTRIES
+#endif  /* HALO_ATTN_H256 */

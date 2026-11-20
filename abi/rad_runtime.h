@@ -344,7 +344,8 @@ typedef struct RadBatch {
      * (RadEncoderDecl::bidirectional): a picture's or a video frame's placeholders inside one
      * sequence's chunk. The pass attends them causally like every other row; the plugin attends a
      * run's rows again without the causal bound, over the keys before `bidi_used` (the position
-     * after the run's last token), in place of that result. The scheduler ends no chunk inside such
+     * after the run's last token, counted as the window group's seqused is: from the first
+     * position of its table), in place of that result. The scheduler ends no chunk inside such
      * a run, so its keys are this pass's or, after a prefix hit, the cache's; a run longer than any
      * step is cut where its chunk ends, and that chunk's rows see the run up to the cut.
      *
@@ -363,6 +364,18 @@ typedef struct RadBatch {
      * context state at the anchor (LiLiCorr) gathers it there; the query rows themselves sit past
      * that position. Null on every other pass. */
     const int32_t* anchor_rows;
+    /* ---- appended in ABI 43 (a checkpoint inside the step) */
+    /* A step of one prefill sequence (n_seq 1, no decode rows) whose linear-state checkpoint lies
+     * inside it rather than at its end: host, the rows before the checkpoint (its position less
+     * the sequence's context), 0 on every other step. Set only for a plugin that asked
+     * (RadArchProbe::ckpt_snap_ok). Such a plugin runs its recurrence over [0, ckpt_cut) and
+     * [ckpt_cut, n_tok) as two pieces -- each what a chunk of those rows computes -- and calls
+     * rad_ckpt_snap for each stateful layer between them, so the snapshot is the state a chunk
+     * ending at the checkpoint leaves, without a step of its own for the rows past it.
+     * `ckpt_cu` is [3] device: {0, ckpt_cut, n_tok}, a piece's cu_seqlens at +0 and +1; null when
+     * ckpt_cut is 0. */
+    int32_t        ckpt_cut;
+    const int32_t* ckpt_cu;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -502,7 +515,7 @@ typedef struct RadGenBatch {
     /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
      * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
-    /* ---- appended in ABI 41 (Krea 2 reference attention) */
+    /* ---- appended in ABI 44 (Krea 2 reference attention) */
     /* DENOISE: one natural-log bias a sequence on target queries to reference keys.
      * Negative infinity isolates the reference queries instead (registered outfill).
      * mode_sigma has three values a sequence, one per span in mode_cu. */
@@ -738,7 +751,8 @@ typedef struct RadVideoGenBatch {
     /* VENCODE: f32 [enc_frames, enc_height, enc_width, 3] RGB in 0..255, the frames padded to
      * whole clips by repeating the last (rad_arch_encode_geom's entry 23). AENCODE: f32
      * [enc_channels, enc_n_samples], each channel padded with zeros to the hop (entry 0). Both:
-     * the pass's geometry as rad_arch_encode_geom gave it, i32 on the device, and the media's
+     * the pass's geometry as rad_arch_encode_geom gave it, i32 in pinned host memory also readable
+     * by device kernels (mixed-site encoders share it), and the media's
      * kind (RAD_ENC_*, below) and its number within the kind from 1. */
     const float*    enc_pixels;
     int32_t         enc_frames, enc_height, enc_width;
@@ -933,6 +947,13 @@ int rad_lane_join(RadCtx* c, int from, int to);
  * refuses a batch shape it does not serve; the engine stops with `what` in the message. Returns
  * the status it set, so a helper can `return rad_step_fail(...)`. */
 int rad_step_fail(RadCtx* c, const char* what);
+
+/* A step with a checkpoint inside it (RadBatch::ckpt_cut): copy layer `layer`'s state of the
+ * stateful KV group `group` -- the sequence's committed slot as the issue stands -- into the
+ * engine's checkpoint stage, on the current lane's stream. Called between the two pieces of the
+ * recurrence, once for every stateful group and layer the plugin holds. A no-op returning RAD_OK
+ * on a step with no checkpoint inside it, so a caller need not test. */
+int rad_ckpt_snap(RadCtx* c, rad_kvgroup group, int layer);
 
 /* ================================================================== run-phase queries */
 const RadBatch* rad_batch(RadCtx* c);

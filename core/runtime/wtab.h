@@ -14,8 +14,12 @@
 namespace rad {
 
 /* One dispatch's worth of writes: dst[i] = val[i] for i < n. Sized so the argument block stays
- * inside the backend's per-dispatch argument slot with the implicit arguments beside it. */
-constexpr int kWtabPatch = 24;
+ * inside the backend's per-dispatch argument slot with the implicit arguments beside it (648 of
+ * the AQL backend's 768 bytes), and within the kernel's one 64-thread workgroup. A staged prefill
+ * chunk patches every routed GEMM's tables, four to eight tables an op (Ctx::wtab_flush gathers
+ * them): at 24 writes a Flash-Next chunk at two ranks took two dispatches a GEMM where 40 take
+ * one. */
+constexpr int kWtabPatch = 40;
 
 struct WtabPatch {
     uint32_t n   = 0;

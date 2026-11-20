@@ -30,6 +30,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
+#include <tuple>
 #include <limits>
 #include <map>
 #include <string>
@@ -458,52 +460,6 @@ TEST(snapshotted_adapter_composes_its_original_bias_after_replacement) {
     CHECK_EQ(file->biases().size(), 1u);
 }
 
-TEST(adapter_snapshot_pool_charges_live_revisions_once) {
-    const std::string dir = new_dir("genlora_snapshot_pool");
-    const std::string path = dir + "/active.safetensors";
-    const std::string replacement = dir + "/new.safetensors";
-    write_st(path, {tensor("layer.diff_b", "F32", {kD}, 7)});
-    write_st(replacement, {tensor("layer.diff_b", "F32", {kD}, 19)});
-    lora::AdapterSnapshots pool;
-    std::shared_ptr<const lora::AdapterSnapshots::Source> old, same, next;
-    std::string err;
-    const std::string invalid = dir + "/incomplete.safetensors";
-    write_st(invalid, {tensor("layer.lora_A.weight", "F32", {2, kD}, 1)});
-    CHECK_EQ(pool.acquire(invalid, 4096, 0, &old, &err), RAD_E_FORMAT);
-    CHECK(!old);
-    CHECK_EQ(pool.used_bytes(), 0u);
-    REQUIRE_EQ(pool.acquire(path, std::filesystem::file_size(path), 0, &old, &err), RAD_OK);
-    const auto budget = old->file.size_bytes();
-    REQUIRE_EQ(pool.acquire(path, budget, 0, &same, &err), RAD_OK);
-    CHECK(same == old);
-    CHECK_EQ(pool.used_bytes(), budget);
-    REQUIRE_EQ(std::rename(replacement.c_str(), path.c_str()), 0);
-    int64_t pressure_bytes = -1;
-    CHECK_EQ(pool.acquire(path, budget, 0, &next, &err, &pressure_bytes), RAD_E_FULL);
-    CHECK_EQ(pressure_bytes, 0);
-    CHECK(!next);
-#if defined(__linux__)
-    CHECK_EQ(pool.acquire(path, budget * 2, std::numeric_limits<int64_t>::max(),
-                          &next, &err, &pressure_bytes), RAD_E_FULL);
-    CHECK_EQ(pressure_bytes, static_cast<int64_t>(std::filesystem::file_size(path)));
-    CHECK(!next);
-    CHECK_EQ(pool.used_bytes(), budget);
-#endif
-    REQUIRE_EQ(pool.acquire(path, budget * 2, 0, &next, &err, &pressure_bytes), RAD_OK);
-    CHECK_EQ(pressure_bytes, 0);
-    CHECK(next->revision != old->revision);
-    CHECK_EQ(pool.used_bytes(), 2 * budget);
-    CHECK(std::memcmp(next->file.biases().at("layer")->data,
-                      old->file.biases().at("layer")->data, kD * sizeof(float)) != 0);
-    next.reset();
-    same.reset();
-    CHECK_EQ(pool.acquire(path, budget, 0, &next, &err), RAD_E_FULL);
-    old.reset();
-    CHECK_EQ(pool.used_bytes(), 0u);
-    REQUIRE_EQ(pool.acquire(path, budget, 0, &next, &err), RAD_OK);
-    CHECK_EQ(next->file.size_bytes(), budget);
-}
-
 TEST(krea_projector_lora_resolves_and_composes_without_a_gemm_site) {
     const std::string dir = new_dir("genlora_projector");
     const std::string path = dir + "/projector.safetensors";
@@ -871,6 +827,78 @@ TEST(requests_name_adapters_in_a_field_or_in_prompt_tags) {
     body = { { "loras", { 3 } } };
     CHECK_EQ(server::parse_loras(body, &prompt, &out, &field, &why), (int)RAD_E_INVAL);
     CHECK_EQ(field, std::string("loras"));
+}
+
+TEST(adapter_composition_compresses_a_known_spectrum_with_concurrent_callers) {
+    const std::string path = new_dir("genlora-compose-spectrum") + "/one.safetensors";
+    const std::string key = "transformer.transformer_blocks.0.attn.to_q";
+    constexpr int rank = 10, keep = 8;
+    TW A{key + ".lora_A.weight", "F32", {rank, kD}, std::vector<float>(rank * kD)};
+    TW B{key + ".lora_B.weight", "F32", {kQ, rank}, std::vector<float>(kQ * rank)};
+    for (int i = 0; i < rank; ++i) { A.v[i * kD + i] = 1; B.v[i * rank + i] = rank - i; }
+    write_st(path, {A, B});
+    auto adapter = std::make_shared<lora::AdapterFile>();
+    std::string why;
+    REQUIRE_EQ(adapter->open(path, &why), RAD_OK);
+    Program program;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &program, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(program, {"*"}, keep, &sites, &why), RAD_OK);
+    const lora::KeyMap keys(program, sites);
+    auto compose = [&] {
+        std::map<std::string, lora::Composite> modules;
+        lora::ComposeReport report;
+        std::string error;
+        const int status = lora::compose(keys, {{"one", adapter, 1.0}}, keep, &modules, &report, &error);
+        return std::tuple{status, std::move(modules), report.worst_kept};
+    };
+    std::vector<std::future<decltype(compose())>> requests;
+    for (int i = 0; i < 4; ++i) requests.push_back(std::async(std::launch::async, compose));
+    for (auto& request : requests) {
+        const auto [status, modules, retained] = request.get();
+        REQUIRE_EQ(status, RAD_OK);
+        REQUIRE_EQ(modules.size(), size_t(1));
+        const auto& result = modules.at(key);
+        CHECK_EQ(result.r, keep);
+        CHECK_NEAR(retained, 380.0 / 385.0, 1e-5);
+        const auto dense = mul(result.B, result.A, kQ, keep, kD, 1.0);
+        for (int row = 0; row < kQ; ++row)
+            for (int col = 0; col < kD; ++col)
+                CHECK_NEAR(dense.d[(size_t)row * kD + col], row == col && row < keep ? rank - row : 0, 1e-4);
+    }
+}
+
+TEST(scalar_truncation_deflates_dependent_columns_without_changing_scale) {
+    for (const int64_t rows : {12, 256})
+        for (const float scale : {1e-4f, 1.0f, 1e4f}) {
+            constexpr int64_t cols = 128, rank = 12, keep = 8;
+            lora::Delta delta;
+            delta.N = rows; delta.K = cols; delta.r = rank;
+            delta.rank_bound = rank; delta.low_rank = true;
+            delta.B.assign((size_t)rows * rank, 0.0f);
+            delta.A.assign(rank * cols, 0.0f);
+            for (int64_t i = 0; i < 10; ++i) {
+                delta.B[(size_t)i * rank + i] = scale;
+                delta.A[i * cols + i] = 10 - i;
+            }
+            delta.energy = 385.0 * scale * scale;
+            std::vector<float> B, A;
+            double retained = 0.0;
+            lora::truncate(delta, keep, &B, &A, &retained);
+            CHECK_NEAR(retained, 380.0 / 385.0, 1e-5);
+            const auto result = mul(B, A, rows, keep, cols, 1.0);
+            double error = 0.0, reference = 0.0;
+            for (int64_t row = 0; row < rows; ++row)
+                for (int64_t col = 0; col < cols; ++col) {
+                    const double expected = row == col && row < keep ? scale * (10 - row) : 0.0;
+                    const double difference = result.d[(size_t)row * cols + col] - expected;
+                    error += difference * difference;
+                    reference += expected * expected;
+                }
+            REQUIRE(reference > 0);
+            CHECK(error / reference < 1e-8);
+        }
 }
 
 RAD_TEST_MAIN()

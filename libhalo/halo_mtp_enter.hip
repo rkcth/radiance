@@ -18,6 +18,7 @@
 #include "halo.h"
 #include "halo_args.h"
 #include "halo_common.h"
+#include "halo_chain.h"
 #include "halo_gdn_wmma.h"
 #include "halo_fp8_wmma.h"
 #include "halo_hc_fp8.h"
@@ -32,7 +33,7 @@
 namespace {
 
 /* ---- per-(row, stream) sums of squares; stream hc is the embedding ----------------------- */
-__global__ __launch_bounds__(256) void mtp_ss_kernel(const uint16_t* __restrict__ h,
+__device__ __forceinline__ void mtp_ss_kernel_body(const uint16_t* __restrict__ h,
                                                      const uint16_t* __restrict__ e,
                                                      float* __restrict__ ss,
                                                      long n, int hc, long hrow, long erow) {
@@ -59,8 +60,20 @@ __global__ __launch_bounds__(256) void mtp_ss_kernel(const uint16_t* __restrict_
     }
 }
 
+/* mtp_ss_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(256)
+void mtp_ss_kernel(const uint16_t* __restrict__ h,
+                                                     const uint16_t* __restrict__ e,
+                                                     float* __restrict__ ss,
+                                                     long n, int hc, long hrow, long erow) {
+    if (CH::on) halo_chain_wait();
+    mtp_ss_kernel_body(h, e, ss, n, hc, hrow, erow);
+    if (CH::on) halo_chain_done();
+}
+
 /* ---- apply the norm: one block a (row, stream) ------------------------------------------ */
-__global__ __launch_bounds__(256) void mtp_norm_kernel(const uint16_t* __restrict__ h,
+__device__ __forceinline__ void mtp_norm_kernel_body(const uint16_t* __restrict__ h,
                                                        const uint16_t* __restrict__ e,
                                                        const float* __restrict__ wh,
                                                        const float* __restrict__ we,
@@ -100,6 +113,24 @@ __global__ __launch_bounds__(256) void mtp_norm_kernel(const uint16_t* __restric
         for (long i = tid; i < n; i += 256)
             dst[i] = f32_to_bf16(bf16_to_f32(src[i]) * sc * (wh[c * n + i] + wadd));
     }
+}
+
+/* mtp_norm_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(256)
+void mtp_norm_kernel(const uint16_t* __restrict__ h,
+                                                       const uint16_t* __restrict__ e,
+                                                       const float* __restrict__ wh,
+                                                       const float* __restrict__ we,
+                                                       const float* __restrict__ ss,
+                                                       uint16_t* __restrict__ nh,
+                                                       uint16_t* __restrict__ ne,
+                                                       long n, int hc, int flat,
+                                                       long hrow, long erow, float eps,
+                                                       float wadd) {
+    if (CH::on) halo_chain_wait();
+    mtp_norm_kernel_body(h, e, wh, we, ss, nh, ne, n, hc, flat, hrow, erow, eps, wadd);
+    if (CH::on) halo_chain_done();
 }
 
 /* ---- decode one stored E4M3 plane to bf16: out[r][k] = e4m3(code) * scale[k / G] -------- */
@@ -145,7 +176,7 @@ constexpr int kMtfS = 4;           /* its K slices */
 constexpr int kMtfSubMax = 8;      /* scale groups a slice at most */
 
 template <int RT>
-__global__ __launch_bounds__(256) void mtf_gemv_kernel(const uint16_t* __restrict__ ne,
+__device__ __forceinline__ void mtf_gemv_kernel_body(const uint16_t* __restrict__ ne,
                                                        const uint16_t* __restrict__ nh,
                                                        const uint8_t* __restrict__ fce,
                                                        const uint8_t* __restrict__ fch, long ld,
@@ -229,8 +260,22 @@ __global__ __launch_bounds__(256) void mtf_gemv_kernel(const uint16_t* __restric
     }
 }
 
+/* mtf_gemv_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <int RT, class CH = HaloUnchained>
+__global__ __launch_bounds__(256)
+void mtf_gemv_kernel(const uint16_t* __restrict__ ne,
+                                                       const uint16_t* __restrict__ nh,
+                                                       const uint8_t* __restrict__ fce,
+                                                       const uint8_t* __restrict__ fch, long ld,
+                                                       float* __restrict__ P, long pslice,
+                                                       int re, int rh, int n) {
+    if (CH::on) halo_chain_wait();
+    mtf_gemv_kernel_body<RT>(ne, nh, fce, fch, ld, P, pslice, re, rh, n);
+    if (CH::on) halo_chain_done();
+}
+
 /* x[r][k*n+i] = fc_h . nh[r][k] + fc_e . ne[r], each a sum of its slices in order. */
-__global__ __launch_bounds__(256) void mtf_finish_kernel(const float* __restrict__ P, long pslice,
+__device__ __forceinline__ void mtf_finish_kernel_body(const float* __restrict__ P, long pslice,
                                                          int S, uint16_t* __restrict__ x, long xrow,
                                                          int rows, int n, int hc) {
     const long idx = (long)blockIdx.x * 256 + threadIdx.x;
@@ -242,6 +287,17 @@ __global__ __launch_bounds__(256) void mtf_finish_kernel(const float* __restrict
         ve += P[(long)s * pslice + r * n + i];
     }
     x[r * xrow + rem] = f32_to_bf16(vh + ve);
+}
+
+/* mtf_finish_kernel's chained form (halo_chain.h): the body above, bracketed so every block waits once and adds once. */
+template <class CH = HaloUnchained>
+__global__ __launch_bounds__(256)
+void mtf_finish_kernel(const float* __restrict__ P, long pslice,
+                                                         int S, uint16_t* __restrict__ x, long xrow,
+                                                         int rows, int n, int hc) {
+    if (CH::on) halo_chain_wait();
+    mtf_finish_kernel_body(P, pslice, S, x, xrow, rows, n, hc);
+    if (CH::on) halo_chain_done();
 }
 
 /* ---- the tiled product (clone of halo_hc_read's tile, plain epilogue) -------------------- */
@@ -467,28 +523,34 @@ extern "C" int halo_rad_mtp_enter(const RadArgs* a, RadStream s) {
                      n / 128 / kMtfS <= kMtfSubMax &&
                      ((uintptr_t)halo_p(fch) & 15u) == 0 && ((uintptr_t)halo_p(fce) & 15u) == 0;
     if (dec) {
-        mtp_ss_kernel<<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
-            (const uint16_t*)halo_p(h), (const uint16_t*)halo_p(e), ssbuf, n, (int)hc, hrow, erow);
-        mtp_norm_kernel<<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
-            (const uint16_t*)halo_p(h), (const uint16_t*)halo_p(e),
-            (const float*)halo_p(wh), (const float*)halo_p(we), ssbuf, nh, ne,
-            n, (int)hc, ngroup == 1 ? 1 : 0, hrow, erow, eps, wadd);
-        float* P = (float*)(scr + p.off_p);
-        const long pslice = (long)std::min<long long>(p.rows * hc, kMtfRows) * n;
-        const long ld = halo_hc8::row_bytes(n, halo_hc8::kDownGroup);
-        const dim3 grid((unsigned)(n / 16), (unsigned)kMtfS, 2u);
-#define MTF(RT) mtf_gemv_kernel<RT><<<grid, 256, 0, st>>>(ne, nh, (const uint8_t*)halo_p(fce), \
-            (const uint8_t*)halo_p(fch), ld, P, pslice, (int)rows, (int)(rows * hc), (int)n)
-        switch ((rows * hc + 15) / 16) {
-            case 1: MTF(1); break;
-            case 2: MTF(2); break;
-            case 3: MTF(3); break;
-            default: MTF(4); break;
-        }
-#undef MTF
-        const long tot = rows * HN;
-        mtf_finish_kernel<<<dim3((unsigned)((tot + 255) / 256)), 256, 0, st>>>(
-            P, pslice, kMtfS, (uint16_t*)halo_p(x), xrow, (int)rows, (int)n, (int)hc);
+        /* The decode form's launches have chained forms (halo_chain.h), where the row resolved
+         * with `chain`. */
+        auto launch_dec = [&](auto ch) {
+            using CH = decltype(ch);
+            mtp_ss_kernel<CH><<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
+                (const uint16_t*)halo_p(h), (const uint16_t*)halo_p(e), ssbuf, n, (int)hc, hrow, erow);
+            mtp_norm_kernel<CH><<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
+                (const uint16_t*)halo_p(h), (const uint16_t*)halo_p(e),
+                (const float*)halo_p(wh), (const float*)halo_p(we), ssbuf, nh, ne,
+                n, (int)hc, ngroup == 1 ? 1 : 0, hrow, erow, eps, wadd);
+            float* P = (float*)(scr + p.off_p);
+            const long pslice = (long)std::min<long long>(p.rows * hc, kMtfRows) * n;
+            const long ld = halo_hc8::row_bytes(n, halo_hc8::kDownGroup);
+            const dim3 grid((unsigned)(n / 16), (unsigned)kMtfS, 2u);
+    #define MTF(RT) mtf_gemv_kernel<RT, CH><<<grid, 256, 0, st>>>(ne, nh, (const uint8_t*)halo_p(fce), \
+                (const uint8_t*)halo_p(fch), ld, P, pslice, (int)rows, (int)(rows * hc), (int)n)
+            switch ((rows * hc + 15) / 16) {
+                case 1: MTF(1); break;
+                case 2: MTF(2); break;
+                case 3: MTF(3); break;
+                default: MTF(4); break;
+            }
+    #undef MTF
+            const long tot = rows * HN;
+            mtf_finish_kernel<CH><<<dim3((unsigned)((tot + 255) / 256)), 256, 0, st>>>(
+                P, pslice, kMtfS, (uint16_t*)halo_p(x), xrow, (int)rows, (int)n, (int)hc);
+        };
+        if (halo_geti_or(a, "chain", 0) != 0) launch_dec(r4dchain{}); else launch_dec(HaloUnchained{});
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
     if (f8) {
@@ -507,10 +569,10 @@ extern "C" int halo_rad_mtp_enter(const RadArgs* a, RadStream s) {
         We = Web;
     }
 
-    mtp_ss_kernel<<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
+    mtp_ss_kernel<HaloUnchained><<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
         (const uint16_t*)halo_p(h), (const uint16_t*)halo_p(e), ssbuf, n, (int)hc, hrow, erow);
     if (hipGetLastError() != hipSuccess) return HALO_NO(RAD_E_DEVICE);
-    mtp_norm_kernel<<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
+    mtp_norm_kernel<HaloUnchained><<<dim3((unsigned)(hc + 1), (unsigned)rows), 256, 0, st>>>(
         (const uint16_t*)halo_p(h), (const uint16_t*)halo_p(e),
         (const float*)halo_p(wh), (const float*)halo_p(we), ssbuf, nh, ne,
         n, (int)hc, ngroup == 1 ? 1 : 0, hrow, erow, eps, wadd);

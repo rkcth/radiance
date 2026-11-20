@@ -13,13 +13,90 @@
 #include "halo_common.h"
 #include "halo_fp8_lm.h"
 #include "halo_fp8_wmma.h"
+#include "halo_iqr.h"
 #include "halo_wmma.h"
 
 #include <cstdint>
 
 namespace {
 
-template <bool I8, int MT>
+/* An IQR head (halo_iqr.h's lm row: TB-bit codes indexing an int8 table of 2^TB entries, the row's
+ * bf16 scales after its codes), libr4d's lm_table / lm_codes16: TB = 0 is a byte a code. The table
+ * sits after the last row (lm_tab), and a kernel holds it in sixteen dwords (`tv`) for byte
+ * permutes: a lookup of four codes is one v_perm a group of eight entries, the groups chosen
+ * bytewise by the codes' upper bits. No matrix instruction: libr4d's code as it is. */
+template <uint32_t TB>
+__device__ __forceinline__ void lm_table(const uint8_t* W, uint32_t rows, uint32_t w_ld,
+                                         uint32_t (&tv)[16]) {
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) tv[i] = 0u;
+    if constexpr (TB != 0) {
+        const uint32_t* t = (const uint32_t*)(W + ((size_t)rows * w_ld + 255u) / 256u * 256u);
+#pragma unroll
+        for (uint32_t i = 0; i < ((1u << TB) + 3u) / 4u; ++i) tv[i] = t[i];
+    }
+}
+/* The table entries of four codes, one a byte of `x`. */
+template <uint32_t TB>
+__device__ __forceinline__ uint32_t lm_lookup4(uint32_t x, const uint32_t (&tv)[16]) {
+    const uint32_t lo = x & 0x07070707u;
+    uint32_t g[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i)
+        if (i < ((1u << TB) + 7u) / 8u) g[i] = __builtin_amdgcn_perm(tv[2 * i + 1], tv[2 * i], lo);
+#pragma unroll
+    for (uint32_t b = 3; b < TB; ++b) {
+        /* bytes whose bit b is set take the upper half of each pair of groups */
+        const uint32_t m = ((x >> b) & 0x01010101u) * 0xFFu;
+        const uint32_t half = 1u << (b - 3);
+#pragma unroll
+        for (uint32_t i = 0; i < 8; i += 2 * half)
+            if (i + half < ((1u << TB) + 7u) / 8u) g[i] = (g[i + half] & m) | (g[i] & ~m);
+    }
+    return g[0];
+}
+/* Sixteen consecutive codes from column c (a multiple of 16) of a row, as int8 bytes (TB = 0: the
+ * row's own sixteen bytes). */
+template <uint32_t TB>
+__device__ __forceinline__ uint4 lm_codes16(const uint8_t* __restrict__ row, uint32_t c,
+                                            const uint32_t (&tv)[16]) {
+    if constexpr (TB == 0) {
+        return *(const uint4*)(row + c);
+    } else {
+        /* 2*TB bytes from offset 2*TB*(c/16), read from the dword-aligned window over them */
+        constexpr uint32_t ND = (2u * TB + 3u + 3u) / 4u;
+        const uint32_t off = c / 16u * 2u * TB;
+        const uint32_t* p = (const uint32_t*)(row + (off & ~3u));
+        uint32_t w[ND];
+#pragma unroll
+        for (uint32_t i = 0; i < ND; ++i) w[i] = p[i];
+        const uint32_t sh = (off & 3u) * 8u;
+        uint32_t d[ND];
+#pragma unroll
+        for (uint32_t i = 0; i < ND; ++i)
+            d[i] = __builtin_amdgcn_alignbit(i + 1u < ND ? w[i + 1u] : 0u, w[i], sh);
+        uint32_t o[4];
+#pragma unroll
+        for (uint32_t q = 0; q < 4; ++q) {
+            uint32_t x = 0;
+#pragma unroll
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t bit = (q * 4u + j) * TB, i = bit >> 5, s = bit & 31u;
+                const uint32_t v = (s + TB <= 32u ? d[i] >> s
+                                                  : __builtin_amdgcn_alignbit(d[i + 1u], d[i], s)) &
+                                   ((1u << TB) - 1u);
+                x |= v << (8u * j);
+            }
+            o[q] = lm_lookup4<TB>(x, tv);
+        }
+        return make_uint4(o[0], o[1], o[2], o[3]);
+    }
+}
+/* Bytes of a row's codes before its scales. */
+template <uint32_t TB>
+__device__ __forceinline__ long lm_codes_bytes(long K) { return TB ? K / 8 * (long)TB : K; }
+
+template <bool I8, int MT, uint32_t TB = 0>
 __global__ void __launch_bounds__(128) logits_kernel(const uint16_t* __restrict__ x,
                                                      const uint8_t* __restrict__ w,
                                                      float* __restrict__ y,
@@ -30,8 +107,10 @@ __global__ void __launch_bounds__(128) logits_kernel(const uint16_t* __restrict_
     if (n >= N) return;
     const int m0 = (int)blockIdx.y * MT;
     const int mt = min(MT, M - m0);
+    uint32_t tv[16];
+    lm_table<TB>(w, (uint32_t)N, (uint32_t)stride, tv);
     const uint8_t* wr = w + (long)n * stride;
-    const uint16_t* sr = (const uint16_t*)(wr + K);
+    const uint16_t* sr = (const uint16_t*)(wr + lm_codes_bytes<TB>(K));
     const long nchunks = K >> 4;
     float acc[MT];
 #pragma unroll
@@ -39,7 +118,7 @@ __global__ void __launch_bounds__(128) logits_kernel(const uint16_t* __restrict_
     for (long c = lane; c < nchunks; c += 32) {
         const long k0 = c << 4;
         const float wsc = bf16_to_f32(sr[k0 >> 7]);
-        const uint4 wb = *(const uint4*)(wr + k0);
+        const uint4 wb = lm_codes16<TB>(wr, (uint32_t)k0, tv);
         const uint32_t qw[4] = { wb.x, wb.y, wb.z, wb.w };
         float wv[16];
 #pragma unroll
@@ -152,7 +231,7 @@ __device__ __forceinline__ u32x8 lg_dec16(const u32x4 q) {
 #define HALO_LG_W 4
 #define HALO_LG_NT 1
 #define HALO_LG_KG 2
-template <bool I8, int MT, int NT>
+template <bool I8, int MT, int NT, uint32_t TB = 0>
 __global__ void __launch_bounds__(32 * HALO_LG_W) logits_wmma_kernel(const uint16_t* __restrict__ x,
                                                           const uint8_t* __restrict__ w,
                                                           float* __restrict__ y,
@@ -179,14 +258,19 @@ __global__ void __launch_bounds__(32 * HALO_LG_W) logits_wmma_kernel(const uint1
     const long nlast = (long)N - 1;
     const long nbase = min(nb, nlast);
     const uint8_t* wb = w + nbase * stride;
+    /* TB > 0 (an IQR head): a lane's sixteen codes are lm_codes16's from its row's start, so the
+     * offset is the row's and the column is added at the fetch. */
+    uint32_t tv[16];
+    lm_table<TB>(w, (uint32_t)N, (uint32_t)stride, tv);
     uint32_t wo[4 * NT];
 #pragma unroll
     for (int i = 0; i < 4 * NT; ++i)
-        wo[i] = (uint32_t)((min(nb + 4 * i + (lane >> 3), nlast) - nbase) * stride) + (lane & 7) * 16;
+        wo[i] = (uint32_t)((min(nb + 4 * i + (lane >> 3), nlast) - nbase) * stride) +
+                (TB ? 0u : (uint32_t)(lane & 7) * 16);
     uint32_t so[NT];
 #pragma unroll
     for (int j = 0; j < NT; ++j)
-        so[j] = (uint32_t)((min(nb + 16 * j + col, nlast) - nbase) * stride + K);
+        so[j] = (uint32_t)((min(nb + 16 * j + col, nlast) - nbase) * stride + lm_codes_bytes<TB>(K));
     const int mbase = min(m0, M - 1);
     const uint16_t* xb = x + (long)mbase * a_ld + (tid & 15) * 8;
     uint32_t xo[XI];
@@ -203,7 +287,14 @@ __global__ void __launch_bounds__(32 * HALO_LG_W) logits_wmma_kernel(const uint1
             const int gq = min(g0 + q, ng - 1);   /* past the end re-reads the last group */
             const uint32_t o = (uint32_t)gq * 128;
 #pragma unroll
-            for (int i = 0; i < 4 * NT; ++i) wq[q][i] = *(const u32x4*)(wb + wo[i] + o);
+            for (int i = 0; i < 4 * NT; ++i) {
+                if constexpr (TB == 0) {
+                    wq[q][i] = *(const u32x4*)(wb + wo[i] + o);
+                } else {
+                    const uint4 c = lm_codes16<TB>(wb + wo[i], o + (uint32_t)(lane & 7) * 16, tv);
+                    wq[q][i] = u32x4{ c.x, c.y, c.z, c.w };
+                }
+            }
 #pragma unroll
             for (int i = 0; i < XI; ++i) xq[q][i] = *(const u32x4*)(xb + xo[i] + o);
 #pragma unroll
@@ -289,17 +380,17 @@ __global__ void __launch_bounds__(32 * HALO_LG_W) logits_wmma_kernel(const uint1
  * x or head the WMMA form's 16-byte loads cannot take. Above, one pass of the head covers up to
  * 64 rows, or 96 when M is 65 .. 96 (one six-tile pass beats two four-tile ones there; past 96
  * the six-tile wave is compute-bound and 64-row passes are cheaper). */
-template <bool I8>
+template <bool I8, uint32_t TB = 0>
 void logits_launch(const uint16_t* xp, const uint8_t* wp, float* yp, int M, int N, long K,
                    long stride, long a_ld, long c_ld, hipStream_t st) {
     constexpr int MIN_M = I8 ? 4 : 2;
     if (M < MIN_M || (a_ld % 8) || (stride % 16) || ((uintptr_t)xp & 15) || ((uintptr_t)wp & 15)) {
         if (M <= 32) {
             const dim3 grid((unsigned)((N + 3) / 4), (unsigned)((M + 7) / 8));
-            logits_kernel<I8, 8><<<grid, 128, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld);
+            logits_kernel<I8, 8, TB><<<grid, 128, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld);
         } else {
             const dim3 grid((unsigned)((N + 3) / 4), (unsigned)((M + 31) / 32));
-            logits_kernel<I8, 32><<<grid, 128, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld);
+            logits_kernel<I8, 32, TB><<<grid, 128, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld);
         }
         return;
     }
@@ -309,11 +400,11 @@ void logits_launch(const uint16_t* xp, const uint8_t* wp, float* yp, int M, int 
     const unsigned gy = (unsigned)((M + 16 * mtiles - 1) / (16 * mtiles));
     const dim3 grid(gx, gy);
     switch (mtiles) {
-    case 1: logits_wmma_kernel<I8, 1, NT><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
-    case 2: logits_wmma_kernel<I8, 2, NT><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
-    case 3: logits_wmma_kernel<I8, 3, NT><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
-    case 4: logits_wmma_kernel<I8, 4, NT><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
-    default: logits_wmma_kernel<I8, 6, NT><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
+    case 1: logits_wmma_kernel<I8, 1, NT, TB><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
+    case 2: logits_wmma_kernel<I8, 2, NT, TB><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
+    case 3: logits_wmma_kernel<I8, 3, NT, TB><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
+    case 4: logits_wmma_kernel<I8, 4, NT, TB><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
+    default: logits_wmma_kernel<I8, 6, NT, TB><<<grid, 32 * HALO_LG_W, 0, st>>>(xp, wp, yp, M, N, K, stride, a_ld, c_ld); break;
     }
 }
 
@@ -350,6 +441,44 @@ extern "C" int halo_rad_logits_gemm_fp8(const RadArgs* a, RadStream s) {
 }
 extern "C" int halo_rad_logits_gemm_i8(const RadArgs* a, RadStream s) {
     return logits_run<true>(a, s, RAD_I8);
+}
+
+/* An IQR head (halo_iqr.h's lm form): the int8 head's kernels with each sixteen codes read at their
+ * width and looked up in the row form's table (lm_codes16), so the arithmetic is the int8 head's
+ * over the same values. */
+extern "C" int halo_rad_logits_gemm_iqr(const RadArgs* a, RadStream s) {
+    const RadTensor* X = halo_opt(a, 0);
+    const RadTensor* W = halo_opt(a, 1);
+    const RadTensor* Y = halo_opt(a, 2);
+    if (!X || !W || !Y) return HALO_NO(RAD_E_INVAL);
+    if (X->dtype != RAD_BF16 || Y->dtype != RAD_F32 || !halo_iqr::is_weight_dtype(W->dtype))
+        return HALO_NO(RAD_E_DTYPE);
+    const uint32_t word = W->dtype & halo_iqr::kWordMask;
+    if (!halo_iqr::lm_built(word)) return HALO_NO(RAD_E_DTYPE);
+    const halo_iqr::Form f = halo_iqr::form(word);
+    const long long N = halo_geti_or(a, "n_vocab", halo_dim(W, 0));
+    const long long K = halo_geti_or(a, "n_embd", 0);
+    if (N <= 0 || K <= 0 || K % 128) return HALO_NO(RAD_E_SHAPE);
+    if (W->rank != 2 || W->shape[0] != N || W->shape[1] != K) return HALO_NO(RAD_E_SHAPE);
+    const long stride = (long)halo_iqr::lm_row(f, K);
+    long long M = 0, My = 0;
+    const long long x_ld = halo_rows_pitch(X, K, &M);
+    const long long y_ld = halo_rows_pitch(Y, N, &My);
+    if (x_ld < 0 || y_ld < 0) return HALO_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return HALO_NO(RAD_E_SHAPE);
+    if (((uintptr_t)halo_p(X) & 15) || ((uintptr_t)halo_p(W) & 255)) return HALO_NO(RAD_E_ALIGN);
+    const uint16_t* xp = (const uint16_t*)halo_p(X);
+    const uint8_t* wp = (const uint8_t*)halo_p(W);
+    float* yp = (float*)halo_p(Y);
+    const hipStream_t st = (hipStream_t)s;
+    switch (f.bits) {
+    case 2: logits_launch<true, 2>(xp, wp, yp, (int)M, (int)N, K, stride, x_ld, y_ld, st); break;
+    case 3: logits_launch<true, 3>(xp, wp, yp, (int)M, (int)N, K, stride, x_ld, y_ld, st); break;
+    case 4: logits_launch<true, 4>(xp, wp, yp, (int)M, (int)N, K, stride, x_ld, y_ld, st); break;
+    case 5: logits_launch<true, 5>(xp, wp, yp, (int)M, (int)N, K, stride, x_ld, y_ld, st); break;
+    default: logits_launch<true, 6>(xp, wp, yp, (int)M, (int)N, K, stride, x_ld, y_ld, st); break;
+    }
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* The raw-pointer entries libr4d exports beside the rows (halo.h): same kernel, the

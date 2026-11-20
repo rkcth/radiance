@@ -64,6 +64,9 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
+    /* rad_kernel_chain said 2: its chained forms' acquire covers their scalar loads too, so their
+     * packets need no acquire from the packet processor. */
+    bool                 chain_fenced = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */
@@ -748,6 +751,10 @@ struct Request {
     /* A tree drafter's parents for `draft` (StepEntry::draft_parent): draft[j]'s parent node,
      * 0 the bonus token. Null for a chain. The sampler reads each row's ancestors from it. */
     const int32_t*       draft_parent = nullptr;
+    /* The draft is a SuffixDecoding chain (--draft-suffix, sched/suffix.h): copied from the
+     * sequence's own history, not drawn from the head's law. The coupled sampler binds no state to
+     * its rows, whatever stale states the head's own draft for the same positions left. */
+    bool                 draft_suffix = false;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* Whether this request may be speculated on. Written by the engine after every step, read by
@@ -811,21 +818,6 @@ enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
-    std::string supplemental_text_model;
-    int supplemental_text_device = -1;
-    int64_t supplemental_text_host_pool_mib = 0;
-    std::string image_model;           /* local checkpoint for the shared HTTP service */
-    int image_text_rank = -1;        /* -1 inherits the text rank layout */
-    std::vector<std::string> image_model_reserve; /* additional checkpoints to size at startup */
-    int64_t image_reload_headroom_mib = 0; /* extra VRAM per shared generator rank */
-    int64_t unloaded_image_expert_pool_mib = 0; /* optional expert cache after explicit unload */
-    TablePlacement image_embedding_placement = TablePlacement::Auto; /* shared image overrides only */
-    TablePlacement video_tower_placement = TablePlacement::Vram; /* shared video only */
-    bool image_model_fifo = false;   /* dispatch strictly in arrival order */
-    int64_t image_lora_snapshot_mib = 2048; /* immutable adapter sources for admitted images */
-    bool image_snapshot_pageable = true; /* generator weight snapshots, including active loans */
-    bool image_weight_loan = true; /* allow text experts to borrow idle generator weight memory */
-    int64_t image_model_cache_mib = 0; /* image snapshot RAM budget, including the active model */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
     std::string model_revision;        /* --model-revision: the hub revision a repo id fetches;
@@ -834,7 +826,6 @@ struct Config {
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
 
     int   tp = 1;
-    std::vector<int> device_ordinals; /* optional ordered backend ordinals, one per rank */
     /* The tensor-parallel wire, a deployment choice. 1 is the exact bf16 all-reduce. 0 accepts a
      * lossy wire: at two ranks libr4d sends a Walsh-Hadamard-rotated 6-bit payload (6 bits per
      * element plus a bf16 scale per 64) instead of 16 bits per element, 2.4x fewer bytes over
@@ -876,6 +867,10 @@ struct Config {
     /* --mixed-step-target-ms: soft duration target for a mixed prefill/decode step. The scheduler
      * learns an aggregate prefill-row cap from completed mixed steps; 0 keeps the fixed policy. */
     int64_t mixed_step_target_ms = 0;
+    /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
+     * position fits beside every runner. Off (the default) admits the first chunk alone, which
+     * can fill the pool and be preempted back to zero at the first decode step. */
+    bool prefill_room_gate = false;
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
@@ -982,6 +977,37 @@ struct Config {
      * inside a span are not written; those at its end and at a prompt's tail are, where a span of
      * 1 writes them. */
     int64_t prefill_span = 1;
+    /* --prefill-span-pass piece|step. `step`: where the architecture runs a spanned step serially
+     * (it pipelines none of it), its routed block takes the whole step in one pass instead of one
+     * pass an interval (RadBuildCtx::span_pass_step), so the step sorts its slots once and each
+     * expert's weight is read -- and a trellis expert decoded -- once for all its rows. The expert
+     * planes are then a step tall (on Qwen3.8-Flash-Next at a 4096 budget 165 MiB more arena a
+     * rank), and the output differs from piece passes at tie level, as a spanned step's at one or
+     * two ranks already does. Off (piece): a routed pass a piece. */
+    bool    prefill_span_step = false;
+    /* --prefill-span-min auto|N: the shortest prompt, in tokens, a lone prefill spans for
+     * (Scheduler::set_span_min). -1 is auto, which Engine::serve resolves: eight intervals where
+     * routed experts are staged from host memory (a spanned step runs at the full plan, which lends
+     * the expert slab nothing), 0 elsewhere. 0 spans every lone prefill from its second interval
+     * on. */
+    int64_t prefill_span_min = -1;
+    /* --prefill-tail-snapshot on|off: whether a prompt's last chunk is cut where the linear state
+     * is snapshotted for the next turn under --prefix-resume nearest (Scheduler::plan_chunk): at
+     * the last quantum boundary (Scheduler::tail_checkpoint), or, a spanned last chunk, at the last
+     * interval boundary it crosses. The cut leaves the prompt's last few tokens (up to a quantum,
+     * or a quarter interval) a step of their own, which on a routed model reads most of the
+     * experts once more (some 60 ms a prompt on Flash-Next at two ranks). Off ends the last chunk
+     * at the prompt's end: the next turn resumes from the deepest snapshot a chunk end left (the
+     * last interval or span boundary) and recomputes up to an interval more. On (the default):
+     * the tail snapshot at its own boundary. Output of a cold prompt differs only as another
+     * chunking does. */
+    bool    prefill_tail_snapshot = true;
+    /* --prefill-span-first on|off: whether a span may start at a prompt's first token (off, the
+     * default: from its second interval on, Scheduler::plan_chunk). On, the first interval is no
+     * step of its own: its rows read the indexer's selection where the dense pass served them,
+     * the same keys below QSA's exactness bound summed in another order, and on routed models the
+     * first interval's experts are read once with the span's rows. */
+    bool    prefill_span_first = false;
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap
@@ -989,6 +1015,10 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
+    /* Engine-internal, not a flag: plan a checkpoint stage on the card (KVManager::ckpt_stage).
+     * The engine sets it at startup where the plugin can cut a step at a tail snapshot and
+     * --prefix-resume is nearest; a KVManager planned without it (a test, a tool) carves none. */
+    bool    ckpt_stage = false;
     /* --prefix-resume exact|nearest.
      * - exact (the default): a prefix hit resumes only on the grid an idle server's cold prefill
      *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken
@@ -1059,6 +1089,65 @@ struct Config {
      * (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
      * Off by default; on changes which tokens a fixed seed yields, not their law. */
     bool        draft_coupling = false;
+    /* --draft-verify token|block|traversal: how a coupled draft chain is verified. token (default):
+     * each row's maximal coupling (above). block: Block Verification (arXiv 2403.10444,
+     * abi/rad_mtp_block.h), the chain's drafts accepted jointly; the same output law, at least as
+     * many accepted tokens. block switches --draft-coupling on (the drafting half is shared).
+     * traversal: Traversal Verification (arXiv 2505.12398, abi/rad_mtp_traversal.h) walks the
+     * chain from its last draft back to its first; the same output law, never fewer accepted
+     * tokens than token-wise, and it needs --draft-coupling on. */
+    bool        draft_verify_block = false;
+    bool        draft_verify_traversal = false;
+    /* --draft-depth fixed|adaptive (core/sched/draft_depth.h): adaptive stops a coupled serial
+     * chain within the step as soon as the head's own laws make the next draft unlikely, so a step
+     * drafts 1 .. draft_depth_max tokens (0: num-speculative-tokens) and its verify carries that
+     * many rows. The chain goes on while the product of the rounds' statistic (stat 0: the largest
+     * mass of each round's law, 1: the mass of the token it drew) stays >= draft_depth_stop; the
+     * decision trails the chain by draft_depth_lag rounds (0 or 1; 1 hides the host's readback
+     * behind a running round), draft_depth_min rounds always run. Switches --draft-coupling on
+     * and needs a serial head's chain and --draft-window fixed. Lossless: the rule reads draft-side
+     * quantities only. Off by default: the fixed chain. */
+    bool        draft_depth_adaptive = false;
+    int         draft_depth_max = 0;
+    int         draft_depth_min = 1;
+    int         draft_depth_lag = 1;
+    int         draft_depth_stat = 0;
+    double      draft_depth_stop = 0.85;
+    /* --draft-depth-load on|off (core/sched/draft_depth.h): the load-aware depth rule. A step that
+     * drafts for draft_depth_load_from sequences or more runs round j only for the rows whose
+     * expected accepted drafts pay their verify rows, the kernel tile those rows open and the
+     * round, at the throughput the engine has; and, with draft_depth_load_late, chooses each
+     * row's verified prefix again when the next verify is issued, from the laws read by then.
+     * draft_depth_load_min rounds always run. The tables (acceptance by confidence, tokens a
+     * millisecond, a row's, a round's and a tile's milliseconds) start from built-in ones -- or
+     * the comma lists below, by drafting rows 1 .. 8 (jumps: past 16, 32, 48, 64 verify rows) --
+     * and with draft_depth_load_online follow the running server. Needs --draft-depth adaptive
+     * with --draft-depth-stat top. A step with fewer sequences is the stop rule's, bit for bit.
+     * Lossless: the rule reads draft-side laws of the step and tables fixed before it. */
+    bool        draft_depth_load = false;
+    int         draft_depth_load_from = 5;
+    int         draft_depth_load_min = 2;
+    bool        draft_depth_load_late = true;
+    bool        draft_depth_load_online = true;
+    std::string draft_depth_load_tok_ms;
+    std::string draft_depth_load_row_ms;
+    std::string draft_depth_load_round_ms;
+    std::string draft_depth_load_jump_ms;
+    /* --draft-suffix on (core/sched/suffix.h): SuffixDecoding as a step SELECTOR on a serial head's
+     * chain. On a host-built step, when the sequence's own history (prompt ++ output) ends in a
+     * pattern of at least `draft_suffix_min_match` tokens that occurred before, the step verifies
+     * that earlier occurrence's continuation (a chain of at most `draft_suffix_max` rows (7: the
+     * delta-net fold's register window serves 8 query rows, so a Flash-Next verify window past 7
+     * drafts leaves its kernels unsupported), cut where the path score falls under
+     * `draft_suffix_min_score`) in place of the head's draft. Lossless: the proposal's rows are never
+     * coupled. Off by default: every step is the head's. */
+    bool        draft_suffix = false;
+    int         draft_suffix_min_match = 6;
+    int         draft_suffix_max = 7;
+    float       draft_suffix_min_score = 0.3f;
+    /* The head's own rounds when --draft-suffix raised `n_spec` (the verify window) past them; 0 =
+     * `n_spec` (set by the engine, not a flag). */
+    int         n_spec_head = 0;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

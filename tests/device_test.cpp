@@ -133,8 +133,163 @@ TEST(chained_launches_follow_the_plugins_ask_on_the_aql_backend_only) {
     CHECK_EQ(rad_dev_chain_enabled(), 0);
     rad_dev_chain_infer(1);
     CHECK_EQ(rad_dev_chain_enabled(), aql ? 1 : 0);
+    /* Their packets go unfenced only where the engine says every chained form fences itself (2),
+     * and only where launches chain at all. */
+    CHECK_EQ(rad_dev_chain_unfenced(), 0);
+    rad_dev_chain_infer(2);
+    CHECK_EQ(rad_dev_chain_enabled(), aql ? 1 : 0);
+    CHECK_EQ(rad_dev_chain_unfenced(), aql ? 1 : 0);
     rad_dev_chain_infer(0);
     CHECK_EQ(rad_dev_chain_enabled(), 0);
+    CHECK_EQ(rad_dev_chain_unfenced(), 0);
+}
+
+/* A chained kernel reads behind its wait what the launch in front of it wrote, a value all its
+ * lanes share included. The compiler loads such a value through the scalar data cache, which no
+ * fence it emits empties: only the packet processor's acquire did, when the kernel was launched,
+ * before the launch in front had written. A chained launch whose packet goes unfenced
+ * (rad_dev_chain_infer(2)) must therefore empty that cache behind its wait (chain_kernel.h), or
+ * every reader here sees the value the reader before it loaded: 1797 launches in 1800 did on an
+ * R9700 before the wait emptied it. Behind a gate, so the card has the readers launched ahead of
+ * the stores they wait for, as a played pass has them. */
+TEST(a_chained_kernel_sees_a_shared_value_the_launch_in_front_wrote) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned pairs = 400, blocks = 256;
+    Stream st;
+    DevBuf<unsigned> x(64 * sizeof(unsigned), RAD_MEM_DEVICE);
+    DevBuf<unsigned> seen((int64_t)pairs * blocks * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(x && seen);
+    std::vector<unsigned> got((size_t)pairs * blocks);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        /* 2: the packets go unfenced, as an engine whose libraries fence in the kernel issues
+         * them. 1: they keep the packet processor's fences, and the readers must see the same. */
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(x, 0, 64 * sizeof(unsigned), st.s));
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)pairs * blocks * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        void* gate = nullptr;
+        REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+        REQUIRE(rad_gate_room(st.s) >= (int64_t)2 * pairs);
+        CHECK_OK(rad::aql::chain_probe(st.s, x, seen, pairs, blocks));
+        CHECK_OK(rad_gate_open(gate));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)pairs * blocks * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        int64_t stale = 0;
+        for (unsigned i = 0; i < pairs; ++i)
+            for (unsigned b = 0; b < blocks; ++b) stale += got[(size_t)i * blocks + b] != i + 1u;
+        CHECK_EQ(stale, 0);
+    }
+    rad_dev_chain_infer(0);
+}
+
+/* A chained launch reads its own arguments and its chain record from a slot of the argument ring
+ * that the host wrote and that another launch read a lap of the ring ago; the L2 still holds what
+ * that launch read. Only a system-scope acquire of the packet processor's makes the card forget
+ * it: the one the ring asks for every half lap, which a chained packet keeps while it goes
+ * without every other. Three laps of launches that each store where their own arguments say,
+ * with no host wait between them: without that acquire every launch past the first lap stores
+ * where the launch a lap before did (as they do on a prefetch stream, which never takes one and
+ * counts on the pass beside it to have turned the L2 over). */
+/* The prefetch stream (rad_xp_stream_create, agent-scope acquires) also reads its own arguments
+ * from a host-written ring: across three laps every launch must see its own slot. */
+TEST(a_prefetch_stream_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("the prefetch stream is an AQL stream");
+    const unsigned n = 3 * 4096 + 517;
+    RadStream xs = nullptr;
+    if (rad_xp_stream_create(&xs) != RAD_OK || !xs) SKIP("no prefetch stream on this device");
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    {
+        rad_dev_chain_infer(1);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad::aql::chain_marks(xs, seen, n));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    rad_dev_chain_infer(0);
+    rad_stream_destroy(xs);
+}
+
+TEST(a_chained_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned n = 3 * 4096 + 517;
+    Stream st;
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad::aql::chain_marks(st.s, seen, n));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    rad_dev_chain_infer(0);
+}
+
+/* The host writes a launch's arguments and chain record into VRAM through the BAR, and the card's
+ * host data path keeps such a write until it is flushed (aql.cpp, host_writes_out). A launch the
+ * card starts within a microsecond or two of its doorbell otherwise reads the slot as it was. What
+ * it reads first is its chain record, so that is what this asks every launch for, on every card:
+ * a lap of card-side copies with chaining off leaves every slot with their arguments and a record
+ * no kernel accepts; then the same copies chained and 50 us apart, the host quiet between them as
+ * the mover is between the copies of a loan recall, each saying whether it found a record. One
+ * that does not would count nothing and stall the queue; the probe counts for it. With the
+ * packets unacquired and with the packet processor's acquire on them. */
+TEST(a_copy_issued_after_a_pause_finds_the_record_written_for_it) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("the AQL backend's argument ring");
+    const unsigned lap = 4096 + 64, words = 8192;
+    const int64_t bytes = 256 * 1024;
+    for (int card = 0; card < rad_dev_count(); ++card) {
+        REQUIRE_EQ(rad_dev_set(card), RAD_OK);
+        DevBuf<unsigned> seen((int64_t)words * sizeof(unsigned), RAD_MEM_DEVICE);
+        DevBuf<uint8_t> src(bytes, RAD_MEM_DEVICE), dst(bytes, RAD_MEM_DEVICE);
+        REQUIRE(seen && src && dst);
+        std::vector<unsigned> got(words);
+        for (int fenced = 0; fenced < 2; ++fenced) {
+            /* Without the flush four runs in five of this many found unacquired launches that
+             * had read the old slot on an R9700, a few or tens of them at a time. */
+            const unsigned n = fenced ? 1500 : 6000;
+            Stream st;
+            rad_dev_chain_infer(0);
+            CHECK_OK(rad::aql::chain_asks(st.s, src, dst, (uint64_t)bytes, seen, lap));
+            CHECK_OK(rad_memset_async(seen, 0, (int64_t)words * sizeof(unsigned), st.s));
+            CHECK_OK(rad_stream_sync(st.s));
+            rad_dev_chain_infer(fenced ? 1 : 2);
+            for (unsigned i = 0; i < n; ++i) {
+                /* In runs of eight with a host wait between them, as a recall ends in one. */
+                if (i % 8 == 0) CHECK_OK(rad_stream_sync(st.s));
+                const auto t0 = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(50)) {}
+                CHECK_OK(rad::aql::chain_asks(st.s, src, dst, (uint64_t)bytes, seen + i, 1));
+            }
+            CHECK_OK(rad_stream_sync(st.s));
+            CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)words * sizeof(unsigned), st.s));
+            CHECK_OK(rad_stream_sync(st.s));
+            /* A launch that read the slot as the lap left it stores where that launch did. */
+            unsigned without = 0, missing = 0;
+            for (unsigned i = 0; i < words; ++i) {
+                without += (got[i] & 0x80000000u) != 0;
+                missing += i < n && got[i] != 1u;
+            }
+            CHECK_EQ(without, 0u);
+            CHECK_EQ(missing, 0u);
+        }
+        rad_dev_chain_infer(0);
+    }
+    rad_dev_set(0);
 }
 
 /* An engine of more than one rank claims its cards (rad_dev_cards_claim). The claim that makes a
@@ -2034,6 +2189,39 @@ TEST(an_allocation_its_owner_refills_parks_with_no_copy_and_comes_back_to_be_fil
     CHECK(spans[0].p > (char*)a.d);
     CHECK_OK(a.upload());
     CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Runtime LoRA state is a mutable arena allocation, separate from the container-backed base
+ * weights. Refilling base weights must neither discard nor overwrite the occupied adapter. */
+TEST(container_weights_and_mutable_adapters_survive_park_and_refill) {
+    if (!need_vmem()) return;
+    Paged weights(9125, kParkChunk + (3 << 20), 63u);
+    Paged adapter(9125, kParkChunk + (1 << 20), 79u);
+    REQUIRE(weights.d && adapter.d);
+    CHECK_OK(weights.upload());
+    rad::dev_page_seal(weights.d);
+    rad::dev_page_refilled(weights.d);
+    for (int round = 0; round < 2; ++round) {
+        fill(adapter.want.data(), adapter.n, (uint32_t)(79 + 2 * round));
+        CHECK_OK(adapter.upload());
+        rad::PageOut request;
+        request.host_budget = (int64_t)1 << 30;
+        rad::PageResult result;
+        CHECK_OK(rad::dev_page_out(weights.owner, request, &result));
+        CHECK(result.file >= weights.n);
+        CHECK(result.host >= adapter.n);
+        CHECK(result.host < weights.n + adapter.n);
+        CHECK_EQ(result.disk, 0);
+        std::vector<rad::PageSpan> refill;
+        CHECK_OK(rad::dev_page_in(weights.owner, &refill));
+        REQUIRE_EQ(refill.size(), (size_t)1);
+        CHECK(refill[0].p == (char*)weights.d);
+        CHECK(refill[0].bytes >= weights.n);
+        CHECK_EQ(adapter.first_bad(), -1);       /* its slot bytes already came back independently */
+        CHECK_OK(weights.upload());             /* the owner supplies the original base weights */
+        CHECK_EQ(weights.first_bad(), -1);
+        CHECK_EQ(adapter.first_bad(), -1);
+    }
 }
 
 /* A host fill of an allocation its owner refills: host memory mapped at its parked chunks, filled by

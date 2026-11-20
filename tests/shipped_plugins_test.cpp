@@ -99,7 +99,7 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "glm5next", "" },
         { "hunyuan3d2", "" }, { "hyv3", "" }, { "hyv3", "fp8" }, { "hyv3", "gguf_ftype_15" },
-        { "laya", "" }, { "lfm2", "" }, { "llama", "" }, { "mistral3", "" },
+        { "laya", "" }, { "lfm2", "" }, { "lfm3", "" }, { "llama", "" }, { "mistral3", "" },
         { "llama", "fp8_e4m3" }, { "nemotronh", "" }, { "nomicbert", "" }, { "qwen35", "" },
         { "museglimmer", "" },
         { "museglimmer", "compressed-tensors" },
@@ -284,3 +284,29 @@ TEST(fishomni_tags_a_reference_transcript_as_the_prompt_builder_does) {
 }
 
 RAD_TEST_MAIN()
+
+/* libr4d's rows that chain answer 2 to rad_kernel_chain: every chained form of theirs ends its wait
+ * in r4d_chain_acquire, which empties the scalar data cache behind the fence, and that is what
+ * lets an engine issue their packets without the packet processor's acquire
+ * (core/device/aql.cpp, "the acquire of a chained launch"). One row answering 1 keeps the acquire
+ * on every chained packet of an engine that loads it, so a row added with a wait of its own shows
+ * up here rather than as a slower step. */
+TEST(libr4ds_rows_that_chain_acquire_for_themselves) {
+#ifndef RAD_TEST_HAS_LIBR4D
+    SKIP("this build makes no libr4d");
+#endif
+    Registry r;
+    const int st = r.load_dir(dir_of("kernels"), { "libr4d", "libref" });
+    if (!r.plugin("libr4d")) {
+        (void)st;
+        ARTIFACT_MISSING("libr4d under " + dir_of("kernels"));
+    }
+    int chained = 0;
+    for (const KernelRow& k : r.rows()) {
+        if (!k.chain) continue;
+        ++chained;
+        CHECK(k.chain_fenced);
+        if (!k.chain_fenced) fprintf(stderr, "    %s chains and answers 1\n", k.info->name);
+    }
+    CHECK(chained > 0);
+}

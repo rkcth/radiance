@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 
 namespace rad {
 
@@ -246,9 +247,7 @@ static int pick_arch(Registry& r, const std::string& home, const std::string& ar
 
 int rad_tools_load_plugins(const std::string& home, const std::vector<std::string>& hierarchy,
                            const std::string& arch_id, const std::string& quant,
-                           LoadedPlugins* out, bool imported, bool reuse_registry,
-                           const std::string& tune_machine) {
-    (void)reuse_registry; // Loaded plugin sets are shared and validated below.
+                           LoadedPlugins* out, bool imported) {
     if (!out) return RAD_E_INVAL;
     *out = LoadedPlugins{};
 
@@ -298,11 +297,9 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
     /* The tuning cache, once the kernel set is known. A missing file leaves every shape on its
      * plugin's first variant. Logged when it has rows; --debug-graph shows the per-shape
      * source. */
-    const std::string machine = tune_machine.empty() ? rad_machine_key() : tune_machine;
-    const std::string rel = TuneCache::rel_path(machine);
-    const std::string tune = rad_home_file(home, rel);
-    const std::string tune_home = tune.substr(0, tune.size() - rel.size() - 1);
-    const int n_tuned = r.load_tune(tune_home, machine);
+    const std::string tune = rad_home_file(home, TuneCache::rel_path(rad_machine_key()));
+    const std::string tune_home = tune.substr(0, tune.size() - TuneCache::rel_path(rad_machine_key()).size() - 1);
+    const int n_tuned = r.load_tune(tune_home);
     if (n_tuned > 0) RAD_INFO("tune cache: %d row(s) from %s", n_tuned, tune.c_str());
 
     return pick_arch(r, home, arch_id, quant, out, imported);
@@ -479,21 +476,42 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     if (sources) b.set_sources(sources);
     b.set_instances(instances);
     const bool with_lora = lora && lora->cfg && lora->cfg->enabled();
-    /* Shared media applies adapters to image GEMMs under their declared roots.
-     * Keep image targets out of audio and video kernel selection. */
-    if (with_lora && !lora->image_only) b.set_lora_targets(&lora->targets);
+    if (with_lora) b.set_lora_targets(&lora->targets);
 
     int s = ap->arch_declare(&b, &meta, &ctx);
     if (s < 0) {
         RAD_ERR("%s: rad_arch_declare returned %s", lp.arch_plugin.c_str(), rad_strerror(s));
         for (const auto& e : b.errors()) RAD_ERR("    %s", e.c_str());
+        /* A plugin that needs an op it declared, and finds it resolved to no kernel, returns a
+         * status and may say nothing more. The ops no library serves in either domain are the
+         * usual reason on a card whose kernel library covers fewer forms, so they are listed with
+         * the constraint that refused each: the device's line, which names the form the card
+         * lacks. */
+        const Program& p = b.program();
+        std::set<std::pair<int32_t, std::string>> no_host;
+        for (const Program::Miss& m : p.misses)
+            if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
+        std::vector<std::string> unserved;
+        for (const Program::Miss& m : p.misses) {
+            if (m.domain != RAD_DOMAIN_DEVICE || !no_host.count({ m.index, m.span })) continue;
+            const std::string line = m.line();
+            if (std::find(unserved.begin(), unserved.end(), line) == unserved.end())
+                unserved.push_back(line);
+        }
+        if (!unserved.empty()) {
+            const size_t shown = std::min<size_t>(unserved.size(), 16);
+            RAD_ERR("    %zu op form(s) it declared before stopping have no kernel in the loaded "
+                    "libraries, on the card or on the host; a plugin that needs one of them stops "
+                    "where it finds that%s:", unserved.size(),
+                    shown < unserved.size() ? " (the first 16)" : "");
+            for (size_t i = 0; i < shown; ++i) RAD_ERR("      %s", unserved[i].c_str());
+        }
         return s;
     }
 
     /* Runtime LoRA, after the plugin and before the sampler: the sites read the plugin's finished
      * graph, and the appended ops go through the same resolution as every other op. */
-    const Program& program = ref ? *ref : b.program();
-    if (with_lora && (!lora->image_only || program.is_generator())) {
+    if (with_lora) {
         b.set_lora_targets(nullptr);
         s = lora_declare(b, *lora);
         if (s < 0) {

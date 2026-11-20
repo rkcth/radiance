@@ -1153,15 +1153,36 @@ std::string describes_differently(const KfCase& c, const RadOpSchema* schema, co
     return std::string();
 }
 
-void Replay::replay_case(size_t fi, const KfCase& c) {
+void Replay::replay_case(size_t fi, const KfCase& recorded) {
     const Kfixture& fx = fx_[fi];
-    const RadOpSchema* schema = reg_->schema(c.op);
+    const RadOpSchema* schema = reg_->schema(recorded.op);
     if (!schema) {
-        nm_.stale[c.op + "  (no plugin declares a schema for it)"]++;
+        nm_.stale[recorded.op + "  (no plugin declares a schema for it)"]++;
         ++st_.stale;
         ++st_.skipped;
         return;
     }
+    /* A schema that gained optional operands at its end takes a recording made before them with
+     * those operands absent: the case is the one recorded, and an absent operand is what the
+     * recording's launch passed. */
+    KfCase padded;
+    const KfCase* cp = &recorded;
+    if ((int)recorded.opd.size() < schema->n_operands) {
+        bool tail_optional = true;
+        for (int k = (int)recorded.opd.size(); k < schema->n_operands; ++k)
+            tail_optional = tail_optional && schema->operands[k].optional;
+        if (tail_optional) {
+            padded = recorded;
+            for (int k = (int)recorded.opd.size(); k < schema->n_operands; ++k) {
+                KfOperand o;
+                o.role = schema->operands[k].role;
+                o.absent = true;
+                padded.opd.push_back(o);
+            }
+            cp = &padded;
+        }
+    }
+    const KfCase& c = *cp;
     /* Operands are positional, so a fixture whose count differs from the schema's is stale. */
     if ((int)c.opd.size() != schema->n_operands) {
         nm_.stale[c.op + "  (fixture recorded " + std::to_string(c.opd.size()) + " operand(s), "

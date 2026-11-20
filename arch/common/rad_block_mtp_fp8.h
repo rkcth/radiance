@@ -92,6 +92,7 @@
 #include "rad_block_attn_gated_fp8.h"
 #include "rad_block_mlp_fp8.h"
 #include "rad_block_vit.h"
+#include "rad_spechub.h"
 
 namespace rad {
 namespace arch {
@@ -116,6 +117,9 @@ inline bool mtp_draft_head_q2(RadBuilder* b, const char* head, const char* lm) {
  * (MoeFP8's Config travels inside its Src for this reason). */
 template <class Ffn>
 struct MtpBlockFP8 {
+    /* spechub consumes a top-eight law; otherwise only the greedy token is needed. */
+    static constexpr int proposal_pitch(bool coupled) { return coupled ? 8 : 1; }
+
     struct Wire {
         /* [max_tok, n_embd] the trunk's final hidden states for the step just run (the plugin's
          * `h`). A pass names the rows it wants through out_ids. */
@@ -128,14 +132,19 @@ struct MtpBlockFP8 {
         rad_buf c      = 0;   /* [max_tok, 2 * n_embd]  the two normed halves, fc's input */
         rad_buf x      = 0;   /* [max_tok, n_embd]      the head's own residual stream */
         rad_buf logits = 0;   /* [max_logit_rows, n_vocab]  the trunk's, shared */
-        /* The 2-bit draft head's working set (see op_dlogits), sized at max_logit_rows: only
-         * drafting rows reach it. */
-        rad_buf dq   = 0;   /* [max_logit_rows, n_embd]   int8 codes */
-        rad_buf ds   = 0;   /* [max_logit_rows, 1]        f32, one scale a row */
-        rad_buf dsum = 0;   /* [n_embd/group, mpad]       f32, group-major (quant_act_i8's asum) */
-        rad_buf dlog = 0;   /* [max_logit_rows, n_vocab]  bf16, the coarse logits */
-        rad_buf didx = 0;   /* [max_logit_rows, 1]        i32, the proposed token */
-        rad_buf dval = 0;   /* [max_logit_rows, 1]        f32, its logit */
+        /* The 2-bit projection's scratch: at most one proposal per sequence, including the
+         * selected final history rows. The unselected history rows need only K/V. */
+        rad_buf dq   = 0;   /* [max_seqs, n_embd]      int8 codes */
+        rad_buf ds   = 0;   /* [max_seqs, 1]           f32, one scale a row */
+        rad_buf dsum = 0;   /* [n_embd/group, mpad]    f32, group-major (quant_act_i8's asum) */
+        rad_buf dlog = 0;   /* [max_seqs, n_vocab_all] bf16, the coarse logits */
+        rad_buf didx = 0;   /* [max_seqs, proposal_pitch] i32, proposal in column zero */
+        rad_buf dval = 0;   /* [max_seqs, proposal_pitch] f32, shortlist logits */
+        bool coupled = false;
+        /* A targeted calib-corpus run may select the virtual MTP layer (n_main) and record the
+         * draft head's actual input. The trunk's CalibFull is intentionally not involved. */
+        const char* calib_dir = nullptr;
+        int64_t calib_tokens = 0;
         /* The layer reuses the trunk's working set, which is dead by the time the head runs (a
          * second set would be 150 MiB). */
         AttnGatedFP8::Wire attn{};
@@ -147,9 +156,6 @@ struct MtpBlockFP8 {
         const char* norm               = nullptr;
         const char* pre_norm_hidden    = nullptr;
         const char* pre_norm_embedding = nullptr;
-        /* The checkpoint's lm_head. The trunk maps it as `output.weight`; the draft head is a
-         * second logical weight over the same tensor, quantised to 2 bits (mtp_draft_head_q2). */
-        const char* lm                 = nullptr;
         AttnGatedFP8::Src attn{};
         typename Ffn::Src mlp{};
     };
@@ -172,6 +178,11 @@ struct MtpBlockFP8 {
     MediaRows  mrows{};
     rad_op     op_norm = 0, op_dsel = 0, op_dback = 0, op_logits = 0;
     rad_op     op_dquant = 0, op_dlogits = 0, op_dtopk = 0;
+    rad_buf    couple_draws = 0, couple_state = 0;
+    rad_op     op_couple[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    CalibTap   draft_head_calib{};
+    bool       draft_head_calib_on = false;
+    mutable int64_t draft_head_calib_rows = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup kv,
                  int64_t rotary_dim, rad_weight tok_embd, rad_weight lm_head, float out_wadd,
@@ -186,7 +197,25 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                                      const Src& src) {
     g = geom; w = wire; layer = l; w_tok = tok_embd; w_lm = lm_head;
     rows = g.max_tok;
-    if (rows <= 0 || !w_tok || !w_lm) return RAD_E_INVAL;
+    q2 = w.dq != 0;
+    draft_head_calib_on = w.calib_dir && *w.calib_dir;
+    if (draft_head_calib_on && (w.calib_tokens <= 0 || g.max_spec != 0 || q2 || w.coupled)) {
+        std::fprintf(stderr, "radiance: MTP draft-head calibration requires a non-empty corpus "
+                             "and a history-only head (speculation off)\n");
+        return RAD_E_INVAL;
+    }
+    if (w.coupled && (!q2 || g.max_spec < 1 || g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS)) {
+        std::fprintf(stderr, "radiance: Qwen35 native MTP coupling requires the U2 draft head and "
+                             "a draft depth in 1..%d\n", RAD_MTP_COUPLE_MAX_ROUNDS);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (w.coupled && !rad_op_declared(b, "mtp_couple_propose")) {
+        std::fprintf(stderr, "radiance: load the spechub kernels for Qwen35 MTP draft coupling\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    if (rows <= 0 || !w_tok || (!draft_head_calib_on &&
+        (q2 ? (!w.ds || !w.dsum || !w.dlog || !w.didx || !w.dval) : (!w_lm || !w.logits))))
+        return RAD_E_INVAL;
 
     /* The normed embedding first, then the normed hidden state (see the header). */
     off_e = 0;
@@ -257,17 +286,19 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
      * to the front of `x` before the feed-forward, which then runs on those rows only. Goes through
      * `hout` (dead between fc's read and the norm's write), since an in-place gather could
      * overwrite a row not yet read. */
-    op_dsel = rw(b, RAD_OP(b, "gather_rows",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.x}, {w.hout});
-    op_dback = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.hout}, {w.x});
-    if (!op_dsel || !op_dback) return RAD_E_INVAL;
+    if (!draft_head_calib_on) {
+        op_dsel = rw(b, RAD_OP(b, "gather_rows",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS),
+                    {w.x}, {w.hout});
+        op_dback = rw(b, RAD_OP(b, "cast",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
+                                    RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                         RAD_NOWEIGHTS),
+                     {w.hout}, {w.x});
+        if (!op_dsel || !op_dback) return RAD_E_INVAL;
+    }
 
     RAD_ARCH_TRY(mlp.declare(b, nm, g, l, w.mlp, src.mlp));
 
@@ -277,15 +308,22 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                                 RAD_STR("dtype", g.dtype)),
                      RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.hout});
+    if (!op_norm) return RAD_E_INVAL;
+    if (draft_head_calib_on)
+        return g.rank == 0 ? draft_head_calib.declare(b, nm, rows, nm.f("mtp.draft_head"),
+                                                     w.hout, g.n_embd) : RAD_OK;
 
-    /* The trunk's lm_head over the head's hidden state, banded at the logits buffer's extent: it
-     * runs over one row per drafting sequence. */
-    op_logits = rw(b, RAD_OP(b, "logits_gemm",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                 RAD_INT("n_vocab", g.n_vocab),
-                                 RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
-                      RAD_WEIGHTS(w_lm)),
-                  {w.hout}, {w.logits});
+    /* Only the fallback projects through the target's single lm_head. In particular do not
+     * declare an unused logits_gemm with a null weight when the target uses width classes. */
+    if (!q2) {
+        op_logits = rw(b, RAD_OP(b, "logits_gemm",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                      RAD_INT("n_vocab", g.n_vocab),
+                                      RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
+                           RAD_WEIGHTS(w_lm)),
+                       {w.hout}, {w.logits});
+        if (!op_logits) return RAD_E_INVAL;
+    }
 
     /* ---- The 2-bit draft head.
      *
@@ -299,20 +337,26 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
      * asymmetric (four levels are too few for a symmetric one), so the activation side uses
      * `quant_act_i8`'s three-output form, whose per-group row sums subtract the stored zero.
      *
-     * The draft head bypasses the sampler, which reads f32 logits: `row_topk` at R=1 takes the
-     * argmax on the GEMM's bf16 output and the engine reads the id from `didx`. The trunk's logits
-     * plane is untouched.
+     * The head bypasses the sampler's f32 logits. row_topk takes the argmax, or the shortlist
+     * when coupling is on; the engine reads the proposal from column zero of didx. The target's
+     * logits plane is untouched.
      */
     enum { MTP_W2_GROUP = 128 };      /* libr4d's R4D_GEMM_W2A8_GROUP, and the layout's g128 tag */
     /* The plugin declares the working set only when mtp_draft_head_q2 found a 2-bit head (and
      * declared its name map). */
-    q2 = src.lm && w.dq && w.ds && w.dsum && w.dlog && w.didx && w.dval;
     if (q2) {
         /* Replicated over the whole vocabulary. Without the sampler's cross-rank merge, a sharded
          * plane would let each rank propose only its own vocabulary slice. Replication costs 341
          * MiB per card at 2 bits and keeps the draft path single-rank. (The stored bytes are also
          * tile-major, 16 output rows per packed block, so a shard would have to be whole tiles.) */
         const char* dhn = nm.f("mtp.draft_head.weight");
+        RadEncoding enc{}, expected = rad_enc_affine(RAD_U2, RAD_F16, 1, MTP_W2_GROUP);
+        rad_enc_add_plane(&expected, "zero", RAD_U8, 1, MTP_W2_GROUP);
+        if (!weight_enc(b, dhn, &enc) || !rad_enc_equal(&enc, &expected)) {
+            std::fprintf(stderr, "radiance: %s requires unrotated U2 codes with an F16 scale and "
+                                 "U8 zero per group of 128\n", dhn);
+            return RAD_E_DTYPE;
+        }
         w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {g.n_vocab_all, g.n_embd},
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
         w_dhs = decl_view(b, nm.f("mtp.draft_head.scale"), dhn, "scale,zero", RAD_F16,
@@ -321,32 +365,49 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
         if (!w_dh || !w_dhs) return RAD_E_INVAL;
 
         op_dquant = rw(b, RAD_OP(b, "quant_act_i8",
-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
                                      RAD_INT("n", g.n_embd), RAD_INT("group", MTP_W2_GROUP),
                                      RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
                       {w.hout}, {w.dq, w.ds, w.dsum});
 
         op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
                                       RAD_INT("N", g.n_vocab_all), RAD_INT("K", g.n_embd),
                                       RAD_INT("group", MTP_W2_GROUP), RAD_STR("dtype", "w2a8")),
                            RAD_WEIGHTS(w_dh, w_dhs)),
                        {w.dq, w.ds, w.dsum}, {w.dlog});
 
         op_dtopk = rw(b, RAD_OP(b, "row_topk",
-                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                    RAD_INT("N", g.n_vocab_all), RAD_INT("R", 1),
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
+                                    RAD_INT("N", g.n_vocab_all), RAD_INT("R", proposal_pitch(w.coupled)),
                                     RAD_STR("dtype", g.dtype)),
                          RAD_NOWEIGHTS),
                      {w.dlog}, {w.didx, w.dval});
+        if (!op_dquant || !op_dlogits || !op_dtopk) return RAD_E_INVAL;
+        if (w.coupled) {
+            /* The engine binds these persistent planes by name. The U2 projection is
+             * replicated over the full vocabulary, so its shortlist already holds global ids. */
+            couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                  {g.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
+            couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                  {g.max_spec, g.max_seqs, RAD_MTP_COUPLE_STATE_WORDS}, RAD_BUF_PERSIST);
+            if (!couple_draws || !couple_state) return RAD_E_INVAL;
+            for (int rd = 1; rd <= g.max_spec; ++rd) {
+                op_couple[rd - 1] = rw(b, RAD_OP(b, "mtp_couple_propose",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
+                               RAD_INT("round", rd), RAD_INT("max_rounds", g.max_spec)),
+                    RAD_NOWEIGHTS), {w.didx, w.dval, couple_draws}, {w.didx, couple_state});
+                if (!op_couple[rd - 1]) return RAD_E_INVAL;
+            }
+        }
     }
 
     /* Keep `hout` live through the head's last op: it is the next round's input, and if only the
      * lm_head's first op read it, the planner could give its bytes to later ops (silently lowering
      * acceptance). */
     {
-        const rad_op last = q2 ? op_dtopk : op_logits;
+        const rad_op last = w.coupled ? op_couple[g.max_spec - 1] : q2 ? op_dtopk : op_logits;
         if (rad_op_reads(b, last, &w.hout, 1) < 0) return RAD_E_INVAL;
     }
     return RAD_OK;
@@ -359,12 +420,21 @@ template <class Ffn>
 inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     const int r = batch->draft_pass;
+    const bool tap_history = draft_head_calib_on;
+    if (tap_history && (r >= 0 || batch->n_out != T || batch->n_draft_out != 0)) {
+        rad_step_fail(c, "MTP draft-head calibration requires every history row and no proposals");
+        return;
+    }
 
     /* The history pass gathers; later rounds read the previous pass's output from the same
      * buffer. */
     if (r == 1) {
         rad_step_fail(c, "the MTP head was handed a draft-round-1 pass: that round is carried by "
                          "the history pass (RadBatch::draft_out_ids) and has no pass of its own");
+        return;
+    }
+    if (w.coupled && (r == 0 || r > g.max_spec)) {
+        rad_step_fail(c, "Qwen35 MTP coupled round outside the declared draft depth");
         return;
     }
     if (r < 0 && batch->n_out > 0)
@@ -381,18 +451,19 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
 
     RAD_ISSUE(c, op_fc, brows(w.c, T), RAD_W(w_fc), brows(w.x, T));
 
-    /* A history pass with no drafting rows (every prefill chunk but a prompt's last) only needs
-     * K and V. `n_draft_out` is the same on every rank, so skipped collectives match. */
-    if (r < 0 && batch->n_draft_out <= 0) {
+    /* The ordinary history fast path only stores K/V. A selected MTP calibration layer instead
+     * runs every prompt row through the block so the U2 draft head gets a real, full-rank Gram. */
+    if (r < 0 && batch->n_draft_out <= 0 && !tap_history) {
         attn.store_kv(c, batch);
         return;
     }
     attn.step(c, batch);
 
     /* A history pass with drafting rows continues on those rows alone (round 1): they are moved
-     * to the front of `x` and the rest of the head runs over them. */
+     * to the front of `x` and the rest of the head runs over them. Calibration uses all prompt
+     * rows and returns before the proposal path. */
     int64_t L = T;                      /* the rows the stream goes on with */
-    if (r < 0) {
+    if (r < 0 && !tap_history) {
         L = batch->n_draft_out;
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.x), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.hout, L));
@@ -402,6 +473,22 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
     mlp.step_rows(c, L);
 
     RAD_ISSUE(c, op_norm, brows(w.x, L), RAD_W(w_norm), brows(w.hout, L));
+    if (tap_history) {
+        /* Only the owner counts and writes. Followers can replay this pass without a host tap. */
+        if (g.rank == 0) {
+            if (L > w.calib_tokens - draft_head_calib_rows) {
+                rad_step_fail(c, "MTP draft-head calibration would count more rows than the corpus holds");
+                return;
+            }
+            draft_head_calib.step(c, w.hout, L, true);
+            draft_head_calib_rows += L;
+            if (draft_head_calib_rows == w.calib_tokens &&
+                !calib_write_to(c, draft_head_calib.h, draft_head_calib.K, draft_head_calib_rows,
+                                "mtp.draft_head", 0, w.calib_dir))
+                rad_step_fail(c, "failed to write the MTP draft-head RADGRAM2 calibration");
+        }
+        return;  /* calib-corpus needs the head input, not a speculative proposal */
+    }
     if (q2) {
         /* `dsum` is group-major [n_embd/group][ceil(L/16)*16], so it has no row slice; pass it
          * whole. */
@@ -413,6 +500,12 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
                     brows(w.dlog, L), RAD_B(w.dsum), RAD_NONE);
         RAD_ISSUE_N(c, op_dtopk, L, brows(w.dlog, L), brows(w.didx, L), brows(w.dval, L),
                     RAD_NONE);   /* the `pairs` slot, absent: operands are positional */
+        if (w.coupled) {
+            const int rd = r < 0 ? 1 : r;   /* history already supplied round one's rows */
+            RAD_ISSUE_N(c, op_couple[rd - 1], L, brows(w.didx, L), brows(w.dval, L),
+                        praw(batch->seq_ids, RAD_I32, batch->n_seq), brows(couple_draws, L),
+                        RAD_B(couple_state));
+        }
     } else {
         RAD_ISSUE_N(c, op_logits, L, brows(w.hout, L), RAD_W(w_lm), brows(w.logits, L));
     }

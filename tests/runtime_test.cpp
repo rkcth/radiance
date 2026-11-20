@@ -133,6 +133,15 @@ static const RadOpSchema g_moe_schema = {
     "moe_gemm", g_gemm_params, 4, g_moe_opds, 3, "A[M,K] x B[e][N,K]^T -> Y[M,N]"
 };
 
+/* A grouped GEMM over two tables, as a routed layer's classes of experts are. */
+static const RadOperandSpec g_moe2_opds[] = {
+    { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WTAB, 0 }, { "c", RAD_OPD_WTAB, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOpSchema g_moe2_schema = {
+    "moe_gemm2", g_gemm_params, 4, g_moe2_opds, 4, "A[M,K] x {B, C}[e][N,K]^T -> Y[M,N]"
+};
+
 static uint16_t g_weight_bytes[64];   /* somewhere for WeightInfo::ptr to point */
 static uint16_t g_moved_bytes[64];    /* where a "relocated" weight lives */
 
@@ -626,6 +635,84 @@ TEST(a_weight_table_resolves_only_the_entries_that_moved) {
     v = entries();
     CHECK(v[1] == (void*)expert_bytes[1]);
     CHECK(v[2] == (void*)moved_expert);
+}
+
+/* An op's tables are patched together. A routed GEMM names a table a class of experts, and a pass
+ * the stager armed for moves a few entries of each at every issue: the entries that moved go out
+ * in one dispatch for the op, not one a table, as long as they fit a patch block; a second block
+ * is dispatched when they do not, and every entry lands either way. */
+TEST(an_ops_weight_tables_are_patched_in_one_dispatch) {
+    constexpr int kE = 32;                       /* experts a table */
+    static uint16_t home[2 * kE][8], away[2 * kE][8];
+    Fixture f;
+    std::vector<rad_weight> w;
+    for (int e = 0; e < 2 * kE; ++e)
+        w.push_back(f.add_weight(("blk.0.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4, home[e]));
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op  op = f.add_op("moe_gemm2", "M", { 8192 }, { k_pre }, { "prefill" }, &g_moe2_schema, w);
+    f.P.ops[op].weight_opd.assign((size_t)kE, 1);
+    f.P.ops[op].weight_opd.insert(f.P.ops[op].weight_opd.end(), (size_t)kE, 2);
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    for (int e = 0; e < 2 * kE; ++e) res.slot[(size_t)w[(size_t)e]].ptr = home[e];
+    CHECK_OK(f.start(&res));
+
+    auto issue = [&](int step_no) {
+        g_rec.clear();
+        CHECK_OK(f.step(4, step_no, [&](Ctx& c) {
+            RadOperand opd[4] = { RAD_B(x), RAD_WTAB(w[0], kE), RAD_WTAB(w[(size_t)kE], kE),
+                                  RAD_B(y) };
+            CHECK_OK(c.issue(op, opd, 4, RAD_N_BATCH));
+        }));
+        REQUIRE_EQ(g_rec.size(), (size_t)1);
+    };
+    /* The two device tables as the kernel would read them, behind the step's stream. */
+    auto entries = [&]() {
+        std::vector<void*> v((size_t)(2 * kE), nullptr);
+        for (int t = 0; t < 2; ++t)
+            CHECK_OK(rad_memcpy_async(v.data() + t * kE, g_rec[0].t[1 + t].data,
+                                      kE * sizeof(void*), f.ctx.stream()));
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+        return v;
+    };
+    auto where = [&](const std::vector<void*>& v, int e) { return v[(size_t)e]; };
+
+    /* The first issue uploads both tables whole: no patch. */
+    issue(0);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)0);
+    std::vector<void*> v = entries();
+    for (int e = 0; e < 2 * kE; ++e) CHECK(where(v, e) == (void*)home[e]);
+
+    /* Three entries of the first table and two of the second move: one dispatch carries all. */
+    for (int e : { 1, 7, 30, kE + 0, kE + 31 }) res.move(w[(size_t)e], away[e]);
+    issue(1);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1);
+    v = entries();
+    for (int e = 0; e < 2 * kE; ++e) {
+        const bool moved = e == 1 || e == 7 || e == 30 || e == kE || e == kE + 31;
+        CHECK(where(v, e) == (moved ? (void*)away[e] : (void*)home[e]));
+    }
+
+    /* Nothing moved: nothing is dispatched. */
+    issue(2);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1);
+
+    /* More than a block's worth across the two tables (every entry back or away): the first full
+     * block goes out while the tables are walked, the rest before the launch. */
+    for (int e = 0; e < 2 * kE; ++e) {
+        const bool at_home = !(e == 1 || e == 7 || e == 30 || e == kE || e == kE + 31);
+        res.move(w[(size_t)e], at_home ? (void*)away[e] : (void*)home[e]);
+    }
+    issue(3);
+    const int64_t blocks = (2 * kE + rad::kWtabPatch - 1) / rad::kWtabPatch;
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1 + blocks);
+    v = entries();
+    for (int e = 0; e < 2 * kE; ++e) {
+        const bool at_home = e == 1 || e == 7 || e == 30 || e == kE || e == kE + 31;
+        CHECK(where(v, e) == (at_home ? (void*)home[e] : (void*)away[e]));
+    }
 }
 
 /* A table's run is fixed by the declaration. The weights declared at a table position (OpInfo::
@@ -2890,7 +2977,11 @@ OracleRun oracle_run(rad::Registry* reg, const char* env, RadLaunchFn dev, RadLa
         if (out.status < 0) return;
         float* pa = (float*)f.ctx.buf_ptr(a);
         float* pb = (float*)f.ctx.buf_ptr(b);
-        for (int i = 0; i < 32; ++i) { pa[i] = (float)i; pb[i] = 0.5f * (float)i; }
+        /* The output starts at a value no kernel here writes: the arena is fresh heap memory, and
+         * leftover bytes that equal the first launch's result (a freed arena of an earlier run
+         * holds exactly that) make repeat mode see an output that never changed. */
+        float* py = (float*)f.ctx.buf_ptr(y);
+        for (int i = 0; i < 32; ++i) { pa[i] = (float)i; pb[i] = 0.5f * (float)i; py[i] = -1.0f; }
         out.status = f.step(4, 0, [&](Ctx& c) {
             CHECK_OK(c.set_lane(lane));
             const RadOperand o[3] = { RAD_B(a), RAD_B(b), RAD_B(y) };

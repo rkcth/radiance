@@ -8,7 +8,7 @@
  *
  * Checked: a C translation unit (abi_c_test.c, strict C11) lays every struct out as C++ does; every
  * struct's listed fields account for its size, so the list in rad_abi_layout_rows.h is complete; and
- * the layout agrees with the table below, taken at RAD_ABI_VERSION 41 and RAD_FORMAT_VER 2. Under
+ * the layout agrees with the table below, taken at RAD_ABI_VERSION 42 and RAD_FORMAT_VER 2. Under
  * those versions a listed field may not move or change size, an ABI struct may only grow by fields
  * past its old end, and an on-disk struct may not change at all. The table is a snapshot of the
  * headers: nothing else states the layout. When it disagrees the test prints the live table.
@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 41 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 41, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 44 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 44, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -216,6 +216,23 @@ TEST(rad_yarn_is_the_same_function_in_c_and_cpp) {
         y.factor = c[0]; y.low = c[1]; y.high = c[2]; y.magnitude = c[3];
         CHECK_EQ((int)rad_yarn_valid(y), abi_c_yarn_valid(c[0], c[1], c[2], c[3]));
     }
+}
+
+/* ABI 42: --prefill-span-pass's field sits past the build context's old end, at the offset a plugin
+ * built against these headers reads it from. */
+TEST(the_span_pass_field_is_appended_past_the_build_contexts_end) {
+    CHECK_EQ(offsetof(RadBuildCtx, span_pass_step), (size_t)200);
+    CHECK_EQ(sizeof(RadBuildCtx), (size_t)208);
+}
+
+/* ABI 43: a checkpoint inside the step. The probe's flag takes the tail padding behind gen_shape
+ * (the probe keeps its 128 bytes); the batch's cut and bounds sit past its old end. */
+TEST(the_checkpoint_cut_fields_are_appended_past_the_old_ends) {
+    CHECK_EQ(offsetof(RadArchProbe, ckpt_snap_ok), (size_t)124);
+    CHECK_EQ(sizeof(RadArchProbe), (size_t)128);
+    CHECK_EQ(offsetof(RadBatch, ckpt_cut), (size_t)480);
+    CHECK_EQ(offsetof(RadBatch, ckpt_cu), (size_t)488);
+    CHECK_EQ(sizeof(RadBatch), (size_t)496);
 }
 
 RAD_TEST_MAIN()

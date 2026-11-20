@@ -58,9 +58,8 @@ public:
     /* Opens and groups the file's tensors by module. Refuses a file holding a form whose effect
      * this engine cannot reproduce (DoRA's magnitude, OFT, Tucker cores), naming it. */
     int open(const std::string& path, std::string* err);
-    /* Copies source bytes within the caller's available snapshot budget. */
-    int open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err);
     uint64_t size_bytes() const { return st_.size_bytes(); }
+    int open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err);
     const std::string&             path() const { return st_.path(); }
     const std::vector<FileModule>& modules() const { return mods_; }
     /* Tensors that change no linear (a trained bias, a norm's weight), with why; reported, not
@@ -76,38 +75,6 @@ private:
     std::vector<FileModule> mods_;
     std::map<std::string, const StTensor*> biases_;
     std::vector<std::pair<std::string, std::string>> skipped_;
-};
-
-/* Shared image requests hold a source until they finish resolving and composing
- * adapters. The pool itself owns no bytes once the last request releases them. */
-class AdapterSnapshots {
-public:
-    struct Source {
-    private:
-        friend class AdapterSnapshots;
-        /* Members are destroyed in reverse order. Release the charge after
-         * AdapterFile has unmapped its storage, even across threads. */
-        struct Charge {
-            std::shared_ptr<std::atomic<uint64_t>> used;
-            uint64_t bytes = 0;
-            ~Charge() { if (used) used->fetch_sub(bytes, std::memory_order_relaxed); }
-        } charge_;
-    public:
-        std::string revision;
-        AdapterFile file;
-    };
-
-    /* pressure_bytes identifies a host-headroom refusal separately from a full adapter budget. */
-    int acquire(const std::string& path, uint64_t budget, int64_t host_headroom,
-                std::shared_ptr<const Source>* out, std::string* err,
-                int64_t* pressure_bytes = nullptr);
-
-    uint64_t used_bytes() const { return used_->load(std::memory_order_relaxed); }
-
-private:
-    std::mutex mutex_;
-    std::shared_ptr<std::atomic<uint64_t>> used_ = std::make_shared<std::atomic<uint64_t>>(0);
-    std::map<std::string, std::weak_ptr<const Source>> sources_;
 };
 
 /* A module's delta as a linear map [N, K] with its scale and strength folded in. Low-rank forms
@@ -187,11 +154,6 @@ struct Strength {
     std::string                        name;
     std::shared_ptr<const AdapterFile> file;
     double                             weight = 1.0;
-};
-
-struct PinnedAdapter {
-    Strength use;
-    std::string revision;
 };
 
 /* Collect per-module bias deltas at the requested strengths, in checkpoint row order. */

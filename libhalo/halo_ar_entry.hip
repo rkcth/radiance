@@ -1330,9 +1330,11 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     /* A row must be whole 16B words, since a block pushes its rows as words. */
     if (K % 8) return RAD_E_SHAPE;
 
-    const long long grp = halo_quant_act_fp8_group();
+    /* 128, or IQ8R's 256 for the rotated int8 form (ar_rmsnorm_had_quant_iq8r). */
+    const long long g0 = halo_quant_act_fp8_group();
+    const long long grp = halo_geti_or(a, "group", g0);
+    if (grp != g0 && !(hi8 && grp == HALO_I8_GROUP_WIDE)) return RAD_E_SHAPE;
     const long long nkb = (K + grp - 1) / grp;
-    if (halo_geti_or(a, "group", grp) != grp) return RAD_E_SHAPE;
     if (hi8 && K % grp) return RAD_E_SHAPE;
     if (halo_numel(w) != K) return RAD_E_SHAPE;
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
@@ -1397,7 +1399,7 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
               halo_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
               (int)rp, (int)yp, (int)qp, (int)sp,
               (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-              in->locpack, in->slot_bytes / 2)
+              in->locpack, in->slot_bytes / 2, (int)grp)
         : halo_ar_rmsnorm_quant_fp8(
               in->peer_scratch[0], in->my_scratch,
               in->peer_flags[0], in->my_flags, in->my_seq,
@@ -1424,14 +1426,15 @@ extern "C" int halo_rad_ar_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) 
  * all-reduce. Width and block count as in ar_rmsnorm_quant_fp8. */
 enum { AQ8_X = 0, AQ8_RES, AQ8_W, AQ8_Q, AQ8_S, AQ8_Y, AQ8_WP, AQ8_SC };
 
-/* The operands and their rules, the same at every width. */
+/* The operands and their rules, the same at every width. `grp`: quant_act_i8g's grid
+ * (ar_rmsnorm_quant_i8g), a scale per (row, 128 columns) and K in whole groups. */
 struct ArQ8Args {
     const RadTensor *x = nullptr, *rs = nullptr, *w = nullptr, *q = nullptr, *sc = nullptr;
     const RadTensor *ob = nullptr, *wp = nullptr, *sl = nullptr;
     long long M = 0, K = 0, yp = 0, rp = 0;
 };
 
-static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
+static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o, bool grp = false) {
     const RadTensor* x  = o->x  = halo_opt(a, AQ8_X);
     const RadTensor* rs = o->rs = halo_opt(a, AQ8_RES);
     const RadTensor* w  = o->w  = halo_opt(a, AQ8_W);
@@ -1447,12 +1450,12 @@ static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
     long long M = 0, K = 0;
     if (halo_rows_of(x, &M, &K) != RAD_OK) return RAD_E_SHAPE;
     if (M * K > in->max_numel) return RAD_E_SHAPE;
-    if (K % 16) return RAD_E_SHAPE;
+    if (K % 16 || (grp && K % 128)) return RAD_E_SHAPE;
     if (halo_numel(w) != K || (w->dtype != RAD_F32 && w->dtype != RAD_BF16)) return RAD_E_DTYPE;
     if (wp && (halo_numel(wp) != K || wp->dtype != w->dtype)) return RAD_E_SHAPE;
     if (sl && (halo_numel(sl) != 1 || (sl->dtype != RAD_F32 && sl->dtype != RAD_BF16))) return RAD_E_SHAPE;
     if (halo_numel(q) != M * K || !halo_contig(q)) return RAD_E_SHAPE;
-    if (halo_numel(sc) != M || !halo_contig(sc)) return RAD_E_SHAPE;
+    if (halo_numel(sc) != M * (grp ? K / 128 : 1) || !halo_contig(sc)) return RAD_E_SHAPE;
     if (ob && halo_numel(ob) != M * K) return RAD_E_SHAPE;
     if (rs && halo_numel(rs) != M * K) return RAD_E_SHAPE;
     const long long xp = halo_row_pitch(x), yp = ob ? halo_row_pitch(ob) : 0, rp = rs ? halo_row_pitch(rs) : 0;
@@ -1462,12 +1465,12 @@ static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
     return RAD_OK;
 }
 
-extern "C" int halo_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
+static int rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s, bool grp) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
     if (in->world != 2) return RAD_E_SHAPE;
     ArQ8Args v;
-    const int arc = ar_q8_args(a, in, &v);
+    const int arc = ar_q8_args(a, in, &v, grp);
     if (arc != RAD_OK) return arc;
     const long long M = v.M, K = v.K;
 
@@ -1484,8 +1487,18 @@ extern "C" int halo_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
         v.sl ? (v.sl->dtype == RAD_F32) : 0, halo_addr(v.ob), halo_addr(v.q), halo_addr(v.sc), (int)M,
         (int)K, (float)halo_getf(a, "eps", 1e-6), (float)halo_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (long)(uintptr_t)s, nblocks, cfgv.drain,
-        cfgv.acq);
+        cfgv.acq, grp ? 1 : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int halo_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant_i8(a, s, false);
+}
+
+/* The same at quant_act_i8g's grid (rmsnorm_quant_i8g's junction): two ranks only. A four-rank
+ * deployment declares it, finds no row, and issues the all-reduce apart. */
+extern "C" int halo_rad_ar_rmsnorm_quant_i8g(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant_i8(a, s, true);
 }
 
 /* The same at four ranks, on the wide family's one-shot transport (halo_rmsnorm_quant_i8.hip's

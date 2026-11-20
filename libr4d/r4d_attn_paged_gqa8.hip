@@ -23,6 +23,7 @@
 #include "r4d_emit.h"
 #include "r4d_common.h"
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 using std::max;
 // The decode kernel uses helpers defined in the prefill unit, so prefill is included first.
@@ -90,6 +91,16 @@ using std::max;
 #define G8_D_JPB     2
 #define G8_D_VECMIN 256
 
+/* The prefill form of the sparse launch (r4d_attn_usel.h): Qwen3.8-Flash-Next's QSA layers at two
+ * ranks (4-token pages at head_dim 256, twelve queries a KV head), over the bf16 cache. The
+ * four-rank unit (gqa 6) keeps the decode kernel: nothing here has run the form at that ratio. */
+#if G8_BLOCK_SIZE == 4 && R4D_ATTN_H256 && R4D_ATTN_GQA == 12 && !defined(G8_NO_USEL)
+#define G8_USEL 1
+#include "r4d_attn_usel.h"
+#else
+#define G8_USEL 0
+#endif
+
 // ---- prefill -----------------------------------------------------------------------------------
 // Query positions a workgroup: 384 / gqa.
 #define G8_P_BQ ((G8_P_NWARPS * 16) / G8_GQA)
@@ -128,6 +139,122 @@ extern "C" long GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(const R4DArgs* a) {
     return r4d_decode_scratch(a, r4d_decode_splits(a, G8_D_TILE), G8_D_OPT);
 }
 
+#if G8_USEL
+/* The sparse launch's prefill form (r4d_attn_usel.h), pinnable for tests: 0 the tiled form from
+ * kG8UselMinRows launch rows (the rule of a process that asked for the form), 1 the decode kernel
+ * at every row count, 2 the tiled form at every row count. `g_usel_lim` is the union, in pages a tile, past which a tile is handed back to
+ * the decode kernel; the launcher's is the builder's capacity, under which the builder also hands
+ * back a tile whose rows share too little (r4d_usel_build_kernel), and a test's of kUselNoLimit
+ * or more tiles every tile. */
+constexpr int kG8UselMinRows = 256;
+constexpr int kG8UselLim     = kUselCap;
+/* A process serves every sparse launch on the decode kernel (form 1): the tiled form agrees with
+ * it to rounding and not bit for bit, and on Qwen3.8-Flash-Next at two ranks it measured no faster
+ * (cold prefill of 2000- and 6000-word prompts within 0.5%). It stays reachable through the pin
+ * for r4d_selftest's checks and timings (docs/QSA.md, "The sparse launch at a prefill chunk"). */
+static int g_usel_form = 1;
+static int g_usel_lim  = kG8UselLim;
+/* `g_usel_skip` (timing only, r4d_selftest --perfusel): launches left out of the tiled form, a
+ * bit each -- 1 the builder (the tables of the launch before stay in the scratch), 2 the tiled
+ * attention, 4 the hand-back, 8 the merge. */
+static int g_usel_skip = 0;
+extern "C" void GQ_SYM(r4d_attn_usel_gqa, _pin)(int form, int lim) {
+    g_usel_form = form & 3;
+    g_usel_skip = form >> 8;
+    g_usel_lim  = lim > 0 ? lim : kG8UselLim;
+}
+/* The tiled kernel's geometry: waves a workgroup and how many of them are stagers (the rest hold
+ * a launch row each). The first is the launcher's; the others are instances r4d_selftest times it
+ * against (G8_USEL_GEOMS), picked through the hook below: it returns the rows a tile of the
+ * geometry it set, -1 for an index past the last (which sets nothing), and for a negative index the
+ * rows a tile of the one in force. `desc` (optional, two ints) receives the waves and the stager
+ * waves of the one returned. */
+struct G8UselGeom { int nw, ns; };
+#ifndef G8_USEL_GEOMS
+#define G8_USEL_GEOMS(X) X(0, 8, 0)
+#endif
+static const G8UselGeom kG8UselGeoms[] = {
+#define G8_X(i, nw, ns) { nw, ns },
+    G8_USEL_GEOMS(G8_X)
+#undef G8_X
+};
+/* The geometry in force: the first (the launcher's); r4d_selftest sets another through the hook
+ * below to time it. */
+static int g_usel_geom = 0;
+static int g8_usel_g() {
+    const G8UselGeom& gm = kG8UselGeoms[g_usel_geom];
+    return gm.nw - gm.ns;
+}
+extern "C" int GQ_SYM(r4d_attn_usel_gqa, _geom)(int idx, int* desc) {
+    if (idx >= (int)(sizeof(kG8UselGeoms) / sizeof(kG8UselGeoms[0]))) return -1;
+    if (idx >= 0) g_usel_geom = idx;
+    if (desc) {
+        desc[0] = kG8UselGeoms[g_usel_geom].nw;
+        desc[1] = kG8UselGeoms[g_usel_geom].ns;
+    }
+    return g8_usel_g();
+}
+
+/* Whether a decode launch takes the form: one row a sequence with no view of its own (no ragged
+ * batch, pitched query, replicated head, tree, window or tuned split), page lists no wider than
+ * the builder's, and enough rows that the split law gives one segment a row anyway. At declare
+ * (max_blocks 0) the list's width is not known and the widest is assumed. */
+static bool g8_usel_shape(const R4DArgs* a) {
+    if (g_usel_form == 1) return false;
+    if (a->q_len != 1 || a->cu_q || a->chain || a->q_ld || a->kv_rep > 1 || a->spec_parent ||
+        a->window > 0 || a->causal_seq || a->splits > 0)
+        return false;
+    if (a->head_dim != 256 || a->block_size != G8_BLOCK_SIZE || a->max_blocks > kUselMaxW)
+        return false;
+    return g_usel_form == 2 || a->num_seqs >= kG8UselMinRows;
+}
+/* The launch's scratch with the form's behind the partials (`partials` bytes of them). */
+static int64_t g8_usel_need(const R4DArgs* a, int64_t partials) {
+    if (!g8_usel_shape(a)) return partials;
+    const int W = a->max_blocks > 0 ? a->max_blocks : kUselMaxW;
+    return (int64_t)r4d_usel_layout((size_t)partials, a->num_seqs, W, g8_usel_g()).end;
+}
+
+/* The builder and the tiled kernel of one geometry. */
+template <int NW, int NS>
+static int g8_usel_emit(const R4DArgs* a, RadStream stream) {
+    constexpr int G = NW - NS;
+    const R4DUselLay lay = r4d_usel_layout((size_t)r4d_decode_scratch(a, 1, G8_D_OPT),
+                                           a->num_seqs, a->max_blocks, G);
+    char* const sb = (char*)a->scratch;
+    R4DUsel u{};
+    u.utab   = (const int*)(sb + lay.utab);
+    u.usig   = (const uint16_t*)(sb + lay.usig);
+    u.ucnt   = (const int*)(sb + lay.ucnt);
+    u.fb     = (const int*)(sb + lay.fb);
+    u.prow   = (const uint32_t*)(sb + lay.prow);
+    u.upitch = lay.upitch;
+    int rc = RAD_OK;
+    if (!(g_usel_skip & 1))
+        rc = R4D_EMIT(stream, (r4d_usel_build_kernel<G>), dim3(lay.tiles), dim3(kUselThreads), 0,
+                      a->block_table, a->seqused_k, a->num_seqs, a->max_blocks,
+                      (int*)(sb + lay.utab), (uint16_t*)(sb + lay.usig), (int*)(sb + lay.ucnt),
+                      (int*)(sb + lay.fb), (uint32_t*)(sb + lay.prow), lay.upitch, g_usel_lim);
+    if (rc != RAD_OK) return rc;
+    /* The tiles without unseen slots, then those with (kUselHidden): each instance returns from
+     * the other's tiles. */
+    if (!(g_usel_skip & 2))
+        rc = R4D_EMIT(stream, (r4d_attn_usel_kernel<NW, G8_GQA, NS, 0>),
+                      dim3(lay.tiles, a->kv_heads), dim3(NW * 32), 0, *a, u);
+    if (rc != RAD_OK) return rc;
+    if (!(g_usel_skip & 2))
+        rc = R4D_EMIT(stream, (r4d_attn_usel_kernel<NW, G8_GQA, NS, 1>),
+                      dim3(lay.tiles, a->kv_heads), dim3(NW * 32), 0, *a, u);
+    if (rc != RAD_OK) return rc;
+    if (g_usel_skip & 4) return RAD_OK;
+    /* The tiles handed back: the decode kernel a row, one segment, as this launch's law has it. */
+    return R4D_EMIT(stream,
+                    (r4d_attn_decode_usel_fb_kernel<1, G8_D_TILE, 256, G8_GQA, G8_BLOCK_SIZE, 1,
+                                                    G8_D_OPT | O_V8>),
+                    dim3(1, a->kv_heads, a->num_seqs), dim3(32), 0, *a, 1, u.fb, G);
+}
+#endif
+
 template <int HEAD_DIM, int KVP, int XOPT = 0>
 /* Two dispatches: the attention kernel and the split-KV combine. R4DArgs is passed by value (184
  * bytes) like any other kernel argument. Non-null `gq` adds the output gate and quantiser to the
@@ -141,7 +268,25 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
     const int rows = a->q_len * G8_GQA;
     if (rows > G8_MAX_DECODE_ROWS) return -4;
     const int nw = (rows + 15) / 16;
-    const int splits = r4d_decode_splits(a, G8_D_TILE);
+    int splits = r4d_decode_splits(a, G8_D_TILE);
+
+    /* The prefill form (r4d_attn_usel.h): the union builder, the tiled attention and the decode
+     * kernel for the tiles handed back, each row's partial its one segment; then the merge below. */
+    bool usel = false;
+#if G8_USEL
+    if constexpr (HEAD_DIM == 256 && KVP == 1 && XOPT == 0) {
+        if (g8_usel_shape(a)) {
+            usel = true;
+            splits = 1;
+            switch (g_usel_geom) {
+#define G8_X(i, nw, ns) case i: emit_rc = g8_usel_emit<nw, ns>(a, stream); break;
+                G8_USEL_GEOMS(G8_X)
+#undef G8_X
+                default: emit_rc = RAD_E_INVAL; break;
+            }
+        }
+    }
+#endif
 
     /* `a->chain`: the chained forms (r4d_chain.h) of the attention kernel and of the merge
      * without a gate; the merge with a gate and quantiser has none. */
@@ -154,7 +299,8 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
          else          G8_LAUNCH_K(r4d_attn_decode_kernel, NW, OPT_); } while (0)
     /* One-wave workgroups stage V as codes (O_V8): same conversion count, half the LDS. The int8
      * cache stages V widened (the kernel drops O_V8 under it). */
-    if      (nw == 1) G8_LAUNCH(1, O_V8);
+    if      (usel)    { /* launched above */ }
+    else if (nw == 1) G8_LAUNCH(1, O_V8);
     else if (nw == 2) G8_LAUNCH(2, 0);
     else if (nw == 3) G8_LAUNCH(3, 0);
 #if G8_MAX_DECODE_ROWS > 64
@@ -168,6 +314,9 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
     if (emit_rc != RAD_OK) return -5;
     CHK8();
 
+#if G8_USEL
+    if (usel && (g_usel_skip & 8)) return 0;
+#endif
     // Merge form, as in the other dispatches: one wave per row when there are enough rows and the
     // segment count fits a wave, else the general LDS-tree form. Both give identical bytes.
     const int jobs3 = r4d_q_total(*a) * a->q_heads;
@@ -321,7 +470,12 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row =
             for (long long n = 1; n <= max_seqs; ++n) {
                 r.q_len    = (int)q;
                 r.num_seqs = (int)n;
-                const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
+                int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
+#if G8_USEL
+                /* The bf16 cache's rows (row 0) may take the prefill form, whose scratch lies
+                 * behind the partials. */
+                if (row == 0 && head_dim == 256) need = g8_usel_need(&r, need);
+#endif
                 if (need > worst) worst = need;
             }
         return worst;
@@ -329,6 +483,10 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row =
     const int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r.splits = sp;
+#if G8_USEL
+    if (row == 0 && head_dim == 256)
+        return g8_usel_need(&r, GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r));
+#endif
     return GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
 }
 
@@ -349,7 +507,10 @@ static int g8_decode_common(const RadArgs* a, R4DArgs* r, int head_dim, long lon
     const int rc = fill_paged_row(a, r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r->splits = sp;
-    const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(r);
+    int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(r);
+#if G8_USEL
+    if (row == 0 && head_dim == 256) need = g8_usel_need(r, need);
+#endif
     if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
     return RAD_OK;
 }

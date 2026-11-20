@@ -16,6 +16,7 @@
 #include "halo_launch.h"   // HALO_DYN_LDS: tests/halo_emu runs this unit on the host
 #include "halo_args.h"
 #include "halo_common.h"
+#include "halo_fwht.h"
 #include "halo_gdn_wmma.h"
 #include "halo_q8.h"
 #include "rad_philox.h"
@@ -192,9 +193,16 @@ __global__ __launch_bounds__(kT) void chan_stats_kernel(
 // ln_mod_kernel's order through the same block_sum, the norm output is rounded to bf16 before
 // quantising, and the codes are halo_q8.h's. A 128-column group is sixteen consecutive lanes, so its
 // amax is a half-wave reduction.
+//
+// HI8 is ln_mod_had_quant_i8g: had_quant_act_i8g's quantiser in place of quant_act_fp8's. The
+// bf16-rounded norm output is rotated by the 128-wide Hadamard where it lies, eight columns a lane
+// and sixteen lanes a block (strides 1, 2, 4 in the lane, then 8 to 64 across lanes, the order
+// halo_fwht_wave takes them in, so the sums are the standalone kernel's), then int8 codes under
+// one scale per (row, 128 * SUB): SUB 2 is IQ8R's 256-wide group, a whole wave. `z` receives the
+// unrotated norm output. Byte-identical to gate_add, ln_mod and had_quant_act_i8g.
 constexpr int kLnqChunks = 4;   // 8-wide chunks a thread keeps: n <= kT * 8 * 4 = 8192
 
-template <bool GATED>
+template <bool GATED, bool HI8 = false, int SUB = 1>
 __global__ __launch_bounds__(kT) void ln_mod_quant_kernel(
     const uint16_t* __restrict__ yd, const uint16_t* __restrict__ g, const uint16_t* __restrict__ s,
     const int* __restrict__ cu, uint16_t* __restrict__ x, uint8_t* __restrict__ q,
@@ -245,6 +253,23 @@ __global__ __launch_bounds__(kT) void ln_mod_quant_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) o[j] = bfr(bfr((v[k][j] - mean) * rs) * bfr(1.0f + gs[j]));
         if (z) st8(z + (size_t)r * z_ld + i, o);
+        if constexpr (HI8) {
+            #pragma unroll
+            for (int h = 1; h < 8; h <<= 1) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    if ((j & h) == 0) {
+                        const float a = o[j], b = o[j + h];
+                        o[j] = a + b;
+                        o[j + h] = a - b;
+                    }
+            }
+            const int lane = (int)threadIdx.x & 31;
+            halo_fwht_xstage<8, 1>(o, lane);
+            halo_fwht_xstage<8, 2>(o, lane);
+            halo_fwht_xstage<8, 4>(o, lane);
+            halo_fwht_xstage<8, 8>(o, lane);
+        }
         float m = 0.0f;
         #pragma unroll
         for (int j = 0; j < 8; ++j) m = fmaxf(m, fabsf(o[j]));
@@ -252,12 +277,13 @@ __global__ __launch_bounds__(kT) void ln_mod_quant_kernel(
         m = fmaxf(m, halo_xor_lane<4>(m));
         m = fmaxf(m, halo_xor_lane<2>(m));
         m = fmaxf(m, halo_xor_lane<1>(m));
-        const float sc = m > 0.0f ? m * (1.0f / q8_top<false>()) : 1.0f;
+        if constexpr (SUB == 2) m = fmaxf(m, halo_xor_lane<16>(m));
+        const float sc = m > 0.0f ? m * (1.0f / q8_top<HI8>()) : 1.0f;
         const float inv = 1.0f / sc;
-        if ((threadIdx.x & 15) == 0) qs[(size_t)r * qs_ld + i / 128] = sc;
+        if ((threadIdx.x & (16 * SUB - 1)) == 0) qs[(size_t)r * qs_ld + i / (128 * SUB)] = sc;
         *(uint2*)(q + (size_t)r * q_ld + i) =
-            make_uint2(q8_pack4<false>(o[0], o[1], o[2], o[3], inv),
-                       q8_pack4<false>(o[4], o[5], o[6], o[7], inv));
+            make_uint2(q8_pack4<HI8>(o[0], o[1], o[2], o[3], inv),
+                       q8_pack4<HI8>(o[4], o[5], o[6], o[7], inv));
     }
 }
 
@@ -880,7 +906,9 @@ extern "C" int halo_rad_ln_mod(const RadArgs* a, RadStream s) {
     return st_of(hipGetLastError());
 }
 
-extern "C" int halo_rad_ln_mod_quant_fp8(const RadArgs* a, RadStream s) {
+/* ln_mod_quant_fp8 (E4M3 codes, group 128) and with `hi8` ln_mod_had_quant_i8g (rotated int8
+ * codes, group 128 or 256). */
+static int ln_mod_quant_launch(const RadArgs* a, RadStream s, bool hi8) {
     const RadTensor *y = halo_opt(a, 0), *g = halo_opt(a, 1), *sc = halo_opt(a, 2);
     const RadTensor *cu = halo_opt(a, 3), *x = halo_opt(a, 4), *q = halo_opt(a, 5);
     const RadTensor *qs = halo_opt(a, 6), *z = halo_opt(a, 7);
@@ -888,10 +916,11 @@ extern "C" int halo_rad_ln_mod_quant_fp8(const RadArgs* a, RadStream s) {
     const bool gated = halo_geti_or(a, "gated", 0) != 0;
     if (gated && (!y || !g)) return HALO_NO(RAD_E_INVAL);
     if (!is_bf16(x) || !is_bf16(sc) || (gated && (!is_bf16(y) || !is_bf16(g))) ||
-        (z && !is_bf16(z)) || q->dtype != RAD_F8E4M3 || qs->dtype != RAD_F32)
+        (z && !is_bf16(z)) || q->dtype != (hi8 ? RAD_I8 : RAD_F8E4M3) || qs->dtype != RAD_F32)
         return HALO_NO(RAD_E_DTYPE);
     const long long n = halo_geti_or(a, "n", 0);
-    if (n <= 0 || n % 128 || halo_geti_or(a, "group", 0) != 128 ||
+    const long long grp = halo_geti_or(a, "group", 0);
+    if (n <= 0 || (grp != 128 && !(hi8 && grp == 256)) || n % grp ||
         n > (long long)kT * 8 * kLnqChunks)
         return HALO_NO(RAD_E_SHAPE);
     long long rx = 0, xl = 0, ry = 0, yl = 0, rg = 0, gl = 0, rs = 0, sl = 0, rz = 0, zl = 0;
@@ -900,24 +929,40 @@ extern "C" int halo_rad_ln_mod_quant_fp8(const RadArgs* a, RadStream s) {
         (gated && (!rows8(y, n, &ry, &yl) || !rows8(g, n, &rg, &gl))) ||
         (z && !rows8(z, n, &rz, &zl)))
         return HALO_NO(RAD_E_STRIDE);
-    const long long ql = halo_rows_pitch(q, n, &rq), qsl = halo_rows_pitch(qs, n / 128, &rqs);
+    const long long ql = halo_rows_pitch(q, n, &rq), qsl = halo_rows_pitch(qs, n / grp, &rqs);
     if (ql < 0 || (ql & 7) || ((uintptr_t)q->data & 7) || qsl < 0) return HALO_NO(RAD_E_STRIDE);
     const long long n_seq = halo_numel(cu) - 1, rows = rq;
     if (rows <= 0 || n_seq <= 0 || rx < rows || rqs < rows || rs < n_seq ||
         (gated && (ry < rows || rg < n_seq)) || (z && rz < rows))
         return HALO_NO(RAD_E_SHAPE);
     const float eps = (float)halo_getf(a, "eps", 1e-6);
-#define HALO_LNQ(G)                                                                                \
-    hipLaunchKernelGGL(ln_mod_quant_kernel<G>, dim3((unsigned)rows), dim3(kT), 0, (hipStream_t)s, \
+#define HALO_LNQ(G, ...)                                                                           \
+    hipLaunchKernelGGL((ln_mod_quant_kernel<G, ##__VA_ARGS__>), dim3((unsigned)rows), dim3(kT), 0, \
+                       (hipStream_t)s,                                                           \
                        G ? (const uint16_t*)y->data : nullptr,                                   \
                        G ? (const uint16_t*)g->data : nullptr, (const uint16_t*)sc->data,        \
                        (const int*)cu->data, (uint16_t*)x->data, (uint8_t*)q->data,              \
                        (float*)qs->data, z ? (uint16_t*)z->data : nullptr, (int)n, (int)n_seq,   \
                        eps, (int)yl, (int)gl, (int)sl, (int)xl, (int)ql, (int)qsl, (int)zl)
-    if (gated) HALO_LNQ(true);
-    else       HALO_LNQ(false);
+    if (!hi8) {
+        if (gated) HALO_LNQ(true);
+        else       HALO_LNQ(false);
+    } else if (grp == 256) {
+        if (gated) HALO_LNQ(true, true, 2);
+        else       HALO_LNQ(false, true, 2);
+    } else {
+        if (gated) HALO_LNQ(true, true, 1);
+        else       HALO_LNQ(false, true, 1);
+    }
 #undef HALO_LNQ
     return st_of(hipGetLastError());
+}
+
+extern "C" int halo_rad_ln_mod_quant_fp8(const RadArgs* a, RadStream s) {
+    return ln_mod_quant_launch(a, s, false);
+}
+extern "C" int halo_rad_ln_mod_had_quant_i8g(const RadArgs* a, RadStream s) {
+    return ln_mod_quant_launch(a, s, true);
 }
 
 extern "C" int halo_rad_gate_add(const RadArgs* a, RadStream s) {

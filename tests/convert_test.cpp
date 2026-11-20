@@ -8,6 +8,7 @@
 #include "rad_test.h"
 #include "gguf_writer.h"
 #include "tiny_model.h"
+#include "e2e_config.h"
 
 #include "format/encoding.h"
 #include "format/radfile.h"
@@ -119,6 +120,302 @@ std::vector<std::string> differing_weights(const RadFile& a, const RadFile& b) {
 }  /* namespace */
 
 /* ================================================================== what a conversion writes */
+
+namespace {
+
+struct VisionExtension {
+    tiny::TempDir dir{"add-vision"};
+    std::string base = dir / "text.rad", vision = dir / "vision.safetensors", log;
+    std::vector<tiny::Tensor> tower;
+    rad::Json config;
+    bool ok = false;
+
+    VisionExtension() {
+        const std::string text_dir = dir / "text", draft_dir = dir / "draft";
+        tiny::Gemma4 s;
+        s.layers = 2;
+        s.hidden = 256;  // current int8 DFlash prefill tiles require 256-row projections
+        s.vocab = 384;
+        if (!dir.ok() || mkdir(text_dir.c_str(), 0755) || mkdir(draft_dir.c_str(), 0755) ||
+            !tiny::write_gemma4(text_dir, s)) return;
+        config = rad::Json::parse(tiny::read_text(text_dir + "/config.json"));
+        auto& text = config["text_config"];
+        text["enable_moe_block"] = true;
+        text["num_experts"] = 4;
+        text["top_k_experts"] = 2;
+        text["moe_intermediate_size"] = 64;
+        auto ts = tiny::read_safetensors(text_dir + "/model.safetensors");
+        tiny::Rng r(46);
+        auto add = [&](const std::string& name, std::vector<int64_t> shape) {
+            ts.push_back(tiny::noise(name, std::move(shape), r, 0.25f));
+        };
+        for (int l = 0; l < s.layers; ++l) {
+            const std::string p = "model.language_model.layers." + std::to_string(l) + ".";
+            add(p + "experts.gate_up_proj", {4, 128, s.hidden});
+            add(p + "experts.down_proj", {4, s.hidden, 64});
+            add(p + "router.proj.weight", {4, s.hidden});
+            add(p + "router.scale", {s.hidden});
+            add(p + "router.per_expert_scale", {4});
+            for (const char* n : {"pre_feedforward_layernorm_2.weight",
+                                  "post_feedforward_layernorm_1.weight",
+                                  "post_feedforward_layernorm_2.weight"})
+                add(p + n, {s.hidden});
+        }
+        if (!tiny::write_checkpoint(text_dir, config, ts, {"<image>", "<video>", "<boi>", "<eoi>"}))
+            return;
+
+        rad::Json draft = {
+            {"architectures", {"DFlashDraftModel"}}, {"model_type", "qwen3"},
+            {"hidden_size", 256}, {"vocab_size", s.vocab}, {"num_hidden_layers", 1},
+            {"num_attention_heads", 1}, {"num_key_value_heads", 1}, {"head_dim", 256},
+            {"intermediate_size", 256}, {"rms_norm_eps", 1e-6}, {"rope_theta", 10000},
+            {"block_size", 4}, {"dflash_config", {{"mask_token_id", 4}, {"target_layer_ids", {1}}}},
+        };
+        ts.clear();
+        for (const char* n : {"fc.weight", "layers.0.self_attn.q_proj.weight",
+                              "layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
+                              "layers.0.self_attn.o_proj.weight", "layers.0.mlp.gate_proj.weight",
+                              "layers.0.mlp.up_proj.weight", "layers.0.mlp.down_proj.weight"})
+            add(n, {256, 256});
+        for (const char* n : {"hidden_norm.weight", "norm.weight", "layers.0.input_layernorm.weight",
+                              "layers.0.post_attention_layernorm.weight",
+                              "layers.0.self_attn.q_norm.weight", "layers.0.self_attn.k_norm.weight"})
+            add(n, {256});
+        if (!tiny::write_checkpoint(draft_dir, draft, ts) ||
+            !tiny::write_text(dir / "chat.jinja", "{{ messages[0].content }}")) return;
+        // Current libref lacks the rotated-expert i8g schemas. Keep this host
+        // fixture's experts BF16 while retaining real two-plane int8 DFlash weights.
+        std::string draft_rules;
+        std::istringstream rules(tiny::read_text(RAD_E2E_RECIPES "/gemma4-26b-a4b-df-i8.recipe"));
+        for (std::string line; std::getline(rules, line);)
+            if (line.starts_with("dflash.")) draft_rules += line + "\n";
+        const std::string draft_recipe = dir / "draft-i8.recipe";
+        if (draft_rules.empty() || !tiny::write_text(draft_recipe, draft_rules)) return;
+        // The tiny Gemma head dimensions exercise the reference kernels.
+        const int rc = convert(text_dir, {"-o", base, "--draft-model", draft_dir, "--kernels", "libref",
+                               "--recipe", draft_recipe,
+                               "--chat-template", dir / "chat.jinja",
+                               "--tokenizer2", text_dir + "/tokenizer.json",
+                               "--set", "test.base_metadata=preserved"}, &log);
+        if (rc != 0) { std::fprintf(stderr, "%s\n", log.c_str()); return; }
+
+        config["text_config"]["use_bidirectional_attention"] = "vision";
+        config["vision_config"] = {
+            {"model_type", "gemma4_vision"}, {"hidden_size", 16}, {"num_attention_heads", 4},
+            {"head_dim", 4}, {"intermediate_size", 32}, {"num_hidden_layers", 1},
+            {"patch_size", 2}, {"pooling_kernel_size", 3}, {"position_embedding_size", 64},
+            {"hidden_activation", "gelu_pytorch_tanh"}, {"standardize", true},
+            {"rope_parameters", {{"rope_type", "default"}, {"rope_theta", 100}}}
+        };
+        config["image_token_id"] = 259; config["video_token_id"] = 260;
+        config["boi_token_id"] = 261; config["eoi_token_id"] = 262;
+        const std::string v = "model.vision_tower.", l = v + "encoder.layers.0.";
+        ts.clear();
+        add(v + "patch_embedder.input_proj.weight", {16, 12});
+        add(v + "patch_embedder.position_embedding_table", {2, 64, 16});
+        add("model.embed_vision.embedding_projection.weight", {s.hidden, 16});
+        add(v + "std_bias", {16});
+        add(v + "std_scale", {16});
+        for (const char* n : {"input_layernorm.weight", "post_attention_layernorm.weight",
+                              "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight"})
+            add(l + n, {16});
+        for (const char* n : {"q_proj", "k_proj", "v_proj", "o_proj"})
+            add(l + "self_attn." + n + ".linear.weight", {16, 16});
+        for (const char* n : {"q_norm", "k_norm"}) add(l + "self_attn." + n + ".weight", {4});
+        add(l + "mlp.gate_proj.linear.weight", {32, 16});
+        add(l + "mlp.up_proj.linear.weight", {32, 16});
+        add(l + "mlp.down_proj.linear.weight", {16, 32});
+        tower = std::move(ts);
+        ok = tiny::write_text(dir / "config.json", config.dump()) &&
+             tiny::write_text(dir / "processor_config.json",
+                              R"({"image_processor":{"max_soft_tokens":140}})") &&
+             tiny::write_safetensors(vision, tower);
+    }
+
+    int repack(const std::string& source, const std::string& out, std::string* log,
+               const std::vector<std::string>& options = {}) const {
+        std::vector<std::string> args = {"--add-vision", base, "-o", out, "--kernels", "libref"};
+        args.insert(args.end(), options.begin(), options.end());
+        return convert(source, args, log);
+    }
+};
+
+VisionExtension& vision_extension() {
+    static VisionExtension fixture;
+    return fixture;
+}
+
+}  /* namespace */
+
+TEST(add_vision_copies_every_text_expert_and_dflash_plane_and_adds_only_the_tower) {
+    const auto& f = vision_extension();
+    REQUIRE(f.ok);
+    const std::string out = f.dir / "with-vision.rad";
+    std::string log;
+    int rc = f.repack(f.vision, out, &log, {"--plan-only"});
+    if (rc) std::fprintf(stderr, "%s\n", log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(!exists(out));
+    rc = f.repack(f.vision, out, &log);
+    if (rc) std::fprintf(stderr, "%s\n", log.c_str());
+    REQUIRE_EQ(rc, 0);
+
+    RadFile old, result;
+    REQUIRE_EQ(old.open(f.base.c_str()), RAD_OK);
+    REQUIRE_EQ(result.open(out.c_str()), RAD_OK);
+    CHECK_EQ(result.entry_count(), old.entry_count() + 16);
+    for (int64_t i = 0; i < old.entry_count(); ++i) {
+        const auto& e = old.entry(i);
+        const auto* n = result.find(old.str(e.name));
+        REQUIRE(n != nullptr);
+        CHECK(rad_enc_equal(&old.encoding(e), &result.encoding(*n)));
+        CHECK_EQ(e.rank, n->rank);
+        CHECK(std::equal(e.shape, e.shape + RAD_MAX_RANK, n->shape));
+        CHECK_EQ(e.layer, n->layer);
+        CHECK_EQ(e.expert, n->expert);
+        CHECK_EQ(e.slot, n->slot);
+        CHECK_EQ(std::string(old.str(e.quantizer)), std::string(result.str(n->quantizer)));
+        CHECK_EQ(std::string(old.str(e.options)), std::string(result.str(n->options)));
+        REQUIRE_EQ(e.n_planes, n->n_planes);
+        for (uint32_t k = 0; k < e.n_planes; ++k) {
+            const auto& a = old.plane(e, (int)k);
+            const auto& b = result.plane(*n, (int)k);
+            REQUIRE_EQ(a.bytes, b.bytes);
+            CHECK(std::memcmp(old.data(a), result.data(b), a.bytes) == 0);
+        }
+    }
+    REQUIRE(old.find("blk.0.ffn_gate_up_exps.0.weight"));
+    REQUIRE(old.find("dflash.draft_head.weight"));
+    CHECK_EQ(old.find("blk.0.ffn_gate_up_exps.0.weight")->n_planes, 1u);
+    CHECK_EQ(old.find("dflash.draft_head.weight")->n_planes, 2u);
+    for (int64_t i = 0; i < old.meta_count(); ++i) {
+        const auto& a = old.meta_at(i);
+        const auto& b = result.meta_at(i);
+        CHECK_EQ(std::string(old.str(a.key)), std::string(result.str(b.key)));
+        REQUIRE_EQ(a.type, b.type);
+        if (a.type == RAD_P_STR) CHECK_EQ(std::string(old.str(a.v.s)), std::string(result.str(b.v.s)));
+        else if (a.type == RAD_P_INT) CHECK_EQ(a.v.i, b.v.i);
+        else CHECK_EQ(a.v.f, b.v.f);
+    }
+    CHECK_EQ(std::string(old.str(old.header().recipe)), std::string(result.str(result.header().recipe)));
+    CHECK_EQ(std::string(result.get_s("radiance.encoder", "")), std::string("vision"));
+    CHECK_EQ(std::string(result.get_s("processor.image_processor.max_soft_tokens", "")),
+             std::string("140"));
+    CHECK_EQ(std::string(result.get_s("text_config.use_bidirectional_attention", "")),
+             std::string("vision"));
+    for (bool aux : {false, true}) {
+        VocabBuild a, b;
+        const auto av = aux ? old.aux_vocab() : old.vocab();
+        const auto bv = aux ? result.aux_vocab() : result.vocab();
+        REQUIRE_EQ(vocab_deserialize(old.base(), old.size(), av.h, a), RAD_OK);
+        REQUIRE_EQ(vocab_deserialize(result.base(), result.size(), bv.h, b), RAD_OK);
+        CHECK(a.tokens == b.tokens);
+        CHECK(a.types == b.types);
+        CHECK(a.scores == b.scores);
+        CHECK(a.merges == b.merges);
+        CHECK_EQ(a.chat_template, b.chat_template);
+        CHECK_EQ(a.kind, b.kind);
+        CHECK_EQ(a.ignore_merges, b.ignore_merges);
+        CHECK(std::tie(a.bos, a.eos, a.eot, a.pad, a.unk, a.sep, a.add_bos, a.add_eos) ==
+              std::tie(b.bos, b.eos, b.eot, b.pad, b.unk, b.sep, b.add_bos, b.add_eos));
+        REQUIRE_EQ(a.steps.size(), b.steps.size());
+        for (size_t i = 0; i < a.steps.size(); ++i) {
+            const auto& x = a.steps[i];
+            const auto& y = b.steps[i];
+            CHECK(std::tie(x.kind, x.flags, x.arg0, x.arg1, x.iarg) ==
+                  std::tie(y.kind, y.flags, y.arg0, y.arg1, y.iarg));
+        }
+    }
+    for (const auto& [name, index] : {std::pair{"v.embed.weight", 2}, {"v.std_bias", 3}, {"v.std_scale", 4}}) {
+        const auto* e = result.find(name);
+        REQUIRE(e != nullptr);
+        const auto& expected = f.tower[(size_t)index].bytes;
+        REQUIRE_EQ(result.plane(*e, 0).bytes, expected.size());
+        CHECK(std::memcmp(result.data(result.plane(*e, 0)), expected.data(), expected.size()) == 0);
+    }
+
+    auto source_bytes = [&](const std::string& name) {
+        auto it = std::find_if(f.tower.begin(), f.tower.end(),
+                               [&](const tiny::Tensor& t) { return t.name == name; });
+        CHECK(it != f.tower.end());
+        if (it == f.tower.end()) return std::string{};
+        return std::string(reinterpret_cast<const char*>(it->bytes.data()), it->bytes.size());
+    };
+    auto check_matrix = [&](const char* name, int64_t rows, int64_t cols, const std::string& bytes) {
+        const auto* e = result.find(name);
+        REQUIRE(e != nullptr);
+        const RadEncoding bf16 = rad_enc_plain(RAD_BF16);
+        CHECK(rad_enc_equal(&result.encoding(*e), &bf16));
+        REQUIRE_EQ(e->n_planes, 1u);
+        CHECK_EQ(e->rank, 2u);
+        CHECK_EQ(e->shape[0], rows);
+        CHECK_EQ(e->shape[1], cols);
+        const auto& plane = result.plane(*e, 0);
+        REQUIRE_EQ(plane.bytes, bytes.size());
+        CHECK(std::memcmp(result.data(plane), bytes.data(), bytes.size()) == 0);
+    };
+    /* The source table is [2, 64, 16] with X then Y. Fused matrices stack rows in
+     * Q/K/V and gate/up order. Derive the expected BF16 bits directly from the fixture. */
+    const std::string pos = source_bytes("model.vision_tower.patch_embedder.position_embedding_table");
+    constexpr size_t axis_bytes = 64 * 16 * sizeof(uint16_t);
+    REQUIRE_EQ(pos.size(), 2 * axis_bytes);
+    check_matrix("v.pos_x.weight", 64, 16, pos.substr(0, axis_bytes));
+    check_matrix("v.pos_y.weight", 64, 16, pos.substr(axis_bytes));
+    const std::string layer = "model.vision_tower.encoder.layers.0.";
+    check_matrix("v.blk.0.qkv", 48, 16,
+                 source_bytes(layer + "self_attn.q_proj.linear.weight") +
+                 source_bytes(layer + "self_attn.k_proj.linear.weight") +
+                 source_bytes(layer + "self_attn.v_proj.linear.weight"));
+    check_matrix("v.blk.0.gate_up", 64, 16,
+                 source_bytes(layer + "mlp.gate_proj.linear.weight") +
+                 source_bytes(layer + "mlp.up_proj.linear.weight"));
+
+    /* Auto media must redeclare the encoder from the finished container. */
+    rc = tiny::run(radtest::config_argv({RAD_E2E_SERVER, "--model", out, "--kernels", "libref", "--debug-graph"}),
+                   convert_env(), &log);
+    if (rc) std::fprintf(stderr, "%s\n", log.c_str());
+    REQUIRE_EQ(rc, 0);
+    CHECK(log.find("vision tower:") != std::string::npos);
+    CHECK(log.find("the DFlash drafter is declared") != std::string::npos);
+}
+
+TEST(add_vision_refuses_invalid_sources_and_never_overwrites_a_destination) {
+    const auto& f = vision_extension();
+    REQUIRE(f.ok);
+    const std::string out = f.dir / "refused.rad";
+    const std::string before = tiny::read_text(f.base);
+    std::string log;
+    CHECK(f.repack(f.vision, f.base, &log) != 0);
+    CHECK(log.find("requires a new output path") != std::string::npos);
+    CHECK(tiny::read_text(f.base) == before);
+    REQUIRE(tiny::write_text(out, "existing"));
+    CHECK(f.repack(f.vision, out, &log) != 0);
+    CHECK_EQ(tiny::read_text(out), std::string("existing"));
+
+    const std::string bad = f.dir / "bad.safetensors", absent = f.dir / "absent.rad";
+    auto ts = f.tower;
+    ts.erase(ts.begin() + 4); /* missing standardization scale */
+    REQUIRE(tiny::write_safetensors(bad, ts));
+    CHECK(f.repack(bad, absent, &log) != 0);
+    CHECK(log.find("std_scale") != std::string::npos);
+    CHECK(!exists(absent));
+
+    ts = f.tower;
+    ts[2].shape = {128, 32};  /* same byte size, incompatible projector */
+    REQUIRE(tiny::write_safetensors(bad, ts));
+    CHECK(f.repack(bad, absent, &log) != 0);
+    CHECK(log.find("v.embed.weight") != std::string::npos);
+    CHECK(!exists(absent));
+
+    const std::string bad_config = f.dir / "bad-config";
+    REQUIRE_EQ(mkdir(bad_config.c_str(), 0755), 0);
+    auto config = f.config;
+    config["image_token_id"] = 300;  /* outside the base's tokenizer */
+    REQUIRE(tiny::write_text(bad_config + "/config.json", config.dump()));
+    CHECK(f.repack(f.vision, absent, &log, {"--config", bad_config}) != 0);
+    CHECK(log.find("outside the base vocabulary") != std::string::npos);
+    CHECK(!exists(absent));
+}
 
 /* A recipe weight is rotated int8 over the rows its name map joins, in the map's order: attn_qkv
  * is q, then k, then v, and ffn_gate_up is gate then up. A row's 128 columns under one scale

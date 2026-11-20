@@ -10,9 +10,8 @@
  */
 #include "server_fakes.h"
 
-#include "image_queue.h"
-#include "lora/adapter.h"
 #include "mm/media.h"
+#include "mm/imaging.h"
 
 #include <future>
 
@@ -20,12 +19,11 @@ namespace {
 
 struct Images {
     FakeImageGen img;
-    FakeTokenizer image_tok;
     std::unique_ptr<Fixture> f;
-    explicit Images(bool image_only = true) {
-        f.reset(new Fixture(Fixture::Tweak{ [this, image_only](ServerOptions& o, Deps& d) {
-            d.images = { &img, &image_tok };
-            o.image_model = image_only;
+    Images() {
+        f.reset(new Fixture(Fixture::Tweak{ [this](ServerOptions& o, Deps& d) {
+            d.images = &img;
+            o.image_model = true;
         } }));
     }
     HttpResponse post(const char* path, const json& body) { return f->post(path, body.dump()); }
@@ -115,19 +113,6 @@ TEST(an_image_model_names_the_images_endpoints_and_its_capabilities) {
 
 /* ================================================================== the request handed over */
 
-TEST(image_and_text_endpoints_use_their_own_tokenizers) {
-    if (!mm::decoder_available()) return;
-    Images s(/*image_only=*/false);
-    s.gen({ { "prompt", "sky" } });
-    CHECK(s.image_tok.last_parse_special);
-    CHECK(!s.f->tok.last_parse_special);
-
-    s.image_tok.last_parse_special = false;
-    CHECK_EQ(s.post("/v1/completions", { { "prompt", "hello" }, { "max_tokens", 1 } }).status, 200);
-    CHECK(s.f->tok.last_parse_special);
-    CHECK(!s.image_tok.last_parse_special);
-}
-
 /* What reaches the generator: sides rounded down to the model's multiple, steps from `quality`
  * (half the default for low, three quarters for medium) unless named, the seed given or a fresh
  * one under 2^53 (returned for reuse, and JavaScript reads JSON numbers as doubles), and each
@@ -161,58 +146,6 @@ TEST(the_generator_gets_rounded_sizes_quality_steps_and_a_readable_seed) {
         CHECK(s.last().seed < ((uint64_t)1 << 53));
         CHECK(r["data"][0]["seed"].get<uint64_t>() < ((uint64_t)1 << 53));
     }
-}
-
-TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
-    if (!mm::decoder_available()) return;
-    Images s;
-    s.img.inf.default_width = s.img.inf.default_height = 1024;
-    s.img.inf.max_tokens = 4096;
-    const std::string pic = png(128, 96, 255, 255);
-    REQUIRE(!pic.empty());
-    const HttpResponse res = s.post("/v1/images/edits",
-        { { "prompt", "x" }, { "image", data_url(pic) } });
-    REQUIRE_EQ(res.status, 200);
-    CHECK_EQ(s.last().width, 1152);
-    CHECK_EQ(s.last().height, 896);
-}
-
-TEST(krea_outfill_scales_the_long_edge_and_preserves_the_source_in_the_canvas) {
-    if (!mm::decoder_available()) return;
-    Images s;
-    s.img.inf.refs_fit_output = true;
-    s.img.inf.size_multiple = 16;
-    const json request = { {"prompt", "A portrait in a studio"}, {"size", "1024x1024"},
-                           {"image", data_url(png(48, 64, 255, 255))},
-                           {"outfill", { {"horizontal", "right"} }} };
-    const HttpResponse response = s.post("/v1/images/edits", request);
-    REQUIRE_EQ(response.status, 200);
-    CHECK_EQ(s.last().outfill.x, 256);
-    CHECK_EQ(s.last().outfill.y, 0);
-    CHECK_EQ(s.last().outfill.w, 768);
-    CHECK_EQ(s.last().outfill.h, 1024);
-    REQUIRE_EQ(s.last().refs.size(), (size_t)1);
-    CHECK_EQ(s.last().refs[0].w, 336);
-    CHECK_EQ(s.last().refs[0].h, 448);
-    CHECK(s.img.frames.empty());
-    const json answer = json::parse(response.body);
-    std::vector<uint8_t> png_bytes;
-    REQUIRE(base64_decode(answer["data"][0]["b64_json"].get<std::string>(), &png_bytes));
-    mm::FrameRGBA result;
-    std::string why;
-    REQUIRE_EQ(mm::decode_image_rgba(png_bytes.data(), png_bytes.size(), 1024 * 1024, &result, &why),
-               RAD_OK);
-    const auto red = [&](int x, int y) { return (int)result.rgba[((size_t)y * 1024 + x) * 4]; };
-    CHECK_EQ(red(10, 100), 0);
-    CHECK_EQ(red(256, 100), 0);
-    CHECK_EQ(red(272, 100), 100);
-    CHECK_EQ(red(288, 100), 200);
-    json other = request;
-    other["size"] = "768x768";
-    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
-    other = request;
-    other["ref_boost"] = 4.0;
-    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
 }
 
 /* Usage counts the pictures' token runs as image tokens, once in each branch that carries them:
@@ -512,218 +445,260 @@ TEST(a_streamed_generation_sends_previews_then_the_image) {
     CHECK_EQ(s.f->srv->in_flight(), (int64_t)0);
 }
 
-TEST(shared_streamed_images_report_dispatch_timing) {
+TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
     if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.default_width = s.img.inf.default_height = 1024;
+    s.img.inf.max_tokens = 4096;
+    const std::string pic = png(128, 96, 255, 255);
+    REQUIRE(!pic.empty());
+    const HttpResponse res = s.post("/v1/images/edits",
+        { { "prompt", "x" }, { "image", data_url(pic) } });
+    REQUIRE_EQ(res.status, 200);
+    CHECK_EQ(s.last().width, 1152);
+    CHECK_EQ(s.last().height, 896);
+}
+
+
+TEST(an_admitted_image_waits_for_the_previous_adapter_slot) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     FakeImageGen image;
-    FakeTokenizer tokenizer;
-    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
-        o.queue_image = [&](const std::string&, size_t, size_t, size_t,
-                            const std::function<bool()>&, Deps::ImageEndpoint* endpoint,
-                            std::shared_ptr<void>*, ImageDispatchTiming* timing, std::string*) {
-            timing->selection = ImageSelection::Warm;
-            *endpoint = {&image, &tokenizer};
+    int attempts = 0;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto&, int32_t* slot, std::shared_ptr<void>* hold,
+                                 std::string*, std::string*) {
+            if (++attempts == 1) return RAD_E_FULL;
+            *slot = 0;
+            *hold = std::make_shared<int>(0);
             return RAD_OK;
         };
     }});
-    auto response = f.post("/v1/images/generations", R"({"prompt":"x","stream":true})");
-    REQUIRE_EQ(response.status, 200);
-    const auto header = std::find_if(response.headers.begin(), response.headers.end(),
-        [](const auto& entry) { return entry.first == "Server-Timing"; });
-    REQUIRE(header != response.headers.end());
-    CHECK(header->second.starts_with("image_queue;dur=0.000, image_selection;dur="));
-    CHECK(header->second.ends_with(", image_activation;desc=\"warm\""));
-    CHECK_EQ(sse_events(drain(response)).size(), 1u);
+    const auto result = f.post("/v1/images/generations",
+        R"({"prompt":"a cup","size":"64x64","loras":["turbo"]})");
+    CHECK_EQ(result.status, 200);
+    CHECK_EQ(attempts, 2);
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
 
-TEST(shared_image_releases_adapter_source_before_generation) {
-    if (!mm::decoder_available()) return;
-    struct Image : FakeImageGen {
-        std::weak_ptr<const lora::AdapterFile> source;
-        int submit(std::unique_ptr<gen::Request> request, std::string* why) override {
-            CHECK(source.expired());
-            CHECK(request->adapter_request_lease);
-            CHECK(request->lora_hold);
-            CHECK_EQ(request->lora_slot, 0);
-            return FakeImageGen::submit(std::move(request), why);
-        }
-    } image;
-    FakeTokenizer tokenizer;
-    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
-        o.pin_image_loras = [&](const auto&, auto* adapters, auto* lease, auto*, bool reclaim_cache) {
-            CHECK(reclaim_cache);
-            auto source = std::make_shared<lora::AdapterFile>();
-            image.source = source;
-            adapters->push_back({{"style", std::move(source), 0.6}, "revision"});
-            *lease = std::make_shared<int>(0);
-            return RAD_OK;
-        };
-        o.queue_image = [&](const std::string&, size_t, size_t, size_t,
-                            const std::function<bool()>&, Deps::ImageEndpoint* endpoint,
-                            std::shared_ptr<void>*, ImageDispatchTiming*, std::string*) {
-            *endpoint = {&image, &tokenizer};
-            endpoint->pinned_lora_acquire = [&](const auto& adapters, auto* slot, auto* hold,
-                                               auto*, auto*) {
-                CHECK_EQ(adapters.size(), 1u);
-                CHECK(!image.source.expired());
-                *slot = 0;
-                *hold = std::make_shared<int>(0);
-                return RAD_OK;
-            };
+TEST(disconnecting_the_head_image_waiter_releases_its_turn_and_admission) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    FakeImageGen image;
+    std::promise<void> attempted;
+    std::atomic<bool> tried{false}, disconnected{false};
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto& choices, int32_t* slot, std::shared_ptr<void>* hold,
+                                 std::string*, std::string*) {
+            if (choices.front().first == "busy") {
+                if (!tried.exchange(true)) attempted.set_value();
+                return RAD_E_FULL;
+            }
+            *slot = 0;
+            *hold = std::make_shared<int>(0);
             return RAD_OK;
         };
     }});
-    const auto response = f.post("/v1/images/generations",
-        R"({"prompt":"x","loras":[{"name":"style","weight":0.6}]})");
-    CHECK_EQ(response.status, 200);
-    CHECK_EQ(image.got.size(), 1u);
-}
-
-TEST(shared_image_waiters_reserve_admission_and_release_it_on_shutdown) {
-    std::promise<void> waiting;
-    auto queued = waiting.get_future();
-    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
-        o.queue_depth = 1;
-        o.queue_image = [&](const std::string&, size_t, size_t, size_t,
-                            const std::function<bool()>& cancelled, Deps::ImageEndpoint*,
-                            std::shared_ptr<void>*, ImageDispatchTiming*, std::string*) {
-            waiting.set_value();
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (!cancelled() && std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            return cancelled() ? RAD_E_CANCELLED : RAD_E_STATE;
-        };
-    }});
-    auto image = std::async(std::launch::async, [&] {
-        return f.post("/v1/images/generations", R"({"prompt":"a red square","model":"second"})");
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/images/generations";
+    q.body = R"({"prompt":"a cup","size":"64x64","loras":["busy"]})";
+    q.closed = [&] { return disconnected.load(); };
+    auto first = std::async(std::launch::async, [&] { return f.srv->router().dispatch(q).status; });
+    const auto started = attempted.get_future().wait_for(std::chrono::seconds(3));
+    auto second = std::async(std::launch::async, [&] {
+        return f.post("/v1/images/generations",
+                      R"({"prompt":"a cup","size":"64x64","loras":["next"]})").status;
     });
-    REQUIRE(queued.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
-    const auto health = f.get("/health");
-    CHECK_EQ(health.status, 200);
-    CHECK_EQ(json::parse(health.body)["in_flight"].get<int>(), 1);
-    CHECK_EQ(f.post("/completion", R"({"prompt":"hello","n_predict":1})").status, 429);
-    const auto full = f.post("/v1/images/generations", R"({"prompt":"a blue square"})");
-    CHECK_EQ(full.status, 429);
-    CHECK(std::any_of(full.headers.begin(), full.headers.end(),
-                      [](const auto& h) { return h.first == "Retry-After"; }));
-    f.srv->stop();
-    CHECK_EQ(image.get().status, 503);
-    CHECK_EQ(json::parse(f.get("/health").body)["in_flight"].get<int>(), 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (f.srv->in_flight() < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto admitted = f.srv->in_flight();
+    disconnected.store(true);
+    CHECK(started == std::future_status::ready);
+    CHECK_EQ(admitted, 2);
+    CHECK_EQ(first.get(), 499);
+    CHECK_EQ(second.get(), 200);
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
 
-TEST(shared_image_ordering_respects_the_age_threshold) {
-    using namespace std::chrono;
-    const auto now = steady_clock::time_point{} + seconds(10);
-    std::vector<ImageWaiter> requests{
-        {"other", now - seconds(5) + milliseconds(1)},
-        {"active", now},
-    };
-    auto select = [&](bool fifo, steady_clock::time_point when) {
-        return next_image_request(requests.begin(), requests.end(), "active", fifo, when)
-               - requests.begin();
-    };
-    CHECK_EQ(select(false, now), 1);
-    CHECK_EQ(select(false, now + milliseconds(1)), 0);
-    CHECK_EQ(select(true, now), 0);
-    requests[0].bypasses = 2;
-    CHECK_EQ(select(false, now), 0);
-}
 
-TEST(image_lifecycle_reports_backend_failures_as_service_unavailable) {
-    int status = RAD_E_IO;
-    auto fail = [&](std::string* why) {
-        *why = "image lifecycle operation failed";
-        return status;
-    };
-    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
-        o.queue_image = [&](const std::string&, size_t, size_t, size_t,
-                            const std::function<bool()>&, Deps::ImageEndpoint*,
-                            std::shared_ptr<void>*, ImageDispatchTiming*, std::string* why) {
-            return fail(why);
-        };
-        o.register_image = o.load_image = [&](const std::string&, const std::string&, std::string* why) {
-            return fail(why);
-        };
-        o.unload_image = [&](const std::string&, const std::function<bool()>&, std::string* why) {
-            return fail(why);
-        };
-    }});
-    struct Request { const char* path; const char* body; };
-    const Request requests[] = {
-        {"/v1/images/generations", R"({"prompt":"a red square","model":"next"})"},
-        {"/v1/images/register_model", R"({"model":"next","path":"/models/next.rad"})"},
-        {"/v1/images/load_model", R"({"model":"next","path":"/models/next.rad"})"},
-        {"/v1/images/unload_model", R"({"model":"next"})"},
-    };
-    for (int failure : {RAD_E_IO, RAD_E_DEVICE, RAD_E_NOMEM, RAD_E_INVAL}) {
-        status = failure;
-        const bool unavailable = failure != RAD_E_INVAL;
-        for (const auto& request : requests) {
-            const auto reply = f.post(request.path, request.body);
-            CHECK_EQ(reply.status, unavailable ? 503 : 400);
-            const auto error = json::parse(reply.body)["error"];
-            CHECK_EQ(error.value("type", ""), unavailable ? "service_unavailable" : "invalid_request_error");
-            CHECK_EQ(error.value("param", ""), "model");
-            CHECK(error.value("message", "").find("image lifecycle operation failed") != std::string::npos);
-        }
-        CHECK_EQ(f.srv->in_flight(), 0);
+/* Admission callbacks are serialized, but the fake generator must also tolerate
+ * overlapping HTTP threads after they leave the adapter queue. */
+namespace {
+struct ConcurrentImageGen : FakeImageGen {
+    std::mutex mutex;
+    int submit(std::unique_ptr<gen::Request> r, std::string* why) override {
+        std::lock_guard lock(mutex);
+        return FakeImageGen::submit(std::move(r), why);
     }
+};
 }
 
-TEST(image_registration_requires_local_operator_on_keyless_listeners) {
-    int calls = 0;
-    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
-        o.register_image = [&](const std::string&, const std::string&, std::string*) {
-            ++calls;
+TEST(image_adapter_waiters_acquire_in_fifo_order_even_for_a_cached_choice) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    ConcurrentImageGen image;
+    std::atomic<bool> release_head{false}, attempted{false};
+    std::atomic<bool> middle_queued{false}, last_queued{false};
+    std::promise<void> head_seen, middle_seen, last_seen;
+    std::vector<std::string> acquired;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto& choices, int32_t* slot, std::shared_ptr<void>* hold,
+                                 std::string*, std::string*) {
+            const auto& name = choices.front().first;
+            if (name == "busy" && !release_head.load()) {
+                if (!attempted.exchange(true)) head_seen.set_value();
+                return RAD_E_FULL;
+            }
+            acquired.push_back(name);
+            *slot = 0;
+            *hold = std::make_shared<int>(0);
             return RAD_OK;
         };
     }});
-    HttpRequest req;
-    req.method = "POST";
-    req.path = "/v1/images/register_model";
-    req.body = R"({"model":"secondary","path":"/models/secondary.rad"})";
-    req.raw_peer = "192.0.2.1:12345";
-    CHECK_EQ(f.srv->router().dispatch(req).status, 403);
-    CHECK_EQ(calls, 0);
-    req.raw_peer.clear();
-    CHECK_EQ(f.srv->router().dispatch(req).status, 200);
-    CHECK_EQ(calls, 1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto request = [&](const char* name, std::atomic<bool>* queued, std::promise<void>* seen) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/generations";
+        q.body = json({{"prompt", "a cup"}, {"size", "64x64"}, {"loras", {name}}}).dump();
+        // peer_gone() is checked after insertion, so this is a queue-order barrier.
+        q.closed = [&, queued, seen] {
+            if (queued && !queued->exchange(true)) seen->set_value();
+            return std::chrono::steady_clock::now() >= deadline;
+        };
+        return f.srv->router().dispatch(q).status;
+    };
+    auto first = std::async(std::launch::async, [&] { return request("busy", nullptr, nullptr); });
+    CHECK(head_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    auto middle = std::async(std::launch::async, [&] {
+        return request("middle", &middle_queued, &middle_seen);
+    });
+    CHECK(middle_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    auto last = std::async(std::launch::async, [&] {
+        return request("cached", &last_queued, &last_seen);
+    });
+    CHECK(last_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    release_head.store(true);
+    CHECK_EQ(first.get(), 200);
+    CHECK_EQ(middle.get(), 200);
+    CHECK_EQ(last.get(), 200);
+    CHECK(acquired == std::vector<std::string>({"busy", "middle", "cached"}));
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
 
-TEST(image_status_requires_local_operator_on_keyless_listeners) {
-    Fixture f(Fixture::Tweak{[](ServerOptions& o, Deps&) {
-        o.image_status = [] { return R"({"queued":0})"; };
+TEST(stopping_the_server_releases_all_image_adapter_waiters) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    ConcurrentImageGen image;
+    std::promise<void> attempted;
+    std::atomic<bool> tried{false}, second_queued{false}, cancel{false};
+    std::promise<void> second_seen;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto&, int32_t*, std::shared_ptr<void>*,
+                                 std::string*, std::string*) {
+            if (!tried.exchange(true)) attempted.set_value();
+            return RAD_E_FULL;
+        };
     }});
-    HttpRequest req;
-    req.path = "/v1/images/status";
-    req.raw_peer = "192.0.2.1:12345";
-    CHECK_EQ(f.srv->router().dispatch(req).status, 403);
-    req.raw_peer.clear();
-    const auto response = f.srv->router().dispatch(req);
-    CHECK_EQ(response.status, 200);
-    CHECK_EQ(json::parse(response.body)["queued"].get<int>(), 0);
+    auto request = [&](bool second) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/generations";
+        q.body = R"({"prompt":"a cup","size":"64x64","loras":["busy"]})";
+        q.closed = [&, second] {
+            if (second && !second_queued.exchange(true)) second_seen.set_value();
+            return cancel.load();
+        };
+        return f.srv->router().dispatch(q).status;
+    };
+    auto first = std::async(std::launch::async, [&] { return request(false); });
+    CHECK(attempted.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    auto second = std::async(std::launch::async, [&] { return request(true); });
+    CHECK(second_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    f.srv->stop();
+    const auto a = first.wait_for(std::chrono::seconds(2));
+    const auto b = second.wait_for(std::chrono::seconds(2));
+    cancel.store(true); // Bound cleanup even if a shutdown regression is introduced.
+    CHECK(a == std::future_status::ready);
+    CHECK(b == std::future_status::ready);
+    CHECK_EQ(first.get(), 429);
+    CHECK_EQ(second.get(), 429);
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
 
-TEST(image_unload_requires_local_operator_on_keyless_listeners) {
-    int calls = 0;
+TEST(adapter_validation_uses_the_selected_model_without_generating_or_holding_a_slot) {
+    int validations = 0;
     Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
-        o.unload_image = [&](const std::string& model, const std::function<bool()>& cancelled,
-                             std::string*) {
-            CHECK_EQ(model, "secondary");
-            CHECK(!cancelled());
-            ++calls;
+        o.api_key = "fixture";
+        o.gen_lora_validate = [&](const auto& choices, std::string* why) {
+            ++validations;
+            if (choices.front().first != "turbo") {
+                *why = "unmatched adapter";
+                return RAD_E_NOTFOUND;
+            }
+            CHECK_EQ(choices.front().second, 0.6);
             return RAD_OK;
         };
     }});
-    HttpRequest req;
-    req.method = "POST";
-    req.path = "/v1/images/unload_model";
-    req.body = R"({"model":"secondary"})";
-    req.raw_peer = "192.0.2.1:12345";
-    CHECK_EQ(f.srv->router().dispatch(req).status, 403);
-    CHECK_EQ(calls, 0);
-    req.raw_peer.clear();
-    CHECK_EQ(f.srv->router().dispatch(req).status, 200);
-    CHECK_EQ(calls, 1);
+    auto validate = [&](const char* model, const json& adapters) {
+        return f.post("/v1/loras/validate", json{{"model", model}, {"loras", adapters}}.dump());
+    };
+    CHECK_EQ(validate("missing", {"turbo"}).status, 404);
+    CHECK_EQ(validate("test-model", json::array()).status, 400);
+    CHECK_EQ(validations, 0);
+    const auto answer = validate("test-model", {{"turbo", 0.6}});
+    REQUIRE_EQ(answer.status, 200);
+    CHECK_EQ(json::parse(answer.body)["compatibility"].get<std::string>(), std::string("compatible"));
+    CHECK_EQ(validate("test-model", {"unknown"}).status, 404);
+    CHECK_EQ(validations, 2);
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
+
+TEST(krea_outfill_scales_the_long_edge_and_preserves_the_source_in_the_canvas) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    const json request = { {"prompt", "A portrait in a studio"}, {"size", "1024x1024"},
+                           {"image", data_url(png(48, 64, 255, 255))},
+                           {"outfill", { {"horizontal", "right"} }} };
+    const HttpResponse response = s.post("/v1/images/edits", request);
+    REQUIRE_EQ(response.status, 200);
+    CHECK_EQ(s.last().outfill.x, 256);
+    CHECK_EQ(s.last().outfill.y, 0);
+    CHECK_EQ(s.last().outfill.w, 768);
+    CHECK_EQ(s.last().outfill.h, 1024);
+    REQUIRE_EQ(s.last().refs.size(), (size_t)1);
+    CHECK_EQ(s.last().refs[0].w, 336);
+    CHECK_EQ(s.last().refs[0].h, 448);
+    CHECK(s.img.frames.empty());
+    const json answer = json::parse(response.body);
+    std::vector<uint8_t> png_bytes;
+    REQUIRE(base64_decode(answer["data"][0]["b64_json"].get<std::string>(), &png_bytes));
+    mm::FrameRGBA result;
+    std::string why;
+    REQUIRE_EQ(mm::decode_image_rgba(png_bytes.data(), png_bytes.size(), 1024 * 1024, &result, &why),
+               RAD_OK);
+    const auto red = [&](int x, int y) { return (int)result.rgba[((size_t)y * 1024 + x) * 4]; };
+    CHECK_EQ(red(10, 100), 0);
+    CHECK_EQ(red(256, 100), 0);
+    CHECK_EQ(red(272, 100), 100);
+    CHECK_EQ(red(288, 100), 200);
+    json other = request;
+    other["size"] = "768x768";
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
+    other = request;
+    other["ref_boost"] = 4.0;
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
+}
+
+
+
 
 RAD_TEST_MAIN()

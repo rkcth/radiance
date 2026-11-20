@@ -18,7 +18,11 @@ Both are built when `RAD_GPU_TARGETS` names gfx1151, and on a Strix Halo libhalo
   alone. The loader would leave libhalo's device rows out there anyway (its code objects are
   gfx1151's); declining also keeps its schemas out, and keeps rad-convert, which resolves kernels
   without that check, from laying weights out for it. A process without `/dev/kfd` (a container
-  given no card, a machine with no amdgpu) sees no gfx1151 and declines it too.
+  given no card, a machine with no amdgpu) sees no gfx1151 and declines it too;
+- libr4d (`r4d_rows.cpp`) declines a machine whose KFD topology lists cards and no gfx12 one, so
+  on a Strix Halo its schemas are absent too: an architecture plugin that asks whether an op is
+  declared would otherwise pick a fused form only libr4d implements, and the engine would refuse
+  to start. With no card listed it stays loaded, for rad-convert and the host-only tests.
 
 An explicit `kernels` list (`server.kernels`, or a tool's `--kernels`) orders the libraries as given; name `libhalo` before `libr3d`.
 

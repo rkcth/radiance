@@ -364,6 +364,17 @@ extern "C" int halo_attn_dense_bf16(const void* q, const void* k, const void* v,
         return halo_attn_dense_launch<64, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
                                                       n_head_kv, scale, window, wright, block,
                                                       cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
+    /* h80 gqa1 (C-RADIO's heads) and h96 gqa1 (Muse Glimmer's vision tower, 16 heads of 96,
+     * bidirectional over segments): the h64 shape (8 query blocks of 16, K/V tiles of 64) with five
+     * and six 16-wide k-tiles a head, as libr4d's. */
+    if (head_dim == 80 && gqa == 1)
+        return halo_attn_dense_launch<80, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
+                                                      n_head_kv, scale, window, wright, block,
+                                                      cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
+    if (head_dim == 96 && gqa == 1)
+        return halo_attn_dense_launch<96, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
+                                                      n_head_kv, scale, window, wright, block,
+                                                      cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
 #define HALO_DENSE(HD, G, NQB, DS, T)                                                              \
     return halo_attn_dense_launch<HD, G, NQB, DS, T>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen, \
                                                     n_head_kv, scale, window, wright, block,      \

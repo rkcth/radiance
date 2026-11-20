@@ -1,4 +1,5 @@
 #include "server.h"
+#include "loras.h"
 #include "server_priv.h"
 
 #include <cstdio>
@@ -7,8 +8,6 @@
 #include "mica.h"
 #include "rad_laya.h"
 #include "json_partial.h"
-#include "loras.h"
-#include "../lora/adapter.h"
 #include "systemone.h"
 #include "rad_internal.h"
 #include "text/tokenizer.h"
@@ -26,98 +25,41 @@ namespace server {
 
 /* ------------------------------------------------------------------ construction */
 
-namespace {
-
-OaiLimits request_limits(const ServerOptions& options) {
-    OaiLimits limits;
-    limits.model_id = options.model_id;
-    limits.version = options.version;
-    limits.max_ctx = options.max_ctx;
-    limits.default_max_tokens = options.default_max_tokens;
-    limits.max_tokens_cap = options.max_tokens_cap;
-    limits.max_n = options.max_n;
-    limits.max_stops = options.max_stops;
-    limits.max_stop_bytes = options.max_stop_bytes;
-    limits.allow_image = options.allow_image;
-    limits.allow_video = options.allow_video;
-    limits.allow_audio = options.allow_audio;
-    limits.supports_logprobs = options.supports_logprobs;
-    limits.default_reasoning_effort = options.default_reasoning_effort;
-    limits.default_thinking_budget = options.default_thinking_budget;
-    limits.default_sampling = options.default_sampling;
-    limits.default_dry_breakers_set = options.default_dry_breakers_set;
-    limits.default_template_kwargs = options.default_template_kwargs;
-    limits.reasoning_effort_map = options.reasoning_effort_map;
-    limits.reasoning_format = options.reasoning_format;
-    return limits;
-}
-
-OaiDeps request_parser(const Deps& deps) {
-    return {deps.tok, deps.chat, deps.grammar, deps.mm, deps.embed};
-}
-
-}  // namespace
-
 Server::Server(const Deps& d, const ServerOptions& o)
     : deps_(d), opt_(o),
-      lim_(request_limits(o)), odeps_(request_parser(d)),
       metrics_(o.model_id, o.max_ctx > 0 ? o.max_ctx : 32768) {
     if (!opt_.kv_cache_dtype.empty())
         metrics_.set_cache_config(opt_.kv_cache_dtype, opt_.kv_block_size, opt_.prefix_cache,
                                   opt_.prefix_cache_mib);
+    lim_.model_id = opt_.model_id;
+    lim_.version = opt_.version;
+    lim_.max_ctx = opt_.max_ctx;
+    lim_.default_max_tokens = opt_.default_max_tokens;
+    lim_.max_tokens_cap = opt_.max_tokens_cap;
+    lim_.max_n = opt_.max_n;
+    lim_.max_stops = opt_.max_stops;
+    lim_.max_stop_bytes = opt_.max_stop_bytes;
+    lim_.allow_image = opt_.allow_image;
+    lim_.allow_video = opt_.allow_video;
+    lim_.allow_audio = opt_.allow_audio;
+    lim_.supports_logprobs = opt_.supports_logprobs;
+    lim_.default_reasoning_effort = opt_.default_reasoning_effort;
+    lim_.default_thinking_budget = opt_.default_thinking_budget;
+    lim_.default_sampling = opt_.default_sampling;
+    lim_.default_dry_breakers_set = opt_.default_dry_breakers_set;
+    lim_.default_template_kwargs = opt_.default_template_kwargs;
+    lim_.reasoning_effort_map = opt_.reasoning_effort_map;
+    lim_.reasoning_format = opt_.reasoning_format;
+
+    odeps_.tok = deps_.tok;
+    odeps_.chat = deps_.chat;
+    odeps_.grammar = deps_.grammar;
+    odeps_.mm = deps_.mm;
+    odeps_.embed = deps_.embed;
+
     queue_depth_ = opt_.queue_depth > 0 ? opt_.queue_depth : opt_.max_seqs * 8;
     started_at_ = unix_now();
     register_routes();
-}
-
-std::shared_ptr<const TextEndpoint> Server::retain_text_endpoint(std::shared_ptr<void> engine_lease) const {
-    if (!engine_lease || !deps_.text_owner || !deps_.sched || !deps_.tok || deps_.embed ||
-        opt_.embedding_model || opt_.image_model || opt_.audio_model ||
-        opt_.video_model || opt_.shape_model)
-        return {};
-
-    auto endpoint = std::make_shared<TextEndpoint>();
-    endpoint->engine_lease = std::move(engine_lease);
-    endpoint->bridge_owner = deps_.text_owner;
-    endpoint->scheduler = deps_.sched;
-    endpoint->parser = odeps_;
-    endpoint->limits = lim_;
-    endpoint->control_vector.available = deps_.control_vector.available;
-    endpoint->control_vector.get_default = deps_.control_vector.get_default;
-    return endpoint;
-}
-
-int Server::probe_text_completion(std::chrono::steady_clock::time_point deadline, std::string* why) {
-    if (std::chrono::steady_clock::now() >= deadline) {
-        *why = "text readiness deadline expired";
-        return RAD_E_CANCELLED;
-    }
-    HttpRequest request;
-    request.method = "POST";
-    request.path = "/v1/completions";
-    request.body = R"({"prompt":"Hello","seed":7,"temperature":0,"max_tokens":1,"ignore_eos":true})";
-    request.closed = [deadline] { return std::chrono::steady_clock::now() >= deadline; };
-
-    const auto response = router_.dispatch(std::move(request));
-    if (response.status == 499 || std::chrono::steady_clock::now() >= deadline) {
-        *why = "text readiness deadline expired";
-        return RAD_E_CANCELLED;
-    }
-    if (response.status != 200) {
-        *why = "text readiness completion returned HTTP " + std::to_string(response.status) +
-               ": " + response.body;
-        return RAD_E_STATE;
-    }
-    const auto body = json::parse(response.body, nullptr, false);
-    if (body.is_object() && body.contains("usage") && body["usage"].is_object()) {
-        const auto tokens = body["usage"].find("completion_tokens");
-        if (tokens != body["usage"].end() && tokens->is_number_integer() && tokens->get<int64_t>() > 0) {
-            why->clear();
-            return RAD_OK;
-        }
-    }
-    *why = "text readiness completion produced no tokens";
-    return RAD_E_STATE;
 }
 
 bool Server::local_operator(const HttpRequest& req) const {
@@ -150,8 +92,8 @@ void Server::drain_graveyard(int timeout_ms) {
             "freeing memory a running step may still write to.",
             grave_.size(), timeout_ms);
     /* Hand the remainder to storage that outlives the process's teardown of this object. */
-    static std::vector<std::vector<RetiredGeneration>>* leaked =
-        new std::vector<std::vector<RetiredGeneration>>();
+    static std::vector<std::vector<std::shared_ptr<Sink>>>* leaked =
+        new std::vector<std::vector<std::shared_ptr<Sink>>>();
     leaked->push_back(std::move(grave_));
     grave_.clear();
 }
@@ -213,21 +155,9 @@ void Server::register_routes() {
         return r;
     });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
+    router_.post_guarded("/v1/loras/validate", [this](const HttpRequest& q) { return handle_validate_loras(q); });
     router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
-    router_.post("/v1/loras/validate",   [this](const HttpRequest& q) { return handle_validate_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
-    if (opt_.load_image)
-        router_.post_guarded("/v1/images/load_model",
-                     [this](const HttpRequest& q) { return handle_image_admin(q, true); });
-    if (opt_.unload_image)
-        router_.post_guarded("/v1/images/unload_model",
-                     [this](const HttpRequest& q) { return handle_unload_image(q); });
-    if (opt_.image_status)
-        router_.get_guarded("/v1/images/status",
-                    [this](const HttpRequest& q) { return handle_image_status(q); });
-    if (opt_.register_image)
-        router_.post_guarded("/v1/images/register_model",
-                     [this](const HttpRequest& q) { return handle_image_admin(q, false); });
     router_.post_guarded("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
     router_.post_guarded("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
     /* The same routes without /v1, as llama-server answers them, for clients whose base URL is
@@ -441,8 +371,6 @@ std::string Server::check_thinking_budget() const {
 }
 
 void Server::stop() {
-    stopping_.store(true);
-    image_adapter_turn_.notify_all();
     transport_.stop();
     retire();
 }
@@ -487,9 +415,9 @@ void Server::sweep_abandoned() {
     std::lock_guard<std::mutex> lk(grave_m_);
     size_t before = grave_.size();
     grave_.erase(std::remove_if(grave_.begin(), grave_.end(),
-                                [](const RetiredGeneration& g) {
-                                    if (!g.sink->done()) return false;
-                                    g.scheduler->reap(g.sink->id);
+                                [this](const std::shared_ptr<Sink>& s) {
+                                    if (!s->done()) return false;
+                                    deps_.sched->reap(s->id);
                                     return true;
                                 }),
                  grave_.end());
@@ -548,34 +476,26 @@ void Server::log_admitted(const OaiRequest& r) const {
 
 /* ------------------------------------------------------------------ submission */
 
-int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiError* err,
-                       const std::shared_ptr<const TextEndpoint>& endpoint) {
-    auto* scheduler = endpoint ? endpoint->scheduler : deps_.sched;
-    const auto& control_vector = endpoint ? endpoint->control_vector : deps_.control_vector;
+int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiError* err) {
     const int n_choices = r.n_choices();
     gens->reserve((size_t)n_choices);
-
-    /* The control-vector variant is a name of the served model, not an adapter: it takes no
-     * slot. */
-    const bool variant =
-        !endpoint && !opt_.control_vector_variant.empty() && r.model == opt_.control_vector_variant;
-
-    if (!endpoint && !opt_.image_model_id.empty() && !r.model.empty() && r.model != opt_.model_id && !variant) {
-        *err = err_bad("model", "expected " + opt_.model_id + " for text generation");
-        return RAD_E_INVAL;
-    }
 
     /* The sampler vets the parameters before anything is queued (IScheduler::admit), so an
      * unresolved stage is a 400 naming the parameter rather than a mid-stream cancellation.
      * Once, not per choice: `n` varies only the seed, which no check reads. */
     {
         std::string why;
-        if (scheduler->admit(r.sp, &why) < 0) {
+        if (deps_.sched->admit(r.sp, &why) < 0) {
             *err = err_unsupported("sampling", why.empty()
                                        ? "these sampling parameters cannot be served" : why);
             return RAD_E_INVAL;
         }
     }
+
+    /* The control-vector variant is a name of the served model, not an adapter: it takes no
+     * slot. */
+    const bool variant =
+        !opt_.control_vector_variant.empty() && r.model == opt_.control_vector_variant;
 
     /* Runtime LoRA: `model` picks the adapter. The served model's own name, or no name, is the
      * base; with adapters enabled anything else must be a loaded adapter, since a typo served by
@@ -583,7 +503,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
     int32_t  lora_slot = -1;
     uint64_t lora_uid = 0;
     std::shared_ptr<void> lora_hold;
-    if (!endpoint && opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id && !variant) {
+    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id && !variant) {
         if (opt_.lora_acquire(r.model, &lora_slot, &lora_uid, &lora_hold) != RAD_OK) {
             std::string names = opt_.model_id;
             if (opt_.lora_names)
@@ -612,10 +532,10 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             return RAD_E_INVAL;
         }
         const bool by_default =
-            control_vector.get_default && control_vector.get_default();
+            deps_.control_vector.get_default && deps_.control_vector.get_default();
         projection_on = variant || (named ? r.control_vector == 1 : by_default);
         if (projection_on &&
-            !(control_vector.available && control_vector.available())) {
+            !(deps_.control_vector.available && deps_.control_vector.available())) {
             *err = err_bad("control_vector",
                            "this deployment found no control vector for its model; the stock model "
                            "is what it serves");
@@ -629,13 +549,13 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
     const size_t first = gens->size();
     for (size_t p = 0; p < r.prompts.size(); ++p) {
         for (int k = 0; k < r.n; ++k, ++idx) {
-            Generation g(deps_, endpoint);
+            Generation g;
             g.index = idx;
             g.prompt_index = (int)p;
             g.sink = std::make_shared<Sink>();
             if (r.want_logprobs) g.sink->enable_logprobs(r.n_logprobs);
             g.think.start(r.sp.reasoning);
-            g.detok = g.tokenizer->detokenizer(r.stop, r.preserved_tokens);
+            g.detok = deps_.tok->detokenizer(r.stop, r.preserved_tokens);
             if (!g.detok) {
                 *err = err_not_implemented("the tokenizer did not supply an incremental decoder");
                 return RAD_E_UNSUPPORTED;
@@ -667,7 +587,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
     std::vector<uint64_t> ids;
-    scheduler->submit_all(rqs, &ids);
+    deps_.sched->submit_all(rqs, &ids);
     for (size_t i = 0; i < ids.size(); ++i) {
         Generation& g = (*gens)[first + i];
         g.id = ids[i];
@@ -708,7 +628,7 @@ void Server::cancel_all(std::vector<Generation>& gens, bool count_disconnect) {
     for (auto& g : gens) {
         if (g.sink->done()) continue;
         g.sink->request_cancel();
-        g.scheduler->cancel(g.id);
+        deps_.sched->cancel(g.id);
     }
     if (count_disconnect) metrics_.observe_disconnect();
 }
@@ -719,17 +639,17 @@ void Server::cancel_all(std::vector<Generation>& gens, bool count_disconnect) {
  * request the scheduler refused or never received: it holds nothing, so there is nothing to
  * reap and nothing to wait for. */
 void Server::retire(std::vector<Generation>& gens) {
-    std::vector<RetiredGeneration> pending;
+    std::vector<std::shared_ptr<Sink>> pending;
     for (auto& g : gens) {
         if (g.retired) continue;
         g.retired = true;
         if (!g.id) continue;
-        if (g.sink->done()) g.scheduler->reap(g.id);
-        else pending.push_back({g.scheduler, g.text_owner, g.lora_hold, g.sink});
+        if (g.sink->done()) deps_.sched->reap(g.id);
+        else pending.push_back(g.sink);
     }
     if (pending.empty()) return;
     std::lock_guard<std::mutex> lk(grave_m_);
-    for (auto& g : pending) grave_.push_back(std::move(g));
+    for (auto& s : pending) grave_.push_back(std::move(s));
 }
 
 /* ------------------------------------------------------------------ draining */
@@ -842,13 +762,13 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
                 e.token = buf[i].token;
                 e.logprob = buf[i].logprob;
                 e.end = g.text.size();
-                lp_text(*g.tokenizer, e.token, &e.text, &e.bytes);
+                lp_text(*deps_.tok, e.token, &e.text, &e.bytes);
                 const SinkAlt* a = alts.data() + i * (size_t)g.sink->alt_width();
                 for (int32_t j = 0; j < buf[i].n_alt; ++j) {
                     LogprobAlt t;
                     t.token = a[j].id;
                     t.logprob = a[j].logprob;
-                    lp_text(*g.tokenizer, t.token, &t.text, &t.bytes);
+                    lp_text(*deps_.tok, t.token, &t.text, &t.bytes);
                     e.top.push_back(std::move(t));
                 }
                 g.logprobs.push_back(std::move(e));
@@ -864,7 +784,7 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
             g.closed = true;
             progress = true;
             g.sink->request_cancel();
-            g.scheduler->cancel(g.id);
+            deps_.sched->cancel(g.id);
             continue;
         }
 
@@ -906,7 +826,7 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
                 progress = true;
                 /* No further token reaches the client, so free its blocks now (spec §14). */
                 g.sink->request_cancel();
-                g.scheduler->cancel(g.id);
+                deps_.sched->cancel(g.id);
                 continue;
             }
         }
@@ -1061,12 +981,11 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
 
 /* ------------------------------------------------------------------ non-streaming */
 
-HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r,
-                                         const std::shared_ptr<const TextEndpoint>& endpoint) {
+HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) {
     r.t_received_ns = req.t_received_ns;
     std::vector<Generation> gens;
     ApiError err;
-    if (submit_all(r, &gens, &err, endpoint) < 0) {
+    if (submit_all(r, &gens, &err) < 0) {
         retire(gens);
         release(r.n_choices());
         return error_response(err, req.peer, r.shape);
@@ -1307,15 +1226,14 @@ static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s)
     return sse_event(o.dump());
 }
 
-HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r,
-                                          const std::shared_ptr<const TextEndpoint>& endpoint) {
+HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r) {
     r.t_received_ns = req.t_received_ns;
     auto st = std::make_shared<StreamState>();
     st->r = r;
     st->peer_closed = req.closed;
 
     ApiError err;
-    if (submit_all(st->r, &st->gens, &err, endpoint) < 0) {
+    if (submit_all(st->r, &st->gens, &err) < 0) {
         retire(st->gens);
         release(r.n_choices());
         return error_response(err, req.peer, r.shape);
@@ -1573,62 +1491,13 @@ std::optional<HttpResponse> Server::refuse_text(const std::string& peer, ApiShap
     return error_response(err_not_implemented(why), peer, shape);
 }
 
-HttpResponse Server::handle_chat(const HttpRequest& req) { return handle_text(req, true); }
-
-HttpResponse Server::handle_text(const HttpRequest& req, bool chat) {
+HttpResponse Server::handle_chat(const HttpRequest& req) {
     if (auto no = refuse_text(req.peer)) return *no;
     OaiRequest r;
     ApiError err;
-    if (!opt_.select_text) {
-        const int st = chat ? parse_chat_request(req.body, odeps_, lim_, &r, &err)
-                            : parse_completion_request(req.body, odeps_, lim_, &r, &err);
-        if (st < 0) return error_response(err, req.peer);
-        return serve(req, r);
-    }
-
-    OaiLimits routing_limits;
-    routing_limits.max_ctx = std::max(lim_.max_ctx, opt_.text_selection_max_ctx);
-    json body;
-    if (parse_request_object(req.body, routing_limits, &body, &err) < 0)
+    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0)
         return error_response(err, req.peer);
-
-    std::shared_ptr<const TextEndpoint> endpoint;
-    if (const auto model = body.find("model"); model != body.end() && !model->is_null()) {
-        if (!model->is_string())
-            return error_response(err_bad("model", "expected a string"), req.peer);
-        const auto& name = model->get_ref<const std::string&>();
-        if (!name.empty() && name != opt_.model_id) {
-            std::string why;
-            const auto cancelled = [&] { return stopping_.load() || req.peer_gone(); };
-            const int st = opt_.select_text(name, cancelled, &endpoint, &why);
-            if (st < 0) {
-                if (st == RAD_E_CANCELLED && req.peer_gone()) {
-                    metrics_.observe_http(499);
-                    return HttpResponse::text(499, "client closed request\n");
-                }
-                err = err_bad("model", why.empty() ? rad_strerror(st) : why);
-                if (st == RAD_E_NOTFOUND) { err.status = 404; err.type = "not_found_error"; }
-                if (st == RAD_E_FULL) {
-                    metrics_.observe_rejected();
-                    return error_response(err_overloaded(err.message), req.peer);
-                }
-                if (st == RAD_E_CANCELLED || st == RAD_E_STATE || st == RAD_E_NOMEM) {
-                    err.status = 503;
-                    err.type = "service_unavailable";
-                }
-                return error_response(err, req.peer);
-            }
-            if (endpoint && (!endpoint->scheduler || !endpoint->parser.tok ||
-                             endpoint->limits.model_id != name))
-                return error_response(err_internal("invalid selected text endpoint"), req.peer);
-        }
-    }
-    const auto& parser = endpoint ? endpoint->parser : odeps_;
-    const auto& limits = endpoint ? endpoint->limits : lim_;
-    const int st = chat ? parse_chat_object(std::move(body), parser, limits, &r, &err)
-                        : parse_completion_object(body, parser, limits, &r, &err);
-    if (st < 0) return error_response(err, req.peer);
-    return serve(req, r, endpoint);
+    return serve(req, r);
 }
 
 /* llama-server's /apply-template and its token count. Both parse exactly as /v1/chat/completions
@@ -1689,13 +1558,12 @@ HttpResponse Server::handle_messages(const HttpRequest& req) {
     return serve(req, r);
 }
 
-HttpResponse Server::serve(const HttpRequest& req, OaiRequest& r,
-                           const std::shared_ptr<const TextEndpoint>& endpoint) {
+HttpResponse Server::serve(const HttpRequest& req, OaiRequest& r) {
     r.peer = req.peer;
     if (auto no = admit(r.n_choices(), req.peer, r.shape, r.prompts.size() > 1 ? "prompt" : "n"))
         return *no;
     log_admitted(r);
-    return r.stream ? streaming_completion(req, r, endpoint) : blocking_completion(req, r, endpoint);
+    return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
 }
 
 /* llama-server's native /completion: the completions parser with llama-server's prompt forms,
@@ -1872,7 +1740,12 @@ HttpResponse Server::handle_responses(const HttpRequest& req) {
 }
 
 HttpResponse Server::handle_completion(const HttpRequest& req) {
-    return handle_text(req, false);
+    if (auto no = refuse_text(req.peer)) return *no;
+    OaiRequest r;
+    ApiError err;
+    if (parse_completion_request(req.body, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
+    return serve(req, r);
 }
 
 HttpResponse Server::handle_embeddings(const HttpRequest& req) { return serve_pooled(req, false); }
@@ -1940,7 +1813,7 @@ HttpResponse Server::serve_pooled(const HttpRequest& req, bool rerank) {
     gens.reserve((size_t)n_in);
     rqs.reserve((size_t)n_in);
     for (int i = 0; i < n_in; ++i) {
-        Generation g(deps_);
+        Generation g;
         g.index = i;
         g.prompt_index = i;
         g.sink = std::make_shared<Sink>(16);
@@ -2098,7 +1971,7 @@ std::optional<HttpResponse> Server::score_prompts(
     std::vector<Request> rqs;
     std::vector<std::shared_ptr<TokenScores>> scores;
     for (int i = 0; i < n; ++i) {
-        Generation g(deps_);
+        Generation g;
         g.index = i;
         g.sink = std::make_shared<Sink>(16);
         auto ts = std::make_shared<TokenScores>();
@@ -2119,7 +1992,7 @@ std::optional<HttpResponse> Server::score_prompts(
      * whose sinks would never finish. */
     size_t submitted = 0;
     auto fail = [&](const std::string& why) {
-        gens.erase(gens.begin() + submitted, gens.end());
+        gens.resize(submitted);
         retire(gens);
         release(n);
         return error_response(err_internal(why), req.peer);
@@ -2154,7 +2027,7 @@ std::optional<HttpResponse> Server::score_prompts(
             if (all) return;
             /* Both conditions only ever turn true, so abandoned() answers once either holds. */
             if (req.peer_gone() || stopping_.load()) {
-                gens.erase(gens.begin() + submitted, gens.end());
+                gens.resize(submitted);
                 early = std::make_unique<HttpResponse>(*abandoned(req, gens, n));
                 return;
             }
@@ -2278,8 +2151,7 @@ HttpResponse Server::handle_clef(const HttpRequest& req) {
     RAD_INFO("systemone (clef) admitted%s questions=%zu options=%lld prompt=%zu tok",
              from_peer(req.peer).c_str(), r.questions.size(), (long long)n_opt, r.tokens.size());
 
-    std::vector<Generation> gens;
-    gens.emplace_back(deps_);
+    std::vector<Generation> gens(1);
     Generation& g = gens[0];
     g.index = 0;
     g.sink = std::make_shared<Sink>(16);
@@ -2374,7 +2246,7 @@ HttpResponse Server::handle_laya(const HttpRequest& req) {
     gens.reserve((size_t)n);
     rqs.reserve((size_t)n);
     for (int i = 0; i < n; ++i) {
-        Generation g(deps_);
+        Generation g;
         g.index = i;
         g.prompt_index = i;
         g.sink = std::make_shared<Sink>(16);
@@ -2439,83 +2311,6 @@ HttpResponse Server::handle_laya(const HttpRequest& req) {
                                                         { "usage", laya_usage(r) } }));
 }
 
-Deps::ImageEndpoint Server::image_endpoint() const {
-    return opt_.acquire_image ? opt_.acquire_image() : deps_.images;
-}
-
-HttpResponse Server::handle_unload_image(const HttpRequest& req) {
-    if (opt_.api_key.empty() && !local_operator(req)) {
-        ApiError e = err_bad("model", "managing local image models requires operator access");
-        e.status = 403;
-        e.type = "permission_error";
-        return error_response(e, req.peer);
-    }
-    json j;
-    ApiError e;
-    if (parse_request_object(req.body, lim_, &j, &e) < 0) return error_response(e, req.peer);
-    if (!j.contains("model") || !j["model"].is_string())
-        return error_response(err_bad("model", "expected a registered image model name"), req.peer);
-    const auto model = j["model"].get<std::string>();
-    const auto cancelled = [&] { return stopping_.load() || req.peer_gone(); };
-    std::string why;
-    const int st = opt_.unload_image(model, cancelled, &why);
-    if (st >= 0) return HttpResponse::json_body(200, json{{"model", model}, {"status", "unloaded"}}.dump());
-    e = err_bad("model", why.empty() ? rad_strerror(st) : why);
-    if (st == RAD_E_FULL) { e.status = 409; e.type = "conflict_error"; }
-    if (st == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
-    if (st == RAD_E_STATE || st == RAD_E_NOMEM || st == RAD_E_IO || st == RAD_E_DEVICE) {
-        e.status = 503;
-        e.type = "service_unavailable";
-    }
-    return error_response(e, req.peer);
-}
-
-HttpResponse Server::handle_image_status(const HttpRequest& req) {
-    if (opt_.api_key.empty() && !local_operator(req)) {
-        ApiError e = err_bad("model", "image model status requires operator access");
-        e.status = 403;
-        e.type = "permission_error";
-        return error_response(e, req.peer);
-    }
-    return HttpResponse::json_body(200, opt_.image_status());
-}
-
-HttpResponse Server::handle_image_admin(const HttpRequest& req, bool activate) {
-    if (opt_.api_key.empty() && !local_operator(req)) {
-        ApiError e;
-        e.status = 403;
-        e.type = "permission_error";
-        e.message = "managing local image models requires operator access";
-        return error_response(e, req.peer);
-    }
-    json j;
-    ApiError e;
-    if (parse_request_object(req.body, lim_, &j, &e) < 0) return error_response(e, req.peer);
-    if (!j.contains("path") || !j["path"].is_string() ||
-        !j.contains("model") || !j["model"].is_string())
-        return error_response(err_bad("model", "expected a local path and a served model name"), req.peer);
-    const auto path = j["path"].get<std::string>();
-    const auto model = j["model"].get<std::string>();
-    if (model.empty() || model.find('\0') != std::string::npos || model == opt_.model_id ||
-        model == opt_.control_vector_variant ||
-        (opt_.supplemental_text && model == opt_.supplemental_text->limits.model_id))
-        return error_response(err_bad("model", "expected a distinct image model name"), req.peer);
-    std::string why;
-    const auto& operation = activate ? opt_.load_image : opt_.register_image;
-    const int st = operation(path, model, &why);
-    if (st >= 0)
-        return HttpResponse::json_body(200,
-            json{{"model", model}, {"status", activate ? "ready" : "registered"}}.dump());
-    e = err_bad("model", why.empty() ? rad_strerror(st) : why);
-    if (st == RAD_E_FULL || st == RAD_E_DUPLICATE) { e.status = 409; e.type = "conflict_error"; }
-    if (st == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
-    if (st == RAD_E_STATE || st == RAD_E_NOMEM || st == RAD_E_IO || st == RAD_E_DEVICE) {
-        e.status = 503;
-        e.type = "service_unavailable";
-    }
-    return error_response(e, req.peer);
-}
-
 HttpResponse Server::handle_models(const HttpRequest& req) {
     const std::string id = req.param("id");
     /* Runtime LoRA: each loaded adapter is a model of its own, whose parent is the served one. */
@@ -2523,16 +2318,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     if (opt_.lora_names) adapters = opt_.lora_names();
     const bool is_adapter = !id.empty() && std::find(adapters.begin(), adapters.end(), id) != adapters.end();
     const bool is_variant = !id.empty() && id == opt_.control_vector_variant;
-    const auto images = image_endpoint();
-    auto image_ids = opt_.image_model_ids ? opt_.image_model_ids() : std::vector<std::string>{};
-    if (opt_.acquire_image && images &&
-        std::find(image_ids.begin(), image_ids.end(), images.model_id) == image_ids.end())
-        image_ids.push_back(images.model_id);
-    const bool is_image = !id.empty() &&
-                          std::find(image_ids.begin(), image_ids.end(), id) != image_ids.end();
-    const auto& supplemental = opt_.supplemental_text;
-    const bool is_supplemental = supplemental && id == supplemental->limits.model_id;
-    if (!id.empty() && id != opt_.model_id && !is_adapter && !is_variant && !is_image && !is_supplemental) {
+    if (!id.empty() && id != opt_.model_id && !is_adapter && !is_variant) {
         ApiError e;
         e.status = 404;
         e.type = "not_found_error";
@@ -2549,12 +2335,10 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
      * belongs to the operator alone, the rule /diagnostics and the LoRA admin follow; with a
      * key, everyone who can pay the key already owns this model's card. */
     if (!opt_.api_key.empty() || local_operator(req)) c.root = opt_.model_path;
-    auto caps = capabilities();
-    if (opt_.acquire_image) {
-        caps["image_generation"] = false;
-        caps["image_edit"] = false;
-    }
-    c.capabilities = caps.dump();
+    /* No capabilities member to strip here: capabilities() carries no expert_stats. The engine
+     * reports that path in its own info blob, and the splice at /server_info screens it for
+     * keyless strangers (admin.cpp, handle_server_info) -- the live guard, this is the map. */
+    c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };
     /* The control-vector variant is listed as a child of the model, as an adapter is, so the front
@@ -2566,30 +2350,6 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
         cards.push_back(vc);
         if (is_variant) return HttpResponse::json_body(200, model_body(vc));
     }
-    if (supplemental) {
-        ModelCard text;
-        text.id = supplemental->limits.model_id;
-        text.created = started_at_;
-        text.max_model_len = supplemental->limits.max_ctx;
-        text.capabilities = json{{"text_generation", true},
-                                 {"chat", supplemental->parser.chat != nullptr}}.dump();
-        if (is_supplemental) return HttpResponse::json_body(200, model_body(text));
-        cards.push_back(std::move(text));
-    }
-    for (const auto& image_id : image_ids) {
-        ModelCard image;
-        image.id = image_id;
-        image.created = started_at_;
-        const auto kind = opt_.generator_kind ? opt_.generator_kind(image_id) : GeneratorKind::Image;
-        const char* capability = kind == GeneratorKind::Video ? "video_generation" :
-                                 kind == GeneratorKind::Audio ? "audio_generation" : "image_generation";
-        json image_caps = {{capability, true}};
-        if (images && images.model_id == image_id)
-            image_caps["image_edit"] = images.gen->info().max_refs > 0;
-        image.capabilities = image_caps.dump();
-        if (is_image && id == image_id) return HttpResponse::json_body(200, model_body(image));
-        cards.push_back(std::move(image));
-    }
     for (const std::string& a : adapters) {
         ModelCard ac = c;
         ac.id = a;
@@ -2600,53 +2360,6 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     return HttpResponse::json_body(200, id.empty() ? models_body(cards) : model_body(c));
 }
 
-/* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
- * to unload. The path is read on this machine, so without --api-key only a loopback client may
- * ask, the rule /diagnostics follows. */
-/* A generator's adapter files: what `loras` and <lora:...> tags may name. */
-HttpResponse Server::handle_loras(const HttpRequest& req) {
-    if (opt_.image_lora_names) {
-        std::string model = req.param("model");
-        if (req.query.contains("model") && model.empty())
-            return error_response(err_bad("model", "expected a nonempty model name"), req.peer);
-        const auto ids = opt_.image_model_ids();
-        if (!model.empty() && std::find(ids.begin(), ids.end(), model) == ids.end()) {
-            ApiError error = err_bad("model", "no registered image model named " + model);
-            error.status = 404;
-            error.type = "not_found_error";
-            return error_response(error, req.peer);
-        }
-        if (model.empty()) model = image_endpoint().model_id;
-        json data = json::array();
-        for (const auto& name : opt_.image_lora_names()) {
-            json entry = {{"id", name}, {"object", "lora"}, {"compatibility", "unchecked"}};
-            if (!model.empty()) entry["model"] = model;
-            data.push_back(std::move(entry));
-        }
-        metrics_.observe_http(200);
-        return HttpResponse::json_body(200, json_dump(json{
-            {"object", "list"}, {"data", std::move(data)}
-        }));
-    }
-    const auto images = image_endpoint();
-    const auto& lora_names = opt_.acquire_image ? images.lora_names : opt_.gen_lora_names;
-    if (!lora_names) {
-        ApiError e;
-        e.status = 404;
-        e.type = "not_found_error";
-        e.message = "this server takes no adapters in image or video requests (--lora, --lora-dir)";
-        return error_response(e, req.peer);
-    }
-    json data = json::array();
-    for (const std::string& n : lora_names()) {
-        json entry = {{"id", n}, {"object", "lora"}};
-        if (opt_.acquire_image) entry["model"] = images.model_id;
-        data.push_back(std::move(entry));
-    }
-    metrics_.observe_http(200);
-    return HttpResponse::json_body(200, json_dump(json{ { "object", "list" }, { "data", std::move(data) } }));
-}
-
 HttpResponse Server::handle_validate_loras(const HttpRequest& req) {
     auto fail = [&](const char* field, const std::string& why, int status, const char* type) {
         ApiError error = err_bad(field, why);
@@ -2654,9 +2367,6 @@ HttpResponse Server::handle_validate_loras(const HttpRequest& req) {
         error.type = type;
         return error_response(error, req.peer);
     };
-    if (!opt_.pin_image_loras)
-        return error_response(err_not_implemented("adapter validation requires shared image serving"),
-                              req.peer);
     if (opt_.api_key.empty() && !local_operator(req))
         return fail("loras", "adapter validation requires operator access", 403, "permission_error");
 
@@ -2666,6 +2376,10 @@ HttpResponse Server::handle_validate_loras(const HttpRequest& req) {
         !body.contains("model") || !body["model"].is_string() || body["model"] == "")
         return error_response(err_bad("model", "expected a nonempty image model ID"), req.peer);
     const std::string model = body["model"].get<std::string>();
+    if (auto it = req.query.find("model"); it != req.query.end() && it->second != model)
+        return error_response(err_bad("model", "query and body name different models"), req.peer);
+    if (!deps_.front && model != opt_.model_id)
+        return fail("model", "unknown model", 404, "not_found_error");
     std::vector<std::pair<std::string, double>> choices;
     std::string field, why;
     if (parse_loras(body, nullptr, &choices, &field, &why) < 0)
@@ -2673,24 +2387,12 @@ HttpResponse Server::handle_validate_loras(const HttpRequest& req) {
     if (choices.empty())
         return error_response(err_bad("loras", "expected at least one adapter"), req.peer);
 
-    auto images = image_endpoint();
-    if (!images || model != images.model_id)
-        return fail("model", "validation requires the requested image model to be active",
-                    409, "conflict_error");
-    if (!images.validate_loras)
-        return error_response(err_not_implemented("the active image model has no adapter slots"),
-                              req.peer);
+    if (!opt_.gen_lora_validate)
+        return error_response(err_not_implemented("this model has no generator adapter slots"), req.peer);
     if (auto no = admit(1, req.peer)) return *no;
     auto release_admission = [this](Server*) { release(1); };
     std::unique_ptr<Server, decltype(release_admission)> admission(this, release_admission);
-    std::vector<lora::PinnedAdapter> adapters;
-    std::shared_ptr<void> lease;
-    int status = opt_.pin_image_loras(choices, &adapters, &lease, &why, false);
-    if (status >= 0) {
-        if (adapters.empty())
-            return error_response(err_bad("loras", "expected a nonzero adapter combination"), req.peer);
-        status = images.validate_loras(adapters, &why);
-    }
+    const int status = opt_.gen_lora_validate(choices, &why);
     if (status == RAD_E_FULL) return error_response(err_overloaded(why), req.peer);
     if (status == RAD_E_NOTFOUND) return fail("loras", why, 404, "not_found_error");
     if (status == RAD_E_STATE) return fail("loras", why, 409, "conflict_error");
@@ -2702,6 +2404,24 @@ HttpResponse Server::handle_validate_loras(const HttpRequest& req) {
                                                        {"compatibility", "compatible"}}));
 }
 
+/* A generator's adapter files: what `loras` and <lora:...> tags may name. */
+HttpResponse Server::handle_loras(const HttpRequest& req) {
+    if (!opt_.gen_lora_names) {
+        ApiError e;
+        e.status = 404;
+        e.type = "not_found_error";
+        e.message = "this server takes no adapters in image or video requests (--lora, --lora-dir)";
+        return error_response(e, req.peer);
+    }
+    json data = json::array();
+    for (const std::string& n : opt_.gen_lora_names()) data.push_back({ { "id", n }, { "object", "lora" } });
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{ { "object", "list" }, { "data", std::move(data) } }));
+}
+
+/* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
+ * to unload. The path is read on this machine, so without --api-key only a loopback client may
+ * ask, the rule /diagnostics follows. */
 HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     auto fail = [&](int status, const char* type, const std::string& msg) {
         ApiError e;
@@ -2710,10 +2430,7 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
         e.message = msg;
         return error_response(e, req.peer);
     };
-    const auto images = image_endpoint();
-    const auto& lora_load = opt_.acquire_image ? images.lora_load : opt_.lora_load;
-    const auto& lora_unload = opt_.acquire_image ? images.lora_unload : opt_.lora_unload;
-    if (!lora_load || !lora_unload)
+    if (!opt_.lora_load || !opt_.lora_unload)
         return fail(404, "not_found_error", "this server was started without runtime LoRA (--lora or "
                                             "--max-loras)");
     if (opt_.api_key.empty() && !local_operator(req))
@@ -2732,9 +2449,6 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     if (j.is_discarded() || over || deep || !j.is_object() || !j.contains("lora_name") ||
         !j["lora_name"].is_string())
         return fail(400, "invalid_request_error", "the body must be a JSON object with lora_name");
-    if (opt_.acquire_image && j.contains("model") &&
-        (!j["model"].is_string() || j["model"] != images.model_id))
-        return fail(400, "invalid_request_error", "expected image model " + images.model_id);
     const std::string name = j["lora_name"].get<std::string>();
     if (name.empty() || name == opt_.model_id)
         return fail(400, "invalid_request_error", "lora_name must be non-empty and not the served model's name");
@@ -2745,13 +2459,12 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     std::string err;
     int s;
     int in_flight = 0;
-    sweep_abandoned();
     if (load) {
         if (!j.contains("lora_path") || !j["lora_path"].is_string())
             return fail(400, "invalid_request_error", "load_lora_adapter needs lora_path");
-        s = lora_load(name, j["lora_path"].get<std::string>(), &err);
+        s = opt_.lora_load(name, j["lora_path"].get<std::string>(), &err);
     } else {
-        s = lora_unload(name, &err, &in_flight);
+        s = opt_.lora_unload(name, &err, &in_flight);
     }
     /* 409 for a load of a name that is still draining: the old adapter's requests are running. */
     if (s == RAD_E_NOTFOUND) return fail(404, "not_found_error", err);

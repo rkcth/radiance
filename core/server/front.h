@@ -159,6 +159,7 @@ public:
 
     /* Blocks serving until stop(). */
     int  run();
+    int  port() const { return transport_.port(); }
     void stop();
     bool stopping() const { return stopping_.load(std::memory_order_acquire); }
 

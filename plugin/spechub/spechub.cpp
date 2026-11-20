@@ -42,6 +42,16 @@ const RadOperandSpec kVerifyOperands[] = {
     { "token",    RAD_OPD_INOUT, 0 },
 };
 
+/* Traversal verification: the verify's five operands and the step's tree. */
+const RadOperandSpec kTravOperands[] = {
+    { "cand_idx", RAD_OPD_IN,    0 },
+    { "cand_val", RAD_OPD_IN,    0 },
+    { "params",   RAD_OPD_IN,    0 },
+    { "state",    RAD_OPD_IN,    0 },
+    { "token",    RAD_OPD_INOUT, 0 },
+    { "topo",     RAD_OPD_IN,    0 },
+};
+
 /* DFlash2's coupled walk: dflash_select's operands, then the coupling's. `tokens` is INOUT because a
  * greedy request's row keeps the selector's walk; `state` holds one row per (round, sequence). */
 const RadOperandSpec kDflashOperands[] = {
@@ -65,7 +75,8 @@ const RadOpSchema kSchemas[] = {
     { "mtp_couple_verify", kVerifyParams, 3, kVerifyOperands, 5,
       "Maximal coupling of a bound mtp_couple state after sample_pick over all surviving target "
       "candidates, FP64 P and 53-bit ACCEPT/RESID uniforms at params.pos; residual (P-Q)+ with "
-      "r(x)=0. Rows whose state is not status 1, not bound to params seed/pos, malformed, or whose "
+      "r(x)=0; a state with `blk` >= 1 is the first row of a block, verified together with the rows after "
+      "it (Block Verification, arXiv 2403.10444). Rows whose state is not status 1, not bound to params seed/pos, malformed, or whose "
       "(P,Q) admit no coupling keep the ordinary token." },
     { "dflash_couple_propose", kDflashParams, 8, kDflashOperands, 10,
       "DFlash2's candidate walk, sampled: at each step Q = FP64 softmax of (unary + low-rank edge "
@@ -73,6 +84,17 @@ const RadOpSchema kSchemas[] = {
       "draw's (seed, base, KEY_DRAFT + step + 1), x the next step's predecessor; tokens and "
       "state[step][row] written. mode0 rows keep tokens (status 0); a Q that cannot be built or "
       "seq_ids != draw.card takes the walk's argmax (status -1)." },
+    { "mtp_trav_verify", kVerifyParams, 3, kTravOperands, 6,
+      "Traversal Verification (arXiv 2505.12398) of a bound draft after sample_pick: per "
+      "request (a row whose topo parent is -1), the bottom-up sequence-level walk over its rows' "
+      "bound mtp_couple states and target candidates (the target's law as integer masses of an "
+      "FP32 exponential, the walk in FP64): a leaf is accepted with the path's cumulative ratio, a "
+      "rejected leaf updates its parent's acceptance, target residual and draft law (Gumbel "
+      "siblings without replacement; a RheoSampling node's tail child first, then its top-q "
+      "children as point masses). The accepted path's rows get their path child's token and the "
+      "last row the final token; rows whose state is not eligible (the row-wise gate) are leaves "
+      "and keep the pick; an eligible row whose draw asks for it gets P exported over its state. "
+      "topo is [M,2] int32: parent row (-1 root), draft token. Any n_cand." },
 };
 
 }  /* namespace */
@@ -263,6 +285,40 @@ int rad_mtp_couple_verify_args(const RadArgs* a, RadMtpCoupleVerifyCall* out) {
     return RAD_OK;
 }
 
+int rad_mtp_trav_verify_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
+    if (!out || i < 0 || i >= 6) return RAD_E_INVAL;
+    if (i < 5) return rad_mtp_couple_verify_shape(p, n, i, out);
+    int64_t M, v, nc;
+    int rc = couple_geometry(p, n, 1, true, &M, &v, &nc);
+    if (rc != RAD_OK) return rc;
+    RadOpdDesc d{};
+    d.idx_const = -1;
+    d.dtype = RAD_I32;
+    d.rank = 2;
+    d.shape[0] = M;
+    d.shape[1] = 2;
+    *out = d;
+    return RAD_OK;
+}
+
+int rad_mtp_trav_verify_args(const RadArgs* a, RadMtpTravCall* out) {
+    if (!out || !a || !a->t || a->n_t != 6) return RAD_E_INVAL;
+    RadArgs five = *a;
+    five.n_t = 5;
+    RadMtpTravCall c{};
+    int rc = rad_mtp_couple_verify_args(&five, &c.v);
+    if (rc != RAD_OK) return rc;
+    const RadTensor& t = a->t[5];
+    if (!t.data || (uintptr_t)t.data % 4) return RAD_E_INVAL;
+    if (t.dtype != RAD_I32) return RAD_E_DTYPE;
+    if (t.rank != 2 || t.shape[0] < c.v.M || t.shape[1] != 2) return RAD_E_SHAPE;
+    if (t.stride[1] != 1 || t.stride[0] < 2) return RAD_E_STRIDE;
+    c.topo = (const int32_t*)t.data;
+    c.ld_topo = t.stride[0];
+    *out = c;
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ dflash_couple_propose */
 
 namespace {
@@ -400,6 +456,19 @@ RadKernelInfo rad_spechub_row(int i, RadLaunchFn launch) {
         r.priority = 100;
         r.launch = launch;
         r.opd_shape = rad_dflash_couple_shape;
+        return r;
+    }
+    if (i == 3) {
+        r.name = "spechub_mtp_trav_verify";
+        r.op = "mtp_trav_verify";
+        r.family = "draft";
+        r.computes = "Traversal Verification of a coupled draft: integer target masses, FP64 walk";
+        r.shape = "M,n_cand,n_vocab";
+        r.dtypes = "f32,i32,u32";
+        r.domain = RAD_DOMAIN_DEVICE;
+        r.priority = 100;
+        r.launch = launch;
+        r.opd_shape = rad_mtp_trav_verify_shape;
         return r;
     }
     r.name = i ? "spechub_mtp_couple_verify" : "spechub_mtp_couple_propose";
